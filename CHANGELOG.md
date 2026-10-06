@@ -1,4 +1,10 @@
 # Changelog
+## [0.3.0] - 2026-10-06
+
+### Added
+
+- **Filament check settings** The Settings page now as filament check notification and a safety margin. Currently the safety margin defaults at 10% e.g. 20g of filament required, spool has 22g so is within the 10% but it can be adjusted to user preference, see updated README for a full explanation.
+- **Filament check at slicing** after each slice, Spoolio compares the filament the plate needs with what is left on your matching spools and shows a notification in OrcaSlicer. A short-lived one when there's enough, and a persistent message that stays until you dismiss it when there may not be enough filament loaded. Slots holding the same filament are counted together. Switch on Spoolio Filament Check in your process settings, under `Others > Slicing Pipeline Plugin`, to use it.
 
 ## [0.2.0] - 2026-10-01
 
