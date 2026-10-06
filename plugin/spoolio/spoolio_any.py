@@ -6,7 +6,7 @@
 # name = "Spoolio"
 # description = "A Bambu Lab inspired inventory management overview for OrcaSlicer"
 # author = "Dan J Moore"
-# version = "0.2.0"
+# version = "0.3.0"
 # ///
 
 import html
@@ -17,6 +17,7 @@ import platform
 import re
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,8 +33,10 @@ try:
 except (ImportError, AttributeError):
     HAS_PAGES = False
 
+HAS_SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
+
 PLUGIN_NAME = "Spoolio"
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 # Stamped per operating system by scripts/build.py.
 BUILD_TARGET = "any"
 
@@ -53,6 +56,13 @@ LOG_MAX_BYTES = 256 * 1024
 REQUEST_TIMEOUT = 5  # seconds
 MAX_QUERY_LENGTH = 200
 REFRESH_SECONDS = 60
+DEFAULT_PLATE_MARGIN = 10  # percent
+PLATE_TAIL_BYTES = 192 * 1024
+PLATE_SPOOL_CACHE_SECONDS = 120
+PLATE_REPEAT_SECONDS = 120
+PLATE_COLOUR_TOLERANCE = 40
+PLATE_NOTICE_MAX = 400
+PLATE_NOTICE_DELAY = 0.4  # seconds, so the slicing thread has returned before any UI call
 FONT_STACK = (
     'Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "Helvetica Neue", '
     'Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif'
@@ -120,6 +130,7 @@ log.info(
 
 
 _reported = {}
+_spool_cache = {"url": "", "time": 0.0, "spools": []}
 
 
 def _report(key: str, error: str | None, exc_info: bool = False) -> None:
@@ -133,7 +144,12 @@ def _report(key: str, error: str | None, exc_info: bool = False) -> None:
 
 
 def get_settings() -> dict:
-    defaults = {"spoolman_url": "", "low_stock_grams": DEFAULT_LOW_FILAMENT_THRESHOLD}
+    defaults = {
+        "spoolman_url": "",
+        "low_stock_grams": DEFAULT_LOW_FILAMENT_THRESHOLD,
+        "plate_check": True,
+        "plate_margin_percent": DEFAULT_PLATE_MARGIN,
+    }
     for path in (SETTINGS_FILE, LEGACY_SETTINGS_FILE):
         try:
             return {**defaults, **json.loads(path.read_text(encoding="utf-8"))}
@@ -150,6 +166,27 @@ def parse_low_stock(value: object) -> float:
     if grams < 0:
         return DEFAULT_LOW_FILAMENT_THRESHOLD
     return int(grams) if grams == int(grams) else grams
+
+
+def parse_margin(value: object) -> int:
+    try:
+        return min(50, max(0, round(float(value))))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_PLATE_MARGIN
+
+
+def parse_flag(value: object, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "on", "yes")
+    return bool(value)
+
+
+def plate_settings() -> tuple[bool, int]:
+    settings = get_settings()
+    return (parse_flag(settings.get("plate_check")),
+            parse_margin(settings.get("plate_margin_percent")))
 
 
 def save_settings(settings: dict) -> bool:
@@ -176,6 +213,7 @@ def get_spools(spoolman_url: str) -> dict:
         _report("Spool list", str(exc), exc_info=True)
         return {"ok": False, "error": str(exc)}
     _report("Spool list", None)
+    _spool_cache.update(url=spoolman_url, time=time.monotonic(), spools=data)
     return {"ok": True, "spools": data}
 
 
@@ -263,6 +301,321 @@ def open_search(query: object) -> None:
     if isinstance(query, str) and query.strip():
         terms = urllib.parse.quote_plus(query.strip()[:MAX_QUERY_LENGTH])
         open_url(SEARCH_URL.format(query=terms))
+
+
+def read_tail(path: str) -> list[str]:
+    size = os.path.getsize(path)
+    with open(path, "rb") as handle:
+        handle.seek(max(0, size - PLATE_TAIL_BYTES))
+        return handle.read().decode("utf-8", "replace").splitlines()
+
+
+def parse_usage(lines: list[str]) -> list[float]:
+    """Grams per filament slot, from the last ``; filament used [g] = ...`` footer line."""
+    for line in reversed(lines):
+        if line.startswith("; filament used [g] ="):
+            return [float(n) for n in re.findall(r"-?\d+(?:\.\d+)?", line.split("=", 1)[1])]
+    return []
+
+
+def split_list(value: object) -> list[str]:
+    """Split a slicer list such as ``"a";"b"`` or ``#000;#fff`` into its items."""
+    text = "" if value is None else str(value)
+    if '"' in text:
+        return [quoted or plain.strip() for quoted, plain in re.findall(r'"([^"]*)"|([^;]+)', text)]
+    return [item.strip() for item in text.split(";")]
+
+
+def plate_slots(ctx, grams: list[float]) -> list[dict]:
+    """Every filament slot the slicer reports, with how much of it this plate uses."""
+    names = split_list(ctx.config_value("filament_settings_id"))
+    colours = split_list(ctx.config_value("filament_colour"))
+    materials = split_list(ctx.config_value("filament_type"))
+    vendors = split_list(ctx.config_value("filament_vendor"))
+    ams = "bambu" in str(ctx.config_value("printer_model") or "").lower()
+
+    def at(items: list[str], i: int) -> str:
+        return items[i] if i < len(items) else ""
+
+    return [
+        {"n": i + 1, "grams": used, "preset": at(names, i), "colour": at(colours, i),
+         "material": at(materials, i), "vendor": at(vendors, i), "ams": ams}
+        for i, used in enumerate(grams)
+    ]
+
+
+def colour_distance(first: str, second: str) -> float | None:
+    def rgb(value):
+        digits = (value or "").strip().lstrip("#")[:6]
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", digits):
+            return None
+        return tuple(int(digits[i:i + 2], 16) for i in (0, 2, 4))
+
+    a, b = rgb(first), rgb(second)
+    return None if a is None or b is None else sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+
+def _norm(text: object) -> str:
+    return re.sub(r"[^a-z0-9+]", "", str(text or "").lower())
+
+
+def _same_material(slicer: object, spool: object) -> bool:
+    """Equal, or one is a variant of the other ("PLA" and "PLA Matte" or "PLA+")."""
+    first, second = _norm(slicer), _norm(spool)
+    return bool(first) and bool(second) and (first.startswith(second) or second.startswith(first))
+
+
+def match_spools(slot: dict, spools: list[dict]) -> list[dict]:
+    """Spools that could be what is loaded in a slot: same vendor and material, close colour."""
+    wants_support = "support" in slot["preset"].lower()
+    vendor = _norm(slot["vendor"])
+    found = []
+    for spool in spools:
+        filament = spool.get("filament") or {}
+        if spool.get("archived") or not isinstance(spool.get("remaining_weight"), (int, float)):
+            continue
+        if ("support" in str(filament.get("name", "")).lower()) != wants_support:
+            continue
+        if vendor and vendor != "generic":
+            theirs = _norm((filament.get("vendor") or {}).get("name"))
+            if not theirs or (vendor not in theirs and theirs not in vendor):
+                continue
+        if not _same_material(slot["material"], filament.get("material")):
+            continue
+        distance = colour_distance(slot["colour"], filament.get("color_hex"))
+        if distance is not None and distance <= PLATE_COLOUR_TOLERANCE:
+            exact = _norm(slot["material"]) == _norm(filament.get("material"))
+            found.append((distance, exact, spool))
+    # An exact colour beats a near one, and an exact material beats a variant.
+    pool = [item for item in found if item[0] <= 1] or found
+    return [spool for *_, spool in [item for item in pool if item[1]] or pool]
+
+
+def group_slots(slots: list[dict]) -> list[dict]:
+    """The groups of slots holding the same filament that this plate uses.
+
+    The AMS moves on to another spool of the same filament when one runs out, so a group is
+    one supply: its use is added together and compared with its spools' combined weight.
+    """
+    groups: dict[tuple, dict] = {}
+    for slot in slots:
+        key = (_norm(slot["preset"]), _norm(slot["vendor"]), _norm(slot["material"]),
+               slot["colour"].lstrip("#").upper()[:6])
+        group = groups.setdefault(key, {"slot": slot, "pool": 0, "used": []})
+        group["pool"] += 1
+        if slot["grams"] > 0:
+            group["used"].append(slot)
+    return [group for group in groups.values() if group["used"]]
+
+
+def check_group(group: dict, spools: list[dict], margin: int) -> dict:
+    """ok, mixed (depends which spools are loaded), barely, short, or unknown (no spool)."""
+    slot, pool = group["slot"], group["pool"]
+    matches = match_spools(slot, spools)
+    need = sum(used["grams"] for used in group["used"])
+    result = {"slot": slot, "slots": [used["n"] for used in group["used"]], "need": need,
+              "margin": margin, "pool": pool, "matches": len(matches), "status": "unknown",
+              "ams": bool(slot.get("ams"))}
+    if not matches:
+        return result
+    padded = need * (1 + margin / 100)
+    weights = sorted((spool["remaining_weight"] for spool in matches), reverse=True)
+    best, worst = sum(weights[:pool]), sum(weights[-pool:])
+    if worst >= padded:
+        status = "ok"
+    elif best >= padded:
+        status = "mixed"
+    elif best >= need:
+        status = "barely"
+    else:
+        status = "short"
+    fullest = max(matches, key=lambda spool: spool["remaining_weight"])
+    name = (fullest.get("filament") or {}).get("name") or ""
+    return {**result, "status": status, "have": best, "worst": worst, "padded": padded,
+            "name": name}
+
+
+def fmt_grams(grams: float) -> str:
+    # The epsilon makes a half such as 296.15 round up, matching the slicer's own figure.
+    grams += 1e-9
+    return f"{grams / 1000:.2f} kg" if grams >= 1000 else f"{grams:.1f} g"
+
+
+def _join(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def slot_label(result: dict) -> str:
+    slot, numbers = result["slot"], result["slots"]
+    preset = slot["preset"].split("@")[0].strip()
+    named = preset or " ".join(part for part in (slot["vendor"], slot["material"]) if part)
+    name = result.get("name") or " ".join(part for part in (named, slot["colour"]) if part)
+    which = "slot " if len(numbers) == 1 else "slots "
+    return f"{which}{_join([str(n) for n in numbers])} ({name})"
+
+
+def _sentence(text: str) -> str:
+    return text[:1].upper() + text[1:] + "."
+
+
+def _need(result: dict) -> str:
+    grams = fmt_grams(result["need"])
+    if len(result["slots"]) == 1:
+        return f"needs {grams} of filament"
+    return f"need {grams} of filament together"
+
+
+def _supply(result: dict) -> str:
+    count, have = min(result["pool"], result["matches"]), fmt_grams(result["have"])
+    if count == 1:
+        return f"the spool has {have}"
+    return f"the {count} spools have {have} between them"
+
+
+def _tracked(result: dict) -> str:
+    if result["matches"] >= result["pool"]:
+        return ""
+    return f" (only {result['matches']} of {result['pool']} matching spools are in Spoolman)"
+
+
+def plate_notice(results: list[dict]) -> tuple[str, str] | None:
+    """The one notification for a slice: ``("warning" | "info", text)``."""
+    label, grams = slot_label, fmt_grams
+    where = " in the AMS" if any(r["ams"] for r in results) else ""
+    short = [r for r in results if r["status"] == "short"]
+    mixed = [r for r in results if r["status"] == "mixed"]
+    barely = [r for r in results if r["status"] == "barely"]
+
+    def short_part(r: dict) -> str:
+        return _sentence(f"{label(r)} {_need(r)} but {_supply(r)}{_tracked(r)}")
+
+    def mixed_part(r: dict, prefix: str = "") -> str:
+        count = min(r["pool"], r["matches"])
+        if count == 1:
+            body = (f"of {r['matches']} matching spools the fullest has {grams(r['have'])} and "
+                    f"the smallest has {grams(r['worst'])}, so make sure the right one is loaded")
+        else:
+            body = (f"the {count} fullest of {r['matches']} matching spools hold "
+                    f"{grams(r['have'])} and the {count} smallest hold {grams(r['worst'])}, "
+                    "so make sure the right ones are loaded")
+        return _sentence(f"{prefix}{label(r)} {_need(r)}; {body}")
+
+    def barely_part(r: dict, prefix: str = "") -> str:
+        return _sentence(f"{prefix}{label(r)} {_need(r)} ({grams(r['padded'])} with the "
+                         f"{r['margin']}% margin) and {_supply(r)}{_tracked(r)}")
+
+    if short:
+        kind, parts = "warning", [f"not enough filament loaded{where}."]
+        parts += [short_part(r) for r in short]
+        parts += [mixed_part(r, "also check: ") for r in mixed]
+        parts += [barely_part(r, "also barely enough: ") for r in barely]
+    elif mixed:
+        kind, parts = "warning", [f"not enough filament may be loaded{where}."]
+        parts += [mixed_part(r) for r in mixed]
+        parts += [barely_part(r, "also barely enough: ") for r in barely]
+    elif barely:
+        kind, parts = "warning", ["barely enough filament."] + [barely_part(r) for r in barely]
+    else:
+        kind, parts = "info", []
+        fine = [r for r in results if r["status"] == "ok"]
+        unknown = [r for r in results if r["status"] == "unknown"]
+        if len(fine) > 3:
+            numbers = sorted(n for r in fine for n in r["slots"])
+            parts.append(f"quantity OK for slots {_join([str(n) for n in numbers])}.")
+        elif fine:
+            parts.append("quantity OK.")
+            parts += [_sentence(f"{label(r)} {_need(r)}, {_supply(r)}") for r in fine]
+        if unknown:
+            many = sum(len(r["slots"]) for r in unknown) > 1
+            outcome = "so they weren't checked" if many else "so it wasn't checked"
+            names = _join([label(r) for r in unknown])
+            sentence = _sentence(f"no spool found for {names}, {outcome}")
+            parts.append(sentence if parts else sentence[:1].lower() + sentence[1:])
+        if not parts:
+            return None
+    return kind, "Spoolio: " + " ".join(parts)
+
+
+def fit_text(text: str, limit: int = PLATE_NOTICE_MAX) -> str:
+    """Whole sentences only: what doesn't fit is dropped and counted, never cut mid-sentence."""
+    if len(text) <= limit:
+        return text
+    sentences = re.split(r"(?<=\.) ", text)
+    for keep in range(len(sentences) - 1, 0, -1):
+        note = f" (+{len(sentences) - keep} more, see the log)"
+        shown = " ".join(sentences[:keep])
+        if len(shown) + len(note) <= limit:
+            return shown + note
+    return text[:limit - 1] + "\u2026"
+
+
+_recent_notices: dict[str, float] = {}
+
+
+def is_repeat(text: str) -> bool:
+    """True if this exact notice was shown moments ago, so re-slicing doesn't stack warnings."""
+    now = time.monotonic()
+    expired = [key for key, shown in _recent_notices.items() if now - shown > PLATE_REPEAT_SECONDS]
+    for old in expired:
+        del _recent_notices[old]
+    if text in _recent_notices:
+        return True
+    _recent_notices[text] = now
+    return False
+
+
+def push_notice(kind: str, text: str) -> bool:
+    text = fit_text(text)
+    ui = orca.host.ui
+    push = getattr(ui, "push_notification", None)
+    level_name = "WarningNotificationLevel" if kind == "warning" else "RegularNotificationLevel"
+    level = getattr(ui, level_name, None)
+    if push is None or level is None:
+        log.info("Notifications are not available in this build: %s", text)
+        return False
+    for call in (lambda: push(level, text), lambda: push(text, level)):
+        try:
+            call()
+            return True
+        except TypeError:
+            continue
+        except Exception:
+            log.exception("push_notification failed")
+            return False
+    log.warning("push_notification accepted neither (level, text) nor (text, level)")
+    return False
+
+
+def plate_spools(url: str) -> list[dict] | None:
+    """The spool list, from the cache when it is fresh; None if Spoolman can't be reached."""
+    age = time.monotonic() - _spool_cache["time"]
+    if _spool_cache["url"] == url and age < PLATE_SPOOL_CACHE_SECONDS:
+        return _spool_cache["spools"]
+    result = get_spools(url)
+    return result["spools"] if result["ok"] else None
+
+
+def run_plate_check(slots: list[dict], margin: int) -> None:
+    time.sleep(PLATE_NOTICE_DELAY)
+    try:
+        url = get_settings().get("spoolman_url", "")
+        spools = plate_spools(url) if url else None
+        if not url:
+            notice = ("info", "Spoolio: no Spoolman address is set up yet, "
+                              "so the filament quantity wasn't checked.")
+        elif spools is None:
+            notice = ("info", "Spoolio: couldn't reach Spoolman, "
+                              "so the filament quantity wasn't checked.")
+        else:
+            results = [check_group(group, spools, margin) for group in group_slots(slots)]
+            log.info("Plate check: %s", ", ".join(
+                f"slot {'+'.join(str(n) for n in r['slots'])} {r['status']}" for r in results))
+            notice = plate_notice(results)
+        if notice and not is_repeat(notice[1]):
+            log.info("Plate notice (%s): %s", *notice)
+            push_notice(*notice)
+    except Exception:
+        log.exception("Plate check failed")
 
 
 LOGO_DATA_URI = (
@@ -870,6 +1223,11 @@ SETTINGS_PAGE_TEMPLATE = """
   .status { margin-top: 8px; font-size: 12px; }
   .divider.spaced { margin-top: 18px; }
   .hint { margin-top: 6px; font-size: 12px; color: var(--orca-muted); }
+  .check-row { display: flex; align-items: center; gap: 8px; margin: 0 0 12px 0; cursor: pointer; }
+  .margin-row { display: flex; align-items: center; gap: 12px; }
+  .margin-row label { margin: 0; }
+  .margin-row input { width: 90px; }
+  input[type="checkbox"] { width: 16px; height: 16px; padding: 0; margin: 0; accent-color: var(--orca-accent); }
   .status.ok { color: #3fb950; }
   .status.error { color: #d9534f; }
   .footer {
@@ -934,6 +1292,16 @@ SETTINGS_PAGE_TEMPLATE = """
   <label for="low-stock" class="field-label">Low stock warning (grams):</label>
   <input id="low-stock" type="number" min="0" step="10" value="__LOW_STOCK__">
   <div class="hint">Spools with this much filament remaining show a cart button for reordering.</div><!--/reorder-->
+
+  <div class="divider spaced"></div>
+
+  <!--check--><h3><span class="emoji">\u2696\ufe0f</span>Configure Filament Check</h3>
+  <label class="check-row"><input id="plate-check" type="checkbox" __PLATE_CHECKED__>Show filament check notifications</label>
+  <div class="margin-row" title="Warns when a plate needs more than a spool has left, or would leave less than this margin spare.">
+    <label for="plate-margin">Safety margin (%):</label>
+    <input id="plate-margin" type="number" min="0" max="50" step="5" value="__PLATE_MARGIN__">
+  </div>
+  <div class="hint">OrcaSlicer also has to run the check: switch on Spoolio Filament Check in your process settings, under <span style="white-space: nowrap">Others &gt; Slicing Pipeline Plugin</span>.</div><!--/check-->
 
   <div class="divider spaced"></div>
 
@@ -1041,7 +1409,11 @@ SETTINGS_PAGE_TEMPLATE = """
     saveEl.addEventListener("click", function () {
       const url = urlEl.value.trim();
       const lowStock = document.getElementById("low-stock").value;
-      orca.postMessage({ type: "save", url: url, low_stock: lowStock });
+      orca.postMessage({
+        type: "save", url: url, low_stock: lowStock,
+        plate_check: document.getElementById("plate-check").checked,
+        plate_margin: document.getElementById("plate-margin").value,
+      });
     });
     refreshSave();
   </script>
@@ -1062,7 +1434,8 @@ def main_html() -> str:
     )
 
 
-def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float) -> str:
+def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
+                  plate_check: bool = True, plate_margin: int = DEFAULT_PLATE_MARGIN) -> str:
     """``spoolman_info`` describes the saved URL, not whatever is typed in the field."""
     verified_url = clean_url(current_url) if spoolman_info.get("ok") else ""
     if spoolman_info.get("ok"):
@@ -1084,6 +1457,8 @@ def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float)
         DEFAULT_URL=html.escape(DEFAULT_SPOOLMAN_URL),
         URL=html.escape(current_url or DEFAULT_SPOOLMAN_URL),
         LOW_STOCK=low_stock_grams,
+        PLATE_CHECKED="checked" if plate_check else "",
+        PLATE_MARGIN=plate_margin,
         LOG_PATH=html.escape(str(LOG_FILE)),
         STATUS_TEXT=html.escape(status_text),
         STATUS_CLASS=status_class,
@@ -1172,8 +1547,8 @@ TAB_HEADER_CSS = """
 """
 
 
-# Wide windows pair each setting with its guide in a grid, then a full-width diagnostics
-# row. Narrow windows stack the cells, guide first.
+# Wide windows put each setting beside its guide, preview or diagnostics in a grid. Narrow
+# windows stack the cells, guide first.
 TAB_SETTINGS_CSS = """
   #view-settings { margin: 0 auto; }
   #view-settings .settings-grid {
@@ -1182,11 +1557,15 @@ TAB_SETTINGS_CSS = """
   #view-settings .cell { padding: 14px 0; }
   /* Fixed heading height, content centred: paired headings stay level whatever the emoji size. */
   #view-settings .cell h3 { display: flex; align-items: center; height: 30px; }
-  #view-settings .cell-server, #view-settings .cell-reorder { grid-column: 1; padding-right: 32px; }
-  #view-settings .cell-guide, #view-settings .cell-preview { grid-column: 2; padding-left: 32px; }
+  #view-settings .cell-server, #view-settings .cell-reorder, #view-settings .cell-check {
+    grid-column: 1; padding-right: 32px;
+  }
+  #view-settings .cell-guide, #view-settings .cell-preview, #view-settings .cell-diag {
+    grid-column: 2; padding-left: 32px;
+  }
   #view-settings .cell-server, #view-settings .cell-guide { grid-row: 1; padding-top: 0; }
   #view-settings .cell-reorder, #view-settings .cell-preview { grid-row: 2; }
-  #view-settings .cell-diag { grid-column: 1 / -1; grid-row: 3; padding-bottom: 0; }
+  #view-settings .cell-check, #view-settings .cell-diag { grid-row: 3; padding-bottom: 0; }
   #view-settings .footer { border-top: none; }
   #view-settings .cell-guide h3 { margin-bottom: 16px; }
   #view-settings .cell-guide .step:last-child { margin-bottom: 0; }
@@ -1321,20 +1700,23 @@ TAB_BRIDGE_SCRIPT = """
     url.value = data.url || url.placeholder;
     url.dispatchEvent(new Event("input"));
     document.getElementById("low-stock").value = data.low_stock;
+    document.getElementById("plate-check").checked = data.plate_check !== false;
+    if (data.plate_margin !== undefined) document.getElementById("plate-margin").value = data.plate_margin;
     document.getElementById("update-status").textContent = "";
   });
 })();
 """
 
 
-def tab_html(initial_view: str, current_url: str, low_stock_grams: float) -> str:
+def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
+             plate_check: bool = True, plate_margin: int = DEFAULT_PLATE_MARGIN) -> str:
     """The spool list and Settings as two views of one page, under a shared header.
 
     Built from the standalone pages, which SpoolioWindow still shows as separate windows.
     """
     main_css, main_body, main_js = _split_page(main_html())
     settings_css, settings_body, settings_js = _split_page(settings_html(
-        current_url, {"ok": False, "pending": True}, low_stock_grams,
+        current_url, {"ok": False, "pending": True}, low_stock_grams, plate_check, plate_margin,
     ))
     main_body, main_header = _take_header(main_body)
     settings_body, settings_header = _take_header(settings_body)
@@ -1342,7 +1724,8 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float) -> str
     settings_button = _button(main_header, "settings-btn")
     feedback_button = _button(settings_header, "feedback")
     steps, reorder = _section(settings_body, "steps"), _section(settings_body, "reorder")
-    server, about = _section(settings_body, "server"), _section(settings_body, "about")
+    check, server = _section(settings_body, "check"), _section(settings_body, "server")
+    about = _section(settings_body, "about")
     footer = _section(settings_body, "footer")
     # The version and update check move out of the footer into the Diagnostics section.
     version_row = re.search(r'<div class="version-row">.*?</div>', footer, re.S).group(0)
@@ -1354,6 +1737,7 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float) -> str
   <div class="cell cell-guide"><h3><span class="emoji">🚀</span>Getting Started</h3>{steps}</div>
   <div class="cell cell-reorder">{reorder}</div>
   <div class="cell cell-preview">{TAB_PREVIEW_HTML}</div>
+  <div class="cell cell-check">{check}</div>
   <div class="cell cell-diag"><h3><span class="emoji">{wrench}</span>Diagnostics</h3>{about}</div>
 </div>
 {footer}"""
@@ -1409,12 +1793,17 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
     def _spoolman_url(self):
         return get_settings().get("spoolman_url", "")
 
-    def _save_settings(self, url, low_stock):
+    def _save_settings(self, url, low_stock, plate_check=True,
+                       plate_margin=DEFAULT_PLATE_MARGIN):
         settings = get_settings()
         settings["spoolman_url"] = url
         settings["low_stock_grams"] = parse_low_stock(low_stock)
+        settings["plate_check"] = parse_flag(plate_check)
+        settings["plate_margin_percent"] = parse_margin(plate_margin)
         if save_settings(settings):
-            log.info("Settings saved (url=%s, low stock=%s g)", url, settings["low_stock_grams"])
+            log.info("Settings saved (url=%s, low stock=%s g, filament check=%s, margin=%s%%)",
+                     url, settings["low_stock_grams"], settings["plate_check"],
+                     settings["plate_margin_percent"])
             return True
         orca.host.ui.message(
             f"Could not write settings to {SETTINGS_FILE}. Check that this folder is writable.",
@@ -1436,6 +1825,8 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                 saved_url,
                 spoolman_info={"ok": False, "pending": True},
                 low_stock_grams=parse_low_stock(get_settings().get("low_stock_grams")),
+                plate_check=plate_settings()[0],
+                plate_margin=plate_settings()[1],
             ),
             title=f"{PLUGIN_NAME} - Settings & About",
             width=SETTINGS_WINDOW_SIZE[0],
@@ -1482,7 +1873,9 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                         "error": "Test the connection successfully before saving.",
                     })
                 return
-            if self._save_settings(url, data.get("low_stock")):
+            saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
+                                        data.get("plate_margin"))
+            if saved:
                 self._after_save()
                 if self._settings_window is not None:
                     self._settings_window.close()
@@ -1646,6 +2039,8 @@ if HAS_PAGES:
                     initial_view="main" if url else "settings",
                     current_url=url,
                     low_stock_grams=parse_low_stock(get_settings().get("low_stock_grams")),
+                    plate_check=plate_settings()[0],
+                    plate_margin=plate_settings()[1],
                 )
             except Exception:
                 log.exception("get_ui() raised")
@@ -1695,13 +2090,17 @@ if HAS_PAGES:
 
             threading.Thread(target=worker, daemon=True).start()
 
-        def _save_settings(self, url, low_stock):
+        def _save_settings(self, url, low_stock, plate_check=True,
+                           plate_margin=DEFAULT_PLATE_MARGIN):
             settings = get_settings()
             settings["spoolman_url"] = url
             settings["low_stock_grams"] = parse_low_stock(low_stock)
+            settings["plate_check"] = parse_flag(plate_check)
+            settings["plate_margin_percent"] = parse_margin(plate_margin)
             if save_settings(settings):
-                log.info("Settings saved (url=%s, low stock=%s g)", url,
-                         settings["low_stock_grams"])
+                log.info("Settings saved (url=%s, low stock=%s g, filament check=%s, margin=%s%%)",
+                         url, settings["low_stock_grams"], settings["plate_check"],
+                         settings["plate_margin_percent"])
                 return True
             orca.host.ui.message(
                 f"Could not write settings to {SETTINGS_FILE}. Check that this folder is writable.",
@@ -1720,6 +2119,8 @@ if HAS_PAGES:
                 "view": "settings",
                 "url": saved_url,
                 "low_stock": parse_low_stock(get_settings().get("low_stock_grams")),
+                "plate_check": plate_settings()[0],
+                "plate_margin": plate_settings()[1],
             })
             self._check_connection(saved_url, self._settings_window)
 
@@ -1755,7 +2156,9 @@ if HAS_PAGES:
                         "error": "Test the connection successfully before saving.",
                     })
                     return
-                if self._save_settings(url, data.get("low_stock")):
+                saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
+                                            data.get("plate_margin"))
+                if saved:
                     self._after_save()
                     self._settings_window.close()
             elif msg_type == "feedback":
@@ -1793,6 +2196,31 @@ if HAS_PAGES:
             log.info("Unloading")
 
 
+if HAS_SLICING:
+
+    class SpoolioFilamentCheck(orca.slicing.SlicingPipelineCapabilityBase):
+        """After each slice, checks the plate's filament against the spools in Spoolman."""
+
+        def get_name(self):
+            return "Spoolio Filament Check"
+
+        def execute(self, ctx):
+            try:
+                if ctx.step != orca.slicing.Step.psGCodePostProcess:
+                    return orca.ExecutionResult.success()
+                enabled, margin = plate_settings()
+                if enabled:
+                    slots = plate_slots(ctx, parse_usage(read_tail(ctx.gcode_path)))
+                    if any(slot["grams"] > 0 for slot in slots):
+                        # Off the slicing thread: it may fetch the spool list, and UI calls from
+                        # here can deadlock while the GUI waits for slicing to finish.
+                        threading.Thread(target=run_plate_check, args=(slots, margin),
+                                         daemon=True).start()
+            except Exception:
+                log.exception("Filament check failed")
+            return orca.ExecutionResult.success()
+
+
 @orca.plugin
 class SpoolioPlugin(orca.base):
     def register_capabilities(self):
@@ -1800,3 +2228,5 @@ class SpoolioPlugin(orca.base):
             orca.register_capability(SpoolioPage)
         else:
             orca.register_capability(SpoolioWindow)
+        if HAS_SLICING:
+            orca.register_capability(SpoolioFilamentCheck)
