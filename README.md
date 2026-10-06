@@ -16,6 +16,7 @@ This plugin is best used in parallel with [HaspelSync](https://github.com/Rdiger
 - **RFID badge:** On spools that have a tag linked in Spoolman (requires Spoolman v.0.27.0 or newer).
 - **Filter, sort and group:** By material, manufacturer or location.
 - **Low-stock reorder button:** Spools under the user defined threshold will generate a cart icon on the card that opens a web search for reordering (either by a user input Spoolman article no. or it defaults to the filament name)
+- **Filament check when slicing:** After each slice, Spoolio checks the plate's filament against your matching spools and shows a notification in OrcaSlicer: a short-lived one when there's enough, and one that stays until dismissed when there may not be enough filament loaded.
 - **Guided settings:** With a connection test before your Spoolman address can be saved.
 - Matches OrcaSlicer's **light and dark theming**.
 - Built for **Windows, macOS and Linux** (x86_64 and arm64).
@@ -31,7 +32,7 @@ This plugin is best used in parallel with [HaspelSync](https://github.com/Rdiger
 
 ## Requirements
 
-- A current OrcaSlicer **nightly build** (tested on 2.5.0-dev Build 97700c5a and confirmed as working).
+- A current OrcaSlicer **nightly build** (tested on 2.5.0-dev `1d577ea4` and confirmed as working).
 - A self-hosted Spoolman server (v0.27.0 or newer required to show RFID tags).
 
 ## Install
@@ -62,11 +63,21 @@ Restart OrcaSlicer, then tick ***Activate*** for Spoolio. A **Spoolio** tab appe
 
 ## Set Up
 
-The Spoolio tab opens on its Settings page on first run. Enter your Spoolman server address (for example `http://raspberrypi.local:7912`), 
-click ***Test***, once the connection is confirmed then ***Save & Close***, which takes you back to your spool list. You can also set the low-stock threshold here, and 
-reopen the page any time with the ***Settings*** button.
+The Spoolio tab opens on its Settings page on first run. Enter your Spoolman server address (for example `http://raspberrypi.local:7912`), click ***Test***, once the connection is confirmed then ***Save & Close***, which takes you back to your spool list. You can also set the low-stock threshold here, and reopen the page any time with the ***Settings*** button.
 
 OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the first time the plugin connects to Spoolman, and another the first time you click a reorder cart to open your browser.
+
+> [!NOTE]
+> ### Filament Check 
+> After each slice, Spoolio compares the filament the plate needs with what is left on your spools. You get a short-lived notification when there is enough, and one that stays until you dismiss it when there may not be enough filament loaded.
+
+> To use it, switch on **Spoolio Filament Check** in your process settings, under **Others > Slicing Pipeline Plugin**. You can hide its notifications, or change its safety margin (10% by default), on the Settings page.
+
+> - Each filament the plate uses is matched to spools in Spoolman by vendor, material and colour. Slots that hold the same filament are treated as one supply, because the AMS moves on to the next spool of the same filament when one runs out: their use is added together and compared with the spools' combined weight. Spare spools that aren't loaded never count towards it.
+> - If a matching spool is too low to cover the plate and could be the one that is loaded, you get a warning to make sure the right spool is loaded. Archive finished spools in Spoolman so they aren't counted.
+> - If no spool matches, or Spoolman can't be reached, you get a short note and nothing else.
+> - Slicer figures are estimates and real use can differ a little, so the safety margin gives you headroom.
+> - Like the rest of Spoolio, it only reads from Spoolman.
 
 ## Feedback
 
