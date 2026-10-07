@@ -67,17 +67,17 @@ The Spoolio tab opens on its Settings page on first run. Enter your Spoolman ser
 
 OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the first time the plugin connects to Spoolman, and another the first time you click a reorder cart to open your browser.
 
-> [!NOTE]
+> [!TIP]
 > ### Filament Check 
 > After each slice, Spoolio compares the filament the plate needs with what is left on your spools. You get a short-lived notification when there is enough, and one that stays until you dismiss it when there may not be enough filament loaded.
 >
-> To use it, switch on **Spoolio Filament Check** in your process settings, under **Others > Slicing Pipeline Plugin**. You can hide its notifications, or change its safety margin (10% by default), on the Settings page.
->
+> To use it, switch on ***Spoolio Filament Check*** in your process settings, under ***Others > Slicing Pipeline Plugin***. You can hide its notifications, or change its safety margin (10% by default), on the Settings page.
+
+>[!NOTE]
 > - Each filament the plate uses is matched to spools in Spoolman by vendor, material and colour. Slots that hold the same filament are treated as one supply, because the AMS moves on to the next spool of the same filament when one runs out: their use is added together and compared with the spools' combined weight. Spare spools that aren't loaded never count towards it.
 > - If a matching spool is too low to cover the plate and could be the one that is loaded, you get a warning to make sure the right spool is loaded. Archive finished spools in Spoolman so they aren't counted.
 > - If no spool matches, or Spoolman can't be reached, you get a short note and nothing else.
 > - Slicer figures are estimates and real use can differ a little, so the safety margin gives you headroom.
-> - Like the rest of Spoolio, it only reads from Spoolman.
 
 ## Feedback
 
