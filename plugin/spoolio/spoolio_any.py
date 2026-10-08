@@ -6,7 +6,7 @@
 # name = "Spoolio"
 # description = "A Bambu Lab inspired inventory management overview for OrcaSlicer"
 # author = "Dan J Moore"
-# version = "0.3.0"
+# version = "0.4.0"
 # ///
 
 import html
@@ -29,46 +29,46 @@ import orca
 
 try:
     import orca.pages  # noqa: F401
-    HAS_PAGES = True
+    _PAGES = True
 except (ImportError, AttributeError):
-    HAS_PAGES = False
+    _PAGES = False
 
-HAS_SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
+_SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
 
 PLUGIN_NAME = "Spoolio"
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 # Stamped per operating system by scripts/build.py.
 BUILD_TARGET = "any"
 
 DEFAULT_SPOOLMAN_URL = "http://raspberrypi:7912"
-DEFAULT_LOW_FILAMENT_THRESHOLD = 100  # grams
+LOW_DEFAULT = 100  # grams
 
 FEEDBACK_URL = "https://github.com/danm1989/spoolio-orcaslicer/issues"
-LATEST_RELEASE_API = "https://api.github.com/repos/danm1989/spoolio-orcaslicer/releases/latest"
+RELEASE_API = "https://api.github.com/repos/danm1989/spoolio-orcaslicer/releases/latest"
 
 # webbrowser can only open a URL; it can't use the browser's default search engine.
 SEARCH_URL = "https://www.google.com/search?q={query}"
 
 SETTINGS_FILENAME = "spoolio_settings.json"
 LOG_FILENAME = "spoolio.log"
-LOG_MAX_BYTES = 256 * 1024
+LOG_MAX = 256 * 1024
 
-REQUEST_TIMEOUT = 5  # seconds
-MAX_QUERY_LENGTH = 200
-REFRESH_SECONDS = 60
-DEFAULT_PLATE_MARGIN = 10  # percent
-PLATE_TAIL_BYTES = 192 * 1024
-PLATE_SPOOL_CACHE_SECONDS = 120
-PLATE_REPEAT_SECONDS = 120
-PLATE_COLOUR_TOLERANCE = 40
-PLATE_NOTICE_MAX = 400
-PLATE_NOTICE_DELAY = 0.4  # seconds, so the slicing thread has returned before any UI call
+TIMEOUT = 5  # seconds
+MAX_QUERY = 200
+REFRESH_SECS = 60
+DEFAULT_MARGIN = 10  # percent
+TAIL_BYTES = 192 * 1024
+CACHE_SECS = 120
+REPEAT_SECS = 120
+COLOUR_TOLERANCE = 40
+NOTICE_MAX = 400
+NOTICE_DELAY = 0.4  # seconds, so the slicing thread has returned before any UI call
 FONT_STACK = (
     'Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "Helvetica Neue", '
     'Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif'
 )
-MAIN_WINDOW_SIZE = (380, 600)
-SETTINGS_WINDOW_SIZE = (560, 820)
+MAIN_SIZE = (380, 600)
+SETTINGS_SIZE = (560, 820)
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 
@@ -97,7 +97,7 @@ DATA_DIR = _data_dir()
 SETTINGS_FILE = DATA_DIR / SETTINGS_FILENAME
 LOG_FILE = DATA_DIR / LOG_FILENAME
 # Where earlier builds kept settings when OrcaSlicer's data folder wasn't found.
-LEGACY_SETTINGS_FILE = PLUGIN_DIR / SETTINGS_FILENAME
+OLD_SETTINGS = PLUGIN_DIR / SETTINGS_FILENAME
 
 log = logging.getLogger("spoolio")
 log.setLevel(logging.INFO)
@@ -105,13 +105,13 @@ log.propagate = False
 log.addHandler(logging.NullHandler())
 
 
-def setup_logging(path: Path | None = None) -> None:
+def setup_log(path: Path | None = None) -> None:
     if any(isinstance(h, RotatingFileHandler) for h in log.handlers):
         return
     path = path or LOG_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(path, maxBytes=LOG_MAX_BYTES, backupCount=1, encoding="utf-8")
+        handler = RotatingFileHandler(path, maxBytes=LOG_MAX, backupCount=1, encoding="utf-8")
     except OSError:
         return
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -119,13 +119,13 @@ def setup_logging(path: Path | None = None) -> None:
 
 
 # Started at import so anything that goes wrong while the plugin loads is captured.
-setup_logging()
+setup_log()
 log.info(
     "%s %s (%s build) imported; orca.pages %s",
     PLUGIN_NAME,
     PLUGIN_VERSION,
     BUILD_TARGET,
-    "available" if HAS_PAGES else "not available",
+    "available" if _PAGES else "not available",
 )
 
 
@@ -146,11 +146,13 @@ def _report(key: str, error: str | None, exc_info: bool = False) -> None:
 def get_settings() -> dict:
     defaults = {
         "spoolman_url": "",
-        "low_stock_grams": DEFAULT_LOW_FILAMENT_THRESHOLD,
+        "low_stock_grams": LOW_DEFAULT,
         "plate_check": True,
-        "plate_margin_percent": DEFAULT_PLATE_MARGIN,
+        "plate_margin_percent": DEFAULT_MARGIN,
+        "weight_display": "both",
+        "show_cart": False,
     }
-    for path in (SETTINGS_FILE, LEGACY_SETTINGS_FILE):
+    for path in (SETTINGS_FILE, OLD_SETTINGS):
         try:
             return {**defaults, **json.loads(path.read_text(encoding="utf-8"))}
         except (OSError, ValueError):
@@ -158,13 +160,13 @@ def get_settings() -> dict:
     return defaults
 
 
-def parse_low_stock(value: object) -> float:
+def parse_low(value: object) -> float:
     try:
         grams = float(value)
     except (TypeError, ValueError):
-        return DEFAULT_LOW_FILAMENT_THRESHOLD
+        return LOW_DEFAULT
     if grams < 0:
-        return DEFAULT_LOW_FILAMENT_THRESHOLD
+        return LOW_DEFAULT
     return int(grams) if grams == int(grams) else grams
 
 
@@ -172,7 +174,7 @@ def parse_margin(value: object) -> int:
     try:
         return min(50, max(0, round(float(value))))
     except (TypeError, ValueError, OverflowError):
-        return DEFAULT_PLATE_MARGIN
+        return DEFAULT_MARGIN
 
 
 def parse_flag(value: object, default: bool = True) -> bool:
@@ -181,6 +183,18 @@ def parse_flag(value: object, default: bool = True) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "on", "yes")
     return bool(value)
+
+
+def parse_weights(value: object) -> str:
+    return value if value in ("grams", "percent", "both") else "both"
+
+
+def weight_mode() -> str:
+    return parse_weights(get_settings().get("weight_display"))
+
+
+def cart_on() -> bool:
+    return parse_flag(get_settings().get("show_cart"), default=False)
 
 
 def plate_settings() -> tuple[bool, int]:
@@ -203,7 +217,7 @@ def get_spools(spoolman_url: str) -> dict:
     """Return ``{"ok": True, "spools": [...]}`` or ``{"ok": False, "error": "..."}``."""
     url = f"{spoolman_url.rstrip('/')}/api/v1/spool"
     try:
-        with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         error = f"Could not reach Spoolman at {spoolman_url} ({exc.reason})"
@@ -221,7 +235,7 @@ def clean_url(url: str | None) -> str:
     return (url or "").strip().rstrip("/")
 
 
-def ping_spoolman(spoolman_url: str) -> dict:
+def ping(spoolman_url: str) -> dict:
     """Ask Spoolman for its version, which doubles as a connection test.
 
     Returns ``{"ok": True, "version": "..."}`` or ``{"ok": False, "error": "..."}``.
@@ -230,7 +244,7 @@ def ping_spoolman(spoolman_url: str) -> dict:
         return {"ok": False, "error": "No Spoolman URL configured yet"}
     url = f"{spoolman_url.rstrip('/')}/api/v1/info"
     try:
-        with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         error = f"Could not reach Spoolman at {spoolman_url} ({exc.reason})"
@@ -251,17 +265,17 @@ def is_newer(latest: str, current: str) -> bool:
     return parts(latest) > parts(current)
 
 
-def latest_release() -> dict:
+def get_release() -> dict:
     """Return ``{"ok": True, "version": ..., "url": ...}`` or ``{"ok": False, "error": ...}``."""
     request = urllib.request.Request(
-        LATEST_RELEASE_API,
+        RELEASE_API,
         headers={
             "Accept": "application/vnd.github+json",
             "User-Agent": f"Spoolio/{PLUGIN_VERSION}",
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -299,14 +313,14 @@ def open_url(url: str) -> bool:
 
 def open_search(query: object) -> None:
     if isinstance(query, str) and query.strip():
-        terms = urllib.parse.quote_plus(query.strip()[:MAX_QUERY_LENGTH])
+        terms = urllib.parse.quote_plus(query.strip()[:MAX_QUERY])
         open_url(SEARCH_URL.format(query=terms))
 
 
 def read_tail(path: str) -> list[str]:
     size = os.path.getsize(path)
     with open(path, "rb") as handle:
-        handle.seek(max(0, size - PLATE_TAIL_BYTES))
+        handle.seek(max(0, size - TAIL_BYTES))
         return handle.read().decode("utf-8", "replace").splitlines()
 
 
@@ -344,7 +358,7 @@ def plate_slots(ctx, grams: list[float]) -> list[dict]:
     ]
 
 
-def colour_distance(first: str, second: str) -> float | None:
+def colour_diff(first: str, second: str) -> float | None:
     def rgb(value):
         digits = (value or "").strip().lstrip("#")[:6]
         if not re.fullmatch(r"[0-9a-fA-F]{6}", digits):
@@ -359,7 +373,7 @@ def _norm(text: object) -> str:
     return re.sub(r"[^a-z0-9+]", "", str(text or "").lower())
 
 
-def _same_material(slicer: object, spool: object) -> bool:
+def _same_mat(slicer: object, spool: object) -> bool:
     """Equal, or one is a variant of the other ("PLA" and "PLA Matte" or "PLA+")."""
     first, second = _norm(slicer), _norm(spool)
     return bool(first) and bool(second) and (first.startswith(second) or second.startswith(first))
@@ -380,10 +394,10 @@ def match_spools(slot: dict, spools: list[dict]) -> list[dict]:
             theirs = _norm((filament.get("vendor") or {}).get("name"))
             if not theirs or (vendor not in theirs and theirs not in vendor):
                 continue
-        if not _same_material(slot["material"], filament.get("material")):
+        if not _same_mat(slot["material"], filament.get("material")):
             continue
-        distance = colour_distance(slot["colour"], filament.get("color_hex"))
-        if distance is not None and distance <= PLATE_COLOUR_TOLERANCE:
+        distance = colour_diff(slot["colour"], filament.get("color_hex"))
+        if distance is not None and distance <= COLOUR_TOLERANCE:
             exact = _norm(slot["material"]) == _norm(filament.get("material"))
             found.append((distance, exact, spool))
     # An exact colour beats a near one, and an exact material beats a variant.
@@ -415,7 +429,7 @@ def check_group(group: dict, spools: list[dict], margin: int) -> dict:
     need = sum(used["grams"] for used in group["used"])
     result = {"slot": slot, "slots": [used["n"] for used in group["used"]], "need": need,
               "margin": margin, "pool": pool, "matches": len(matches), "status": "unknown",
-              "ams": bool(slot.get("ams"))}
+              "ams": bool(slot.get("ams")), "ids": [spool.get("id") for spool in matches]}
     if not matches:
         return result
     padded = need * (1 + margin / 100)
@@ -429,10 +443,13 @@ def check_group(group: dict, spools: list[dict], margin: int) -> dict:
         status = "barely"
     else:
         status = "short"
-    fullest = max(matches, key=lambda spool: spool["remaining_weight"])
+    ranked = sorted(matches, key=lambda spool: spool["remaining_weight"], reverse=True)
+    fullest = ranked[0]
     name = (fullest.get("filament") or {}).get("name") or ""
+    total = sum(spool.get("initial_weight") or (spool.get("filament") or {}).get("weight") or 0
+                for spool in ranked[:pool])
     return {**result, "status": status, "have": best, "worst": worst, "padded": padded,
-            "name": name}
+            "name": name, "total": total, "spool_colour": (fullest.get("filament") or {}).get("color_hex")}
 
 
 def fmt_grams(grams: float) -> str:
@@ -536,7 +553,7 @@ def plate_notice(results: list[dict]) -> tuple[str, str] | None:
     return kind, "Spoolio: " + " ".join(parts)
 
 
-def fit_text(text: str, limit: int = PLATE_NOTICE_MAX) -> str:
+def fit_text(text: str, limit: int = NOTICE_MAX) -> str:
     """Whole sentences only: what doesn't fit is dropped and counted, never cut mid-sentence."""
     if len(text) <= limit:
         return text
@@ -549,18 +566,19 @@ def fit_text(text: str, limit: int = PLATE_NOTICE_MAX) -> str:
     return text[:limit - 1] + "\u2026"
 
 
-_recent_notices: dict[str, float] = {}
+_recent: dict[str, float] = {}
+_plate: dict = {"payload": None, "slots": [], "margin": DEFAULT_MARGIN, "page": None}
 
 
 def is_repeat(text: str) -> bool:
     """True if this exact notice was shown moments ago, so re-slicing doesn't stack warnings."""
     now = time.monotonic()
-    expired = [key for key, shown in _recent_notices.items() if now - shown > PLATE_REPEAT_SECONDS]
+    expired = [key for key, shown in _recent.items() if now - shown > REPEAT_SECS]
     for old in expired:
-        del _recent_notices[old]
-    if text in _recent_notices:
+        del _recent[old]
+    if text in _recent:
         return True
-    _recent_notices[text] = now
+    _recent[text] = now
     return False
 
 
@@ -589,28 +607,103 @@ def push_notice(kind: str, text: str) -> bool:
 def plate_spools(url: str) -> list[dict] | None:
     """The spool list, from the cache when it is fresh; None if Spoolman can't be reached."""
     age = time.monotonic() - _spool_cache["time"]
-    if _spool_cache["url"] == url and age < PLATE_SPOOL_CACHE_SECONDS:
+    if _spool_cache["url"] == url and age < CACHE_SECS:
         return _spool_cache["spools"]
     result = get_spools(url)
     return result["spools"] if result["ok"] else None
 
 
-def run_plate_check(slots: list[dict], margin: int) -> None:
-    time.sleep(PLATE_NOTICE_DELAY)
-    try:
-        url = get_settings().get("spoolman_url", "")
-        spools = plate_spools(url) if url else None
-        if not url:
-            notice = ("info", "Spoolio: no Spoolman address is set up yet, "
-                              "so the filament quantity wasn't checked.")
-        elif spools is None:
-            notice = ("info", "Spoolio: couldn't reach Spoolman, "
-                              "so the filament quantity wasn't checked.")
+def plate_rows(results: list[dict]) -> list[dict]:
+    rows = []
+    for r in results:
+        slot, numbers, status = r["slot"], r["slots"], r["status"]
+        many = len(numbers) > 1
+        preset = slot["preset"].split("@")[0].strip()
+        name = r.get("name") or preset or " ".join(p for p in (slot["vendor"], slot["material"]) if p)
+        need, have, count = fmt_grams(r["need"]), r.get("have", 0), min(r["pool"], r["matches"])
+        total = r.get("total") or max(have, r["need"])
+        if status == "unknown":
+            headline, detail = "Not checked", f"no spool found for {'these slots' if many else 'this slot'}"
         else:
-            results = [check_group(group, spools, margin) for group in group_slots(slots)]
-            log.info("Plate check: %s", ", ".join(
-                f"slot {'+'.join(str(n) for n in r['slots'])} {r['status']}" for r in results))
-            notice = plate_notice(results)
+            headline = {"ok": "Quantity OK", "barely": "Barely enough", "short": "Not enough",
+                        "mixed": "Check the spool" + ("s" if count > 1 else "")}[status]
+            if status == "mixed":
+                detail = f"{need} needed \u00b7 matching spools hold {fmt_grams(r['worst'])} to {fmt_grams(have)}"
+            elif count > 1:
+                detail = f"{need} needed \u00b7 {fmt_grams(have)} across {count} spools"
+            elif status == "ok" and r["matches"] == 1:
+                detail = f"{need} needed \u00b7 leaves {fmt_grams(have - r['need'])}"
+            elif status == "ok":
+                detail = f"{need} needed \u00b7 every matching spool has at least {fmt_grams(r['worst'])}"
+            else:
+                detail = f"{need} needed \u00b7 {fmt_grams(have)} left"
+        rows.append({
+            "slots": ("Slots " if many else "Slot ") + " + ".join(str(n) for n in numbers),
+            "first": min(numbers), "name": name,
+            "meta": " \u00b7 ".join(p for p in (slot["vendor"], f"{len(numbers)} slots, pooled" if many else "") if p),
+            "colour": slot["colour"], "status": status, "headline": headline, "detail": detail,
+            "fill": round(min(1.0, have / total), 3), "need_pct": round(min(1.0, r["need"] / total), 3),
+            "spool_colour": r.get("spool_colour") or slot["colour"],
+            "ids": r["ids"],
+        })
+    return rows
+
+
+def send_plate(payload: dict | None) -> None:
+    page = _plate["page"]
+    if page is None:
+        return
+    try:
+        page.post_message(payload or {"type": "plate_clear"})
+    except Exception:
+        log.exception("Could not update the plate panel")
+
+
+def show_plate(slots: list[dict], margin: int, results: list[dict] | None) -> None:
+    payload = ({"type": "plate", "time": time.strftime("%H:%M"), "rows": plate_rows(results)}
+               if results else None)
+    _plate.update(payload=payload, slots=slots, margin=margin)
+    send_plate(payload)
+
+
+def clear_plate() -> None:
+    _plate["payload"] = None
+    send_plate(None)
+
+
+def recheck() -> None:
+    slots, margin = _plate["slots"], _plate["margin"]
+    if not slots:
+        return
+    try:
+        show_plate(slots, margin, check_plate(slots, margin, fresh=True)[1])
+    except Exception:
+        log.exception("Plate re-check failed")
+
+
+def check_plate(slots: list[dict], margin: int, fresh: bool = False) -> tuple[tuple | None, list | None]:
+    """The notice for a plate and its per-group results (None when Spoolman couldn't be checked)."""
+    url = get_settings().get("spoolman_url", "")
+    if fresh:
+        _spool_cache["time"] = float("-inf")
+    spools = plate_spools(url) if url else None
+    if not url:
+        return ("info", "Spoolio: no Spoolman address is set up yet, "
+                        "so the filament quantity wasn't checked."), None
+    if spools is None:
+        return ("info", "Spoolio: couldn't reach Spoolman, "
+                        "so the filament quantity wasn't checked."), None
+    results = [check_group(group, spools, margin) for group in group_slots(slots)]
+    log.info("Plate check: %s", ", ".join(
+        f"slot {'+'.join(str(n) for n in r['slots'])} {r['status']}" for r in results))
+    return plate_notice(results), results
+
+
+def run_check(slots: list[dict], margin: int) -> None:
+    time.sleep(NOTICE_DELAY)
+    try:
+        notice, results = check_plate(slots, margin)
+        show_plate(slots, margin, results)
         if notice and not is_repeat(notice[1]):
             log.info("Plate notice (%s): %s", *notice)
             push_notice(*notice)
@@ -689,7 +782,7 @@ def _fill(template: str, **values: object) -> str:
 
 # The pages and the tab set overscroll-behavior-x: none so a two-finger trackpad swipe
 # can't navigate the embedded browser back or forward, which lands on a blank page.
-MAIN_PAGE_TEMPLATE = """
+MAIN_PAGE = """
 <!doctype html>
 <html>
 <head>
@@ -713,6 +806,9 @@ MAIN_PAGE_TEMPLATE = """
     background: transparent; color: var(--orca-fg);
   }
   button:hover { border-color: var(--orca-accent); }
+  #settings-btn, #plate-recheck, #plate-dismiss, #filters-toggle {
+    padding: 7px 16px; border-radius: 6px; font-size: 13px; font-weight: 700;
+  }
   #settings-btn, .sort-dir { background: var(--orca-accent); color: var(--orca-accent-fg); border-color: var(--orca-accent); }
   .filters { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
   .filters input, .filters select {
@@ -787,10 +883,58 @@ MAIN_PAGE_TEMPLATE = """
     background: rgba(127, 127, 127, 0.25); overflow: hidden;
   }
   .spool-bar-fill { height: 100%; border-radius: 3px; }
-  .spool-subtitle {
-    font-size: 12px; color: var(--orca-muted); font-style: italic;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  .spool-pct { font-size: 12px; color: var(--orca-muted); }
+  .spool-weight.low .spool-pct { color: inherit; opacity: 0.8; }
+  .spool-dup {
+    margin-left: 8px; padding: 1px 8px; border-radius: 99px; vertical-align: middle;
+    border: 1px solid var(--orca-border); color: var(--orca-muted);
+    font-size: 11px; font-weight: 700;
   }
+  .spool-subtitle {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    font-size: 12px; color: var(--orca-muted); font-style: italic;
+  }
+  .sub-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .plate-chip {
+    flex: none; margin: 5px 0 4px; padding: 3px 11px; border-radius: 99px;
+    border: 1px solid var(--orca-accent); font-size: 11px; font-weight: 700; font-style: normal;
+    background: color-mix(in srgb, var(--orca-accent) 25%, var(--orca-bg) 75%);
+    color: color-mix(in srgb, var(--orca-accent) 55%, var(--orca-fg) 45%);
+  }
+
+  .plate { margin: 6px 0 2px; color: var(--orca-fg); }
+  .divider { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 8px 0 4px; }
+  .divider .line { flex: 1; height: 1px; min-width: 12px; background: var(--orca-border); }
+  .divider-title { font-weight: 700; color: color-mix(in srgb, var(--orca-accent) 75%, var(--orca-fg) 25%); }
+  .divider-sub { color: var(--orca-muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .plate-pill { padding: 2px 10px; border-radius: 99px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+  .plate-pill.attention { background: rgba(210, 153, 34, 0.22); color: #e0a030; }
+  .plate-pill.fine { background: rgba(63, 185, 80, 0.18); color: #3fb950; }
+  #plate-recheck { background: var(--orca-accent); color: var(--orca-accent-fg); border-color: var(--orca-accent); }
+  .plate-row { display: flex; flex-wrap: wrap; gap: 6px 11px; align-items: center; padding: 8px 15px; }
+  .plate-who { flex: 1 1 200px; min-width: 0; }
+  .plate-who .plate-name, .plate-who .plate-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .plate-rows .plate-row + .plate-row { border-top: 1px solid var(--orca-border); }
+  .plate-dot {
+    flex: none; width: 16px; height: 16px; margin: 0 13px; border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.15); box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.2);
+  }
+  .plate-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .plate-meta { color: var(--orca-muted); font-size: 12px; margin-top: 1px; }
+  .plate-result { flex: 1.4 1 190px; text-align: right; min-width: 0; }
+  .plate-headline { font-weight: 700; }
+  .plate-bar { flex: 3 1 120px; position: relative; height: 8px; border-radius: 4px; background: rgba(127, 127, 127, 0.25); overflow: hidden; }
+  .plate-bar .have { position: absolute; top: 0; bottom: 0; left: 0; }
+  .plate-bar .need {
+    position: absolute; top: 0; bottom: 0; left: 0;
+    background: repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.38) 0, rgba(255, 255, 255, 0.38) 3px, rgba(0, 0, 0, 0.38) 3px, rgba(0, 0, 0, 0.38) 6px);
+  }
+  .listbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  .listbar #status { margin-bottom: 0; }
+  .st-ok .plate-headline { color: #3fb950; }
+  .st-barely .plate-headline, .st-mixed .plate-headline { color: #e0a030; }
+  .st-short .plate-headline { color: #d9534f; }
+  .st-unknown .plate-headline { color: var(--orca-muted); }
 
   .group { margin-bottom: 4px; }
   .group-card {
@@ -821,8 +965,11 @@ MAIN_PAGE_TEMPLATE = """
       <button id="settings-btn" title="Settings &amp; about">Settings</button>
     </div>
   </div><!--/header-->
-  <div id="status">Loading...</div>
-
+  <div class="listbar">
+    <div id="status">Loading...</div>
+    <button id="filters-toggle" aria-expanded="false">Filters &#9662;</button>
+  </div>
+  <div id="filters-panel" hidden>
   <div class="filters">
     <input id="search" type="text" placeholder="Filter by name...">
     <select id="material-filter"><option value="">All materials</option></select>
@@ -843,8 +990,24 @@ MAIN_PAGE_TEMPLATE = """
       <option value="used">Sort: Used weight</option>
       <option value="first_used">Sort: First used</option>
       <option value="last_used">Sort: Last used</option>
+      <option value="plate" disabled>Sort: On this plate</option>
     </select>
     <button class="sort-dir" id="sort-dir" title="Toggle ascending/descending">&#9650;</button>
+  </div>
+  </div>
+
+  <div id="plate" class="plate" hidden>
+    <div class="divider">
+      <span class="line"></span>
+      <span class="divider-title">⚖️ This plate</span>
+      <span class="divider-sub" id="plate-sub"></span>
+      <span class="line"></span>
+      <span class="plate-pill" id="plate-pill"></span>
+      <button id="plate-recheck" title="Check again against Spoolman">Re-check</button>
+      <button id="plate-dismiss" title="Hide until the next slice">Dismiss</button>
+    </div>
+    <div class="plate-rows" id="plate-rows"></div>
+    <div class="divider"><span class="line"></span><span class="divider-title">All spools</span><span class="line"></span></div>
   </div>
 
   <div id="list"></div>
@@ -858,10 +1021,109 @@ MAIN_PAGE_TEMPLATE = """
     const groupKeyEl = document.getElementById("group-key");
     const sortKeyEl = document.getElementById("sort-key");
     const sortDirBtn = document.getElementById("sort-dir");
+    const fToggle = document.getElementById("filters-toggle");
+    const fPanel = document.getElementById("filters-panel");
+    const plateEl = document.getElementById("plate");
+    const plateList = document.getElementById("plate-rows");
+    const plateSort = sortKeyEl.querySelector('option[value="plate"]');
 
     let allSpools = [];
     let lowStockGrams = __LOW_STOCK_DEFAULT__;
+    let wMode = "both";
+    let cart = false;
     let sortDir = "asc";
+    let plate = null;
+    let plateSlots = new Map();
+    let plateOrder = new Map();
+    let dupes = new Map();
+    let lastSort = sortKeyEl.value;
+
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function plateRowEl(row) {
+      const node = el("div", "plate-row st-" + row.status);
+      const dot = el("div", "plate-dot");
+      dot.style.background = /^#?[0-9a-f]{6}/i.test(row.colour) ? "#" + row.colour.replace(/^#/, "").slice(0, 6) : "#888";
+      const who = el("div", "plate-who");
+      who.appendChild(el("div", "plate-name", row.slots + " \u00b7 " + row.name));
+      who.appendChild(el("div", "plate-meta", row.meta));
+      const bar = el("div", "plate-bar");
+      if (row.status !== "unknown") {
+        const have = el("i", "have");
+        have.style.width = Math.round(row.fill * 100) + "%";
+        have.style.background = "#" + String(row.spool_colour).replace(/^#/, "").slice(0, 6);
+        bar.appendChild(have);
+        const need = el("i", "need");
+        need.style.width = Math.round(row.need_pct * 100) + "%";
+        bar.appendChild(need);
+      }
+      const result = el("div", "plate-result");
+      result.appendChild(el("div", "plate-headline", row.headline));
+      result.appendChild(el("div", "plate-meta", row.detail));
+      node.append(dot, who, bar, result);
+      return node;
+    }
+
+    function setPlate(data) {
+      plate = data && Array.isArray(data.rows) && data.rows.length ? data : null;
+      plateSlots = new Map();
+      plateOrder = new Map();
+      plateList.innerHTML = "";
+      if (plate) {
+        plate.rows.forEach(function (row) {
+          plateList.appendChild(plateRowEl(row));
+          row.ids.forEach(function (id) {
+            plateSlots.set(id, plateSlots.has(id) ? plateSlots.get(id) + ", " + row.slots : row.slots);
+            if (!plateOrder.has(id) || row.first < plateOrder.get(id)) plateOrder.set(id, row.first);
+          });
+        });
+        const attention = plate.rows.filter(function (r) {
+          return r.status === "barely" || r.status === "mixed" || r.status === "short";
+        }).length;
+        const fine = plate.rows.some(function (r) { return r.status === "ok"; });
+        const pill = document.getElementById("plate-pill");
+        pill.className = "plate-pill " + (attention ? "attention" : "fine");
+        pill.textContent = attention ? attention + (attention === 1 ? " needs" : " need") + " attention" : "Quantity OK";
+        pill.hidden = !attention && !fine;
+        document.getElementById("plate-sub").textContent =
+          "Sliced " + (plate.time || "") + " \u00b7 striped = needed, solid = left \u00b7 clears on next slice";
+      }
+      plateEl.hidden = !plate;
+      plateSort.disabled = !plate;
+      if (!plate && sortKeyEl.value === "plate") sortKeyEl.value = lastSort;
+      applyFilters();
+    }
+
+    function computeDupes() {
+      dupes = new Map();
+      allSpools.forEach(function (s) {
+        const id = (s.filament || {}).id;
+        if (s.archived || id === undefined || typeof s.remaining_weight !== "number") return;
+        const d = dupes.get(id) || { count: 0, total: 0 };
+        d.count += 1;
+        d.total += s.remaining_weight;
+        dupes.set(id, d);
+      });
+    }
+
+    function setFilters(open) {
+      fPanel.hidden = !open;
+      fToggle.setAttribute("aria-expanded", open ? "true" : "false");
+      try { localStorage.setItem("spoolio.filters", open ? "1" : "0"); } catch (err) {}
+      filterLabel();
+    }
+
+    function filterLabel() {
+      const active = (searchEl.value.trim() ? 1 : 0) + (materialEl.value ? 1 : 0) +
+        (vendorEl.value ? 1 : 0) + (groupKeyEl.value !== "none" ? 1 : 0);
+      fToggle.innerHTML = "Filters" + (active ? " (" + active + ")" : "") +
+        (fPanel.hidden ? " &#9662;" : " &#9652;");
+    }
 
     function populateFilterOptions() {
       const materials = new Set();
@@ -902,6 +1164,13 @@ MAIN_PAGE_TEMPLATE = """
         : Math.round(grams) + " g";
     }
 
+    function lowTint(grams) {
+      if (typeof grams !== "number" || lowStockGrams <= 0 || grams >= lowStockGrams) return "";
+      const t = Math.max(0, Math.min(1, (lowStockGrams - grams) / (lowStockGrams * 0.8)));
+      const amber = [224, 160, 48], red = [217, 83, 79];
+      return "rgb(" + amber.map(function (v, i) { return Math.round(v + (red[i] - v) * t); }).join(",") + ")";
+    }
+
     function tagUids(s) {
       const tags = s.tags;
       if (!Array.isArray(tags)) return [];
@@ -921,6 +1190,7 @@ MAIN_PAGE_TEMPLATE = """
         case "used": return (typeof s.used_weight === "number") ? s.used_weight : null;
         case "first_used": return s.first_used ? Date.parse(s.first_used) : null;
         case "last_used": return s.last_used ? Date.parse(s.last_used) : null;
+        case "plate": return plateOrder.has(s.id) ? plateOrder.get(s.id) : null;
         default: return null;
       }
     }
@@ -965,6 +1235,15 @@ MAIN_PAGE_TEMPLATE = """
         percent = Math.max(0, Math.min(100, Math.round((remaining / original) * 100)));
       }
       const remainingLabel = formatWeight(remaining);
+      const wHtml = percent === null || wMode === "grams" ? remainingLabel
+        : wMode === "percent" ? percent + '%'
+        : '<span class="spool-pct">' + percent + '% \u00b7</span>' + remainingLabel;
+      const dupe = dupes.get(filament.id);
+      const dupeHtml = dupe && dupe.count > 1
+        ? '<span class="spool-dup">\u00d7' + dupe.count + ' \u00b7 ' + formatWeight(dupe.total) + ' together</span>'
+        : '';
+      const plateLabel = plateSlots.get(s.id);
+      const chipHtml = plateLabel ? '<span class="plate-chip">On this plate \u00b7 ' + plateLabel + '</span>' : '';
       const percentTitle = percent === null ? "Remaining unknown" : percent + "% remaining";
       const tagHtml = vendorName
         ? '<div class="spool-tag">' +
@@ -977,8 +1256,9 @@ MAIN_PAGE_TEMPLATE = """
             '<span>' + vendorName + '</span>' +
           '</div>'
         : '';
+      const tint = lowTint(remaining);
       const searchQuery = [vendorName, s.lot_nr || name].filter(Boolean).join(" ");
-      const cartHtml = (typeof remaining === "number" && remaining < lowStockGrams)
+      const cartHtml = (cart && typeof remaining === "number" && remaining < lowStockGrams)
         ? '<button class="spool-cart" data-q="' + encodeURIComponent(searchQuery) + '" ' +
             'title="Low stock - search online for ' + searchQuery.replace(/"/g, "") + '">' +
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
@@ -1007,13 +1287,13 @@ MAIN_PAGE_TEMPLATE = """
             '</div>' +
             '<div class="spool-main">' +
               '<div class="spool-top">' +
-                '<div class="spool-title">' + name + '</div>' +
-                '<div class="spool-weight">' + remainingLabel + cartHtml + '</div>' +
+                '<div class="spool-title">' + name + dupeHtml + '</div>' +
+                '<div class="spool-weight' + (tint ? ' low" style="color:' + tint : '') + '">' + wHtml + cartHtml + '</div>' +
               '</div>' +
               '<div class="spool-bar-track" title="' + percentTitle + '">' +
                 '<div class="spool-bar-fill" style="width:' + (percent === null ? 0 : percent) + '%;background:' + color + '"></div>' +
               '</div>' +
-              '<div class="spool-subtitle">' + subtitle + '</div>' +
+              '<div class="spool-subtitle"><span class="sub-text">' + subtitle + '</span>' + chipHtml + '</div>' +
             '</div>' +
           '</div>' +
         '</div>'
@@ -1047,6 +1327,9 @@ MAIN_PAGE_TEMPLATE = """
       const remainingLabel = hasRemaining ? formatWeight(totalRemaining) : "?";
       const percentLabel = percent === null ? "?" : percent + "%";
       const count = group.items.length + " spool" + (group.items.length === 1 ? "" : "s");
+      const wLabel = wMode === "grams" ? remainingLabel
+        : wMode === "percent" ? (percent === null ? remainingLabel : percentLabel)
+        : remainingLabel + ' \\u00b7 ' + percentLabel;
       const subLabel = [group.sub, count].filter(Boolean).join(" \\u00b7 ");
       return (
         '<div class="group' + (collapsed ? " collapsed" : "") + '" data-key="' + group.key + '">' +
@@ -1054,7 +1337,7 @@ MAIN_PAGE_TEMPLATE = """
             '<div class="arrow">' + (collapsed ? "\\u25b8" : "\\u25be") + '</div>' +
             '<div class="group-info"><div class="group-name">' + group.label + '</div><div class="group-meta">' + subLabel + '</div></div>' +
             '<div class="group-bar">' +
-              '<div class="group-meta" style="text-align:right;margin-bottom:2px;">' + remainingLabel + ' \\u00b7 ' + percentLabel + '</div>' +
+              '<div class="group-meta" style="text-align:right;margin-bottom:2px;">' + wLabel + '</div>' +
               '<div class="group-bar-track"><div class="group-bar-fill ' + progressClass(percent) +
                 '" style="width:' + (percent === null ? 0 : percent) + '%"></div></div>' +
             '</div>' +
@@ -1094,6 +1377,7 @@ MAIN_PAGE_TEMPLATE = """
     }
 
     function applyFilters() {
+      filterLabel();
       const query = searchEl.value.trim().toLowerCase();
       const material = materialEl.value;
       const vendor = vendorEl.value;
@@ -1113,7 +1397,8 @@ MAIN_PAGE_TEMPLATE = """
       statusEl.textContent = filtered.length + " of " + allSpools.length + " spool" +
         (allSpools.length === 1 ? "" : "s");
       filtered.sort(function (a, b) {
-        return compareSpools(a, b, sortKeyEl.value, sortDir);
+        return compareSpools(a, b, sortKeyEl.value, sortDir) ||
+          (sortKeyEl.value === "plate" ? compareSpools(a, b, "remaining", "asc") : 0);
       });
       if (filtered.length === 0) {
         listEl.innerHTML = '<div class="empty">No spools match this filter.</div>';
@@ -1135,7 +1420,10 @@ MAIN_PAGE_TEMPLATE = """
         return;
       }
       allSpools = payload.spools || [];
+      computeDupes();
       if (typeof payload.low_stock_grams === "number") lowStockGrams = payload.low_stock_grams;
+      if (typeof payload.weight_display === "string") wMode = payload.weight_display;
+      if (typeof payload.show_cart === "boolean") cart = payload.show_cart;
       populateFilterOptions();
       applyFilters();
     }
@@ -1143,6 +1431,10 @@ MAIN_PAGE_TEMPLATE = """
     orca.onMessage(function (data) {
       if (data && data.type === "spools") {
         render(data);
+      } else if (data && data.type === "plate") {
+        setPlate(data);
+      } else if (data && data.type === "plate_clear") {
+        setPlate(null);
       }
     });
 
@@ -1157,7 +1449,10 @@ MAIN_PAGE_TEMPLATE = """
     materialEl.addEventListener("change", applyFilters);
     vendorEl.addEventListener("change", applyFilters);
     groupKeyEl.addEventListener("change", applyFilters);
-    sortKeyEl.addEventListener("change", applyFilters);
+    sortKeyEl.addEventListener("change", function () {
+      if (sortKeyEl.value !== "plate") lastSort = sortKeyEl.value;
+      applyFilters();
+    });
     sortDirBtn.addEventListener("click", function () {
       sortDir = sortDir === "asc" ? "desc" : "asc";
       sortDirBtn.innerHTML = sortDir === "asc" ? "&#9650;" : "&#9660;";
@@ -1166,6 +1461,15 @@ MAIN_PAGE_TEMPLATE = """
 
     document.getElementById("settings-btn").addEventListener("click", function () {
       orca.postMessage({ type: "settings" });
+    });
+    fToggle.addEventListener("click", function () { setFilters(fPanel.hidden); });
+    try { setFilters(localStorage.getItem("spoolio.filters") === "1"); } catch (err) { setFilters(false); }
+    document.getElementById("plate-recheck").addEventListener("click", function () {
+      orca.postMessage({ type: "plate_recheck" });
+    });
+    document.getElementById("plate-dismiss").addEventListener("click", function () {
+      setPlate(null);
+      orca.postMessage({ type: "plate_dismiss" });
     });
 
     // Ask for data on load rather than relying on a push landing in time.
@@ -1179,7 +1483,7 @@ MAIN_PAGE_TEMPLATE = """
 </html>
 """
 
-SETTINGS_PAGE_TEMPLATE = """
+SETTINGS_PAGE = """
 <!doctype html>
 <html>
 <head>
@@ -1224,9 +1528,40 @@ SETTINGS_PAGE_TEMPLATE = """
   .divider.spaced { margin-top: 18px; }
   .hint { margin-top: 6px; font-size: 12px; color: var(--orca-muted); }
   .check-row { display: flex; align-items: center; gap: 8px; margin: 0 0 12px 0; cursor: pointer; }
+  .check-row input {
+    -webkit-appearance: none; appearance: none; flex: none; width: 17px; height: 17px; margin: 0;
+    border: 1.5px solid var(--orca-muted); border-radius: 4px; background: transparent; cursor: pointer;
+  }
+  .check-row input:hover { border-color: var(--orca-accent); }
+  .check-row input:checked {
+    border-color: #2fbfa8;
+    background: transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-7' fill='none' stroke='%232fbfa8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 13px no-repeat;
+  }
   .margin-row { display: flex; align-items: center; gap: 12px; }
   .margin-row label { margin: 0; }
   .margin-row input { width: 90px; }
+  .seg { display: inline-flex; margin: 6px 0 14px; border: 1px solid var(--orca-border); border-radius: 6px; overflow: hidden; }
+  .seg label { margin: 0; padding: 6px 18px; cursor: pointer; border-right: 1px solid var(--orca-border); }
+  .seg label:last-child { border-right: 0; }
+  .seg label.on { background: var(--orca-accent); color: var(--orca-accent-fg); font-weight: 700; }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .ws-card {
+    display: flex; gap: 11px; align-items: flex-start; padding: 13px 14px 11px;
+    border: 1px solid var(--orca-border); border-radius: 14px;
+    background: var(--orca-border);
+    background: color-mix(in srgb, var(--orca-fg) 5%, var(--orca-bg) 95%);
+  }
+  .ws-swatch {
+    flex: none; width: 42px; height: 42px; border-radius: 50%; background: #1a1a1a;
+    border: 2px solid rgba(255, 255, 255, 0.15); box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.2);
+  }
+  .ws-main { flex: 1; min-width: 0; }
+  .ws-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .ws-name { font-weight: 700; }
+  .ws-pct { color: var(--orca-muted); font-size: 12px; }
+  .ws-bar { height: 5px; margin: 6px 0 5px; border-radius: 3px; background: rgba(127, 127, 127, 0.25); overflow: hidden; }
+  .ws-bar i { display: block; height: 100%; width: 64%; background: #1a1a1a; }
+  .ws-sub { font-size: 12px; color: var(--orca-muted); font-style: italic; }
   input[type="checkbox"] { width: 16px; height: 16px; padding: 0; margin: 0; accent-color: var(--orca-accent); }
   .status.ok { color: #3fb950; }
   .status.error { color: #d9534f; }
@@ -1289,19 +1624,39 @@ SETTINGS_PAGE_TEMPLATE = """
   <div class="divider"></div>
 
   <!--reorder--><h3><span class="emoji">🛒</span>Configure Filament Reorder</h3>
+  <label class="check-row"><input id="show-cart" type="checkbox" __CART_CHECKED__>Show a cart button for reordering low-stock spools</label>
   <label for="low-stock" class="field-label">Low stock warning (grams):</label>
   <input id="low-stock" type="number" min="0" step="10" value="__LOW_STOCK__">
-  <div class="hint">Spools with this much filament remaining show a cart button for reordering.</div><!--/reorder-->
+  <div class="hint">Below this weight, a spool's remaining weight turns amber, then red as it runs out.</div><!--/reorder-->
 
   <div class="divider spaced"></div>
 
-  <!--check--><h3><span class="emoji">\u2696\ufe0f</span>Configure Filament Check</h3>
+  <!--check--><h3><span class="emoji">\u26a0\ufe0f</span>Configure Filament Check</h3>
   <label class="check-row"><input id="plate-check" type="checkbox" __PLATE_CHECKED__>Show filament check notifications</label>
   <div class="margin-row" title="Warns when a plate needs more than a spool has left, or would leave less than this margin spare.">
     <label for="plate-margin">Safety margin (%):</label>
     <input id="plate-margin" type="number" min="0" max="50" step="5" value="__PLATE_MARGIN__">
   </div>
   <div class="hint">OrcaSlicer also has to run the check: switch on Spoolio Filament Check in your process settings, under <span style="white-space: nowrap">Others &gt; Slicing Pipeline Plugin</span>.</div><!--/check-->
+
+  <div class="divider spaced"></div>
+
+  <!--weights--><h3><span class="emoji">\u2696\ufe0f</span>Configure Spool Weights</h3>
+  <div class="field-label">Show the remaining weight on spool cards as:</div>
+  <div class="seg" id="weight-seg">
+    <label><input type="radio" name="weight-display" value="grams">Grams</label>
+    <label><input type="radio" name="weight-display" value="percent">Percentage</label>
+    <label><input type="radio" name="weight-display" value="both">Both</label>
+  </div>
+  <div class="ws-card">
+    <div class="ws-swatch"></div>
+    <div class="ws-main">
+      <div class="ws-top"><span class="ws-name">PLA Matte - Black</span><span id="weight-sample"></span></div>
+      <div class="ws-bar"><i></i></div>
+      <div class="ws-sub">PLA \u00b7 #1A1A1A \u00b7 1.75mm</div>
+    </div>
+  </div>
+  <div class="hint">The percentage is what is left of the spool's original weight.</div><!--/weights-->
 
   <div class="divider spaced"></div>
 
@@ -1366,6 +1721,22 @@ SETTINGS_PAGE_TEMPLATE = """
     document.getElementById("feedback").addEventListener("click", function () {
       orca.postMessage({ type: "feedback" });
     });
+    const wRadios = document.querySelectorAll('input[name="weight-display"]');
+    const wSample = document.getElementById("weight-sample");
+    function wPick() {
+      const picked = document.querySelector('input[name="weight-display"]:checked');
+      return picked ? picked.value : "both";
+    }
+    function showWeight() {
+      const mode = wPick();
+      wRadios.forEach(function (r) { r.parentNode.classList.toggle("on", r.checked); });
+      wSample.innerHTML = mode === "grams" ? "640 g"
+        : mode === "percent" ? "64%"
+        : '<span class="ws-pct">64% \u00b7</span> 640 g';
+    }
+    wRadios.forEach(function (r) { r.addEventListener("change", showWeight); });
+    document.querySelector('input[name="weight-display"][value=' + __WEIGHT_MODE__ + ']').checked = true;
+    showWeight();
     const updateEl = document.getElementById("update-status");
     document.getElementById("check-update").addEventListener("click", function () {
       updateEl.textContent = "Checking...";
@@ -1413,6 +1784,8 @@ SETTINGS_PAGE_TEMPLATE = """
         type: "save", url: url, low_stock: lowStock,
         plate_check: document.getElementById("plate-check").checked,
         plate_margin: document.getElementById("plate-margin").value,
+        weight_display: wPick(),
+        show_cart: document.getElementById("show-cart").checked,
       });
     });
     refreshSave();
@@ -1424,18 +1797,19 @@ SETTINGS_PAGE_TEMPLATE = """
 
 def main_html() -> str:
     return _fill(
-        MAIN_PAGE_TEMPLATE,
+        MAIN_PAGE,
         LOGO=LOGO_IMG,
         LOGODATA=LOGO_DATA_URI,
         FONT=FONT_STACK,
         PLUGIN_NAME=PLUGIN_NAME,
-        LOW_STOCK_DEFAULT=DEFAULT_LOW_FILAMENT_THRESHOLD,
-        REFRESH_MS=REFRESH_SECONDS * 1000,
+        LOW_STOCK_DEFAULT=LOW_DEFAULT,
+        REFRESH_MS=REFRESH_SECS * 1000,
     )
 
 
 def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
-                  plate_check: bool = True, plate_margin: int = DEFAULT_PLATE_MARGIN) -> str:
+                  plate_check: bool = True, plate_margin: int = DEFAULT_MARGIN,
+                  weight: str = "both", cart: bool = False) -> str:
     """``spoolman_info`` describes the saved URL, not whatever is typed in the field."""
     verified_url = clean_url(current_url) if spoolman_info.get("ok") else ""
     if spoolman_info.get("ok"):
@@ -1448,7 +1822,7 @@ def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
         status_text = spoolman_info.get("error", "Not connected")
         status_class = "error"
     return _fill(
-        SETTINGS_PAGE_TEMPLATE,
+        SETTINGS_PAGE,
         LOGO=LOGO_IMG,
         LOGODATA=LOGO_DATA_URI,
         FONT=FONT_STACK,
@@ -1459,6 +1833,8 @@ def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
         LOW_STOCK=low_stock_grams,
         PLATE_CHECKED="checked" if plate_check else "",
         PLATE_MARGIN=plate_margin,
+        WEIGHT_MODE=json.dumps(parse_weights(weight)),
+        CART_CHECKED="checked" if cart else "",
         LOG_PATH=html.escape(str(LOG_FILE)),
         STATUS_TEXT=html.escape(status_text),
         STATUS_CLASS=status_class,
@@ -1557,15 +1933,16 @@ TAB_SETTINGS_CSS = """
   #view-settings .cell { padding: 14px 0; }
   /* Fixed heading height, content centred: paired headings stay level whatever the emoji size. */
   #view-settings .cell h3 { display: flex; align-items: center; height: 30px; }
-  #view-settings .cell-server, #view-settings .cell-reorder, #view-settings .cell-check {
+  #view-settings .cell-guide, #view-settings .cell-preview, #view-settings .cell-weights, #view-settings .cell-diag {
     grid-column: 1; padding-right: 32px;
   }
-  #view-settings .cell-guide, #view-settings .cell-preview, #view-settings .cell-diag {
+  #view-settings .cell-server, #view-settings .cell-reorder, #view-settings .cell-check {
     grid-column: 2; padding-left: 32px;
   }
-  #view-settings .cell-server, #view-settings .cell-guide { grid-row: 1; padding-top: 0; }
-  #view-settings .cell-reorder, #view-settings .cell-preview { grid-row: 2; }
-  #view-settings .cell-check, #view-settings .cell-diag { grid-row: 3; padding-bottom: 0; }
+  #view-settings .cell-guide, #view-settings .cell-server { grid-row: 1; padding-top: 0; }
+  #view-settings .cell-preview, #view-settings .cell-reorder { grid-row: 2; }
+  #view-settings .cell-weights, #view-settings .cell-check { grid-row: 3; }
+  #view-settings .cell-diag { grid-row: 4; padding-bottom: 0; }
   #view-settings .footer { border-top: none; }
   #view-settings .cell-guide h3 { margin-bottom: 16px; }
   #view-settings .cell-guide .step:last-child { margin-bottom: 0; }
@@ -1589,7 +1966,7 @@ TAB_SETTINGS_CSS = """
   @media (max-width: 900px) {
     #view-settings .settings-grid { grid-template-columns: minmax(0, 1fr); }
     #view-settings .cell { grid-column: auto; grid-row: auto; padding: 14px 0; }
-    #view-settings .cell-guide { order: -1; padding-top: 0; }
+    #view-settings .cell-guide { padding-top: 0; }
   }
 """
 
@@ -1603,7 +1980,7 @@ TAB_PREVIEW_HTML = """
 """
 
 # Reads the spool list the main view already receives, so the preview needs no requests.
-TAB_PREVIEW_SCRIPT = """
+TAB_PREVIEW_JS = """
   var input = document.getElementById("low-stock");
   var countEl = document.getElementById("preview-count");
   var listEl = document.getElementById("preview-list");
@@ -1666,7 +2043,7 @@ TAB_PREVIEW_SCRIPT = """
 # Loaded before either view's script. Each view gets its own `orca` object: the
 # settings view tags what it sends (both views send "ready"), and a single real
 # onMessage handler fans incoming messages out to both views.
-TAB_BRIDGE_SCRIPT = """
+TAB_BRIDGE = """
 (function () {
   var host = window.orca;
   var handlers = [];
@@ -1702,6 +2079,9 @@ TAB_BRIDGE_SCRIPT = """
     document.getElementById("low-stock").value = data.low_stock;
     document.getElementById("plate-check").checked = data.plate_check !== false;
     if (data.plate_margin !== undefined) document.getElementById("plate-margin").value = data.plate_margin;
+    var mode = document.querySelector('input[name="weight-display"][value="' + (data.weight_display || "both") + '"]');
+    if (mode) { mode.checked = true; mode.dispatchEvent(new Event("change")); }
+    document.getElementById("show-cart").checked = data.show_cart === true;
     document.getElementById("update-status").textContent = "";
   });
 })();
@@ -1709,7 +2089,8 @@ TAB_BRIDGE_SCRIPT = """
 
 
 def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
-             plate_check: bool = True, plate_margin: int = DEFAULT_PLATE_MARGIN) -> str:
+             plate_check: bool = True, plate_margin: int = DEFAULT_MARGIN,
+             weight: str = "both", cart: bool = False) -> str:
     """The spool list and Settings as two views of one page, under a shared header.
 
     Built from the standalone pages, which SpoolioWindow still shows as separate windows.
@@ -1717,6 +2098,7 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
     main_css, main_body, main_js = _split_page(main_html())
     settings_css, settings_body, settings_js = _split_page(settings_html(
         current_url, {"ok": False, "pending": True}, low_stock_grams, plate_check, plate_margin,
+        weight, cart,
     ))
     main_body, main_header = _take_header(main_body)
     settings_body, settings_header = _take_header(settings_body)
@@ -1726,6 +2108,7 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
     steps, reorder = _section(settings_body, "steps"), _section(settings_body, "reorder")
     check, server = _section(settings_body, "check"), _section(settings_body, "server")
     about = _section(settings_body, "about")
+    weights = _section(settings_body, "weights")
     footer = _section(settings_body, "footer")
     # The version and update check move out of the footer into the Diagnostics section.
     version_row = re.search(r'<div class="version-row">.*?</div>', footer, re.S).group(0)
@@ -1733,11 +2116,12 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
     about = about.replace('<div class="logpath">', version_row + '<div class="logpath">', 1)
     wrench = "\U0001F6E0\uFE0F"
     settings_view = f"""<div class="settings-grid">
-  <div class="cell cell-server">{server}</div>
   <div class="cell cell-guide"><h3><span class="emoji">🚀</span>Getting Started</h3>{steps}</div>
+  <div class="cell cell-server">{server}</div>
   <div class="cell cell-reorder">{reorder}</div>
   <div class="cell cell-preview">{TAB_PREVIEW_HTML}</div>
   <div class="cell cell-check">{check}</div>
+  <div class="cell cell-weights">{weights}</div>
   <div class="cell cell-diag"><h3><span class="emoji">{wrench}</span>Diagnostics</h3>{about}</div>
 </div>
 {footer}"""
@@ -1767,10 +2151,10 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
 </div>
 <div id="view-main" class="view {_hidden(not on_main)}">{main_body}</div>
 <div id="view-settings" class="view {_hidden(on_main)}">{settings_view}</div>
-<script>{TAB_BRIDGE_SCRIPT}</script>
+<script>{TAB_BRIDGE}</script>
 <script>(function (orca) {{{main_js}}})(window.__spoolio.main);</script>
 <script>(function (orca) {{{settings_js}}})(window.__spoolio.settings);</script>
-<script>(function (bridge) {{{TAB_PREVIEW_SCRIPT}}})(window.__spoolio.settings);</script>
+<script>(function (bridge) {{{TAB_PREVIEW_JS}}})(window.__spoolio.settings);</script>
 </body>
 </html>
 """
@@ -1794,12 +2178,14 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
         return get_settings().get("spoolman_url", "")
 
     def _save_settings(self, url, low_stock, plate_check=True,
-                       plate_margin=DEFAULT_PLATE_MARGIN):
+                       plate_margin=DEFAULT_MARGIN, weight="both", cart=False):
         settings = get_settings()
         settings["spoolman_url"] = url
-        settings["low_stock_grams"] = parse_low_stock(low_stock)
+        settings["low_stock_grams"] = parse_low(low_stock)
         settings["plate_check"] = parse_flag(plate_check)
         settings["plate_margin_percent"] = parse_margin(plate_margin)
+        settings["weight_display"] = parse_weights(weight)
+        settings["show_cart"] = parse_flag(cart, default=False)
         if save_settings(settings):
             log.info("Settings saved (url=%s, low stock=%s g, filament check=%s, margin=%s%%)",
                      url, settings["low_stock_grams"], settings["plate_check"],
@@ -1824,13 +2210,15 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
             html=settings_html(
                 saved_url,
                 spoolman_info={"ok": False, "pending": True},
-                low_stock_grams=parse_low_stock(get_settings().get("low_stock_grams")),
+                low_stock_grams=parse_low(get_settings().get("low_stock_grams")),
                 plate_check=plate_settings()[0],
                 plate_margin=plate_settings()[1],
+                weight=weight_mode(),
+                cart=cart_on(),
             ),
             title=f"{PLUGIN_NAME} - Settings & About",
-            width=SETTINGS_WINDOW_SIZE[0],
-            height=SETTINGS_WINDOW_SIZE[1],
+            width=SETTINGS_SIZE[0],
+            height=SETTINGS_SIZE[1],
             on_message=self._on_settings,
             on_close=self._on_settings_close,
         )
@@ -1841,7 +2229,7 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
         self._testing = True
 
         def worker():
-            info = ping_spoolman(url)
+            info = ping(url)
             self._testing = False
             if info.get("ok"):
                 self._verified_url = clean_url(url)
@@ -1874,7 +2262,8 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                     })
                 return
             saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
-                                        data.get("plate_margin"))
+                                        data.get("plate_margin"), data.get("weight_display"),
+                                        data.get("show_cart"))
             if saved:
                 self._after_save()
                 if self._settings_window is not None:
@@ -1888,7 +2277,7 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
             window = self._settings_window
 
             def worker():
-                result = latest_release()
+                result = get_release()
                 self._checking_update = False
                 if result["ok"]:
                     self._release_url = result["url"]
@@ -1937,13 +2326,14 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
             return
         self._refreshing = True
         panel = self._panel
-        low_stock_grams = parse_low_stock(get_settings().get("low_stock_grams"))
+        low_stock_grams = parse_low(get_settings().get("low_stock_grams"))
 
         def worker():
             result = get_spools(url)
             self._refreshing = False
             if panel.is_open():
-                panel.post({"type": "spools", "low_stock_grams": low_stock_grams, **result})
+                panel.post({"type": "spools", "low_stock_grams": low_stock_grams,
+                            "weight_display": weight_mode(), "show_cart": cart_on(), **result})
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1957,8 +2347,8 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
         self._panel = orca.host.ui.create_window(
             html=main_html(),
             title=PLUGIN_NAME,
-            width=MAIN_WINDOW_SIZE[0],
-            height=MAIN_WINDOW_SIZE[1],
+            width=MAIN_SIZE[0],
+            height=MAIN_SIZE[1],
             on_message=self.on_message,
             on_close=self._on_panel_close,
         )
@@ -2004,7 +2394,7 @@ class _SettingsView:
         self._page.post_message({"type": "show_view", "view": "main"})
 
 
-if HAS_PAGES:
+if _PAGES:
 
     class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
         """The Spoolio tab, with Settings as a second view inside it.
@@ -2022,6 +2412,7 @@ if HAS_PAGES:
             self._refreshing = False
             self._testing = False
             self._checking_update = False
+            _plate["page"] = self
 
         def get_name(self):
             return PLUGIN_NAME
@@ -2038,9 +2429,11 @@ if HAS_PAGES:
                 return tab_html(
                     initial_view="main" if url else "settings",
                     current_url=url,
-                    low_stock_grams=parse_low_stock(get_settings().get("low_stock_grams")),
+                    low_stock_grams=parse_low(get_settings().get("low_stock_grams")),
                     plate_check=plate_settings()[0],
                     plate_margin=plate_settings()[1],
+                    weight=weight_mode(),
+                    cart=cart_on(),
                 )
             except Exception:
                 log.exception("get_ui() raised")
@@ -2059,10 +2452,16 @@ if HAS_PAGES:
                 msg_type = data.get("type")
                 if msg_type in ("ready", "refresh"):
                     self._push_data()
+                    if msg_type == "ready" and _plate["payload"]:
+                        send_plate(_plate["payload"])
                 elif msg_type == "settings":
                     self._open_settings()
                 elif msg_type == "order":
                     open_search(data.get("query"))
+                elif msg_type == "plate_recheck":
+                    threading.Thread(target=recheck, daemon=True).start()
+                elif msg_type == "plate_dismiss":
+                    _plate.update(payload=None, slots=[])
             except Exception:
                 log.exception("on_message() raised (arg0=%r)", arg0)
 
@@ -2081,22 +2480,25 @@ if HAS_PAGES:
             if self._refreshing:
                 return
             self._refreshing = True
-            low_stock_grams = parse_low_stock(get_settings().get("low_stock_grams"))
+            low_stock_grams = parse_low(get_settings().get("low_stock_grams"))
 
             def worker():
                 result = get_spools(url)
                 self._refreshing = False
-                self.post_message({"type": "spools", "low_stock_grams": low_stock_grams, **result})
+                self.post_message({"type": "spools", "low_stock_grams": low_stock_grams,
+                                   "weight_display": weight_mode(), "show_cart": cart_on(), **result})
 
             threading.Thread(target=worker, daemon=True).start()
 
         def _save_settings(self, url, low_stock, plate_check=True,
-                           plate_margin=DEFAULT_PLATE_MARGIN):
+                           plate_margin=DEFAULT_MARGIN, weight="both", cart=False):
             settings = get_settings()
             settings["spoolman_url"] = url
-            settings["low_stock_grams"] = parse_low_stock(low_stock)
+            settings["low_stock_grams"] = parse_low(low_stock)
             settings["plate_check"] = parse_flag(plate_check)
             settings["plate_margin_percent"] = parse_margin(plate_margin)
+            settings["weight_display"] = parse_weights(weight)
+            settings["show_cart"] = parse_flag(cart, default=False)
             if save_settings(settings):
                 log.info("Settings saved (url=%s, low stock=%s g, filament check=%s, margin=%s%%)",
                          url, settings["low_stock_grams"], settings["plate_check"],
@@ -2118,9 +2520,11 @@ if HAS_PAGES:
                 "type": "show_view",
                 "view": "settings",
                 "url": saved_url,
-                "low_stock": parse_low_stock(get_settings().get("low_stock_grams")),
+                "low_stock": parse_low(get_settings().get("low_stock_grams")),
                 "plate_check": plate_settings()[0],
                 "plate_margin": plate_settings()[1],
+                "weight_display": weight_mode(),
+                "show_cart": cart_on(),
             })
             self._check_connection(saved_url, self._settings_window)
 
@@ -2130,7 +2534,7 @@ if HAS_PAGES:
             self._testing = True
 
             def worker():
-                info = ping_spoolman(url)
+                info = ping(url)
                 self._testing = False
                 if info.get("ok"):
                     self._verified_url = clean_url(url)
@@ -2157,7 +2561,8 @@ if HAS_PAGES:
                     })
                     return
                 saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
-                                            data.get("plate_margin"))
+                                            data.get("plate_margin"), data.get("weight_display"),
+                                            data.get("show_cart"))
                 if saved:
                     self._after_save()
                     self._settings_window.close()
@@ -2170,7 +2575,7 @@ if HAS_PAGES:
                 window = self._settings_window
 
                 def worker():
-                    result = latest_release()
+                    result = get_release()
                     self._checking_update = False
                     if result["ok"]:
                         self._release_url = result["url"]
@@ -2196,7 +2601,7 @@ if HAS_PAGES:
             log.info("Unloading")
 
 
-if HAS_SLICING:
+if _SLICING:
 
     class SpoolioFilamentCheck(orca.slicing.SlicingPipelineCapabilityBase):
         """After each slice, checks the plate's filament against the spools in Spoolman."""
@@ -2206,6 +2611,10 @@ if HAS_SLICING:
 
         def execute(self, ctx):
             try:
+                if ctx.step == getattr(orca.slicing.Step, "posSlice", None):
+                    if _plate["payload"]:
+                        threading.Thread(target=clear_plate, daemon=True).start()
+                    return orca.ExecutionResult.success()
                 if ctx.step != orca.slicing.Step.psGCodePostProcess:
                     return orca.ExecutionResult.success()
                 enabled, margin = plate_settings()
@@ -2214,7 +2623,7 @@ if HAS_SLICING:
                     if any(slot["grams"] > 0 for slot in slots):
                         # Off the slicing thread: it may fetch the spool list, and UI calls from
                         # here can deadlock while the GUI waits for slicing to finish.
-                        threading.Thread(target=run_plate_check, args=(slots, margin),
+                        threading.Thread(target=run_check, args=(slots, margin),
                                          daemon=True).start()
             except Exception:
                 log.exception("Filament check failed")
@@ -2224,9 +2633,9 @@ if HAS_SLICING:
 @orca.plugin
 class SpoolioPlugin(orca.base):
     def register_capabilities(self):
-        if HAS_PAGES:
+        if _PAGES:
             orca.register_capability(SpoolioPage)
         else:
             orca.register_capability(SpoolioWindow)
-        if HAS_SLICING:
+        if _SLICING:
             orca.register_capability(SpoolioFilamentCheck)
