@@ -1,4 +1,28 @@
 # Changelog
+## [0.4.0] - 2026-10-08
+
+### Added
+
+- **This plate panel** on the spool list, shown after each slice (when filament check notifications are on). Each filament the plate uses gets a row with its colour, a progress bar showing what the plate needs against what the spool has left, and a result: Quantity OK, Barely enough, Not enough, Check the spool(s) or Not checked. Re-check runs it again against fresh Spoolman data, Dismiss hides it, and it clears itself on the next slice.
+- **On this plate chip** on the matching spool cards, showing which slot or slots use that spool.
+- **Duplicate marker** on cards where you hold more than one spool of the same filament, e.g. `x2 · 300 g together`.
+- **Sort by On this plate**, which becomes available while the panel is showing.
+- **Spool weight display** setting to show the remaining weight on the spool cards and group rows as grams, a percentage or both (the default), with a live sample card on the Settings page. The 'This plate' panel always uses grams.
+- **Low-stock weight colours:** below your low-stock threshold the remaining weight turns amber, shading to red as the spool runs out (fully red at 20% of the threshold, so at 10 g with a 50 g threshold).
+- **Show cart button** setting on the Settings page for the reorder cart.
+
+### Changed
+
+- **The reorder cart button is now optional and off by default**, because the weight colour now flags low stock. Tick `Show a cart button for reordering low-stock spools` in Settings to bring it back.
+- **Filters, sort and grouping are collapsible** behind a Filters button, so the spool list looks cleaner.
+- **Matching buttons:** Re-check, Dismiss and Filters are now the same size as the Settings button.
+- **Settings page rearranged:** Getting Started and Filament Reorder Preview now sit on the left, with the Spoolman server and reorder settings beside them. Spool Weights is a new section, and the tick inclusion of tick boxes for some settings.
+
+### Behind the scenes code clean up
+
+- Shortened variable and function names across the plugin and tidied the comments and docstrings.
+- The filament check and 'This plate' panel share one code path, so the notification and the panel always agree.
+
 ## [0.3.0] - 2026-10-06
 
 ### Added
