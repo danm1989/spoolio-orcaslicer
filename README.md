@@ -15,8 +15,10 @@ This plugin is best used in parallel with [HaspelSync](https://github.com/Rdiger
 - **Spool cards:** Showing colour, vendor, remaining weight, a progress bar in the spool's own colour and material / colour hex / diameter details.
 - **RFID badge:** On spools that have a tag linked in Spoolman (requires Spoolman v.0.27.0 or newer).
 - **Filter, sort and group:** By material, manufacturer or location.
-- **Low-stock reorder button:** Spools under the user defined threshold will generate a cart icon on the card that opens a web search for reordering (either by a user input Spoolman article no. or it defaults to the filament name)
+- **Low-stock warning:** Spools under the user defined threshold have their remaining weight turn amber, shading to red as the spool runs out.
+- **Optional reorder button:** Switch on the cart icon in Settings and low-stock spools get a button that opens a web search for reordering (either by a user input Spoolman article no. or it defaults to the filament name).
 - **Filament check when slicing:** After each slice, Spoolio checks the plate's filament against your matching spools and shows a notification in OrcaSlicer: a short-lived one when there's enough, and one that stays until dismissed when there may not be enough filament loaded.
+- **This plate panel:** The same check shown on the spool list, with a bar per filament, an **On this plate** chip on the matching cards, and a marker where you hold several spools of one filament.
 - **Guided settings:** With a connection test before your Spoolman address can be saved.
 - Matches OrcaSlicer's **light and dark theming**.
 - Built for **Windows, macOS and Linux** (x86_64 and arm64).
@@ -63,7 +65,7 @@ Restart OrcaSlicer, then tick ***Activate*** for Spoolio. A **Spoolio** tab appe
 
 ## Set Up
 
-The Spoolio tab opens on its Settings page on first run. Enter your Spoolman server address (for example `http://raspberrypi.local:7912`), click ***Test***, once the connection is confirmed then ***Save & Close***, which takes you back to your spool list. You can also set the low-stock threshold here, and reopen the page any time with the ***Settings*** button.
+The Spoolio tab opens on its Settings page on first run. Enter your Spoolman server address (for example `http://raspberrypi.local:7912`), click ***Test***, once the connection is confirmed then ***Save & Close***, which takes you back to your spool list. You can also set the low-stock threshold, the cart button and how weights are shown here, and reopen the page any time with the ***Settings*** button.
 
 OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the first time the plugin connects to Spoolman, and another the first time you click a reorder cart to open your browser.
 
@@ -71,7 +73,7 @@ OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the fir
 > ### Filament Check 
 > After each slice, Spoolio compares the filament the plate needs with what is left on your spools. You get a short-lived notification when there is enough, and one that stays until you dismiss it when there may not be enough filament loaded.
 >
-> To use it, switch on ***Spoolio Filament Check*** in your process settings, under ***Others > Slicing Pipeline Plugin***. You can hide its notifications, or change its safety margin (10% by default), on the Settings page.
+> To use it, switch on ***Spoolio Filament Check*** in your process settings, under ***Others > Slicing Pipeline Plugin***. The results also appear in a **This plate** panel at the top of your spool list, where **Re-check** runs it again with fresh Spoolman data and **Dismiss** hides it until the next slice. You can hide the notifications and the panel, or change the safety margin (10% by default), on the Settings page.
 
 >[!NOTE]
 > - Each filament the plate uses is matched to spools in Spoolman by vendor, material and colour. Slots that hold the same filament are treated as one supply, because the AMS moves on to the next spool of the same filament when one runs out: their use is added together and compared with the spools' combined weight. Spare spools that aren't loaded never count towards it.
