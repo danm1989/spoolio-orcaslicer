@@ -84,8 +84,7 @@ OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the fir
 >
 > ### Live Link
 > To read a printer directly, press ***Live Link*** on its card and enter its IP address, its serial number (optional, but helps if you have several printers) and its access code, all found in the printer's network settings with LAN mode on. The slots then show what the printer reports and how long ago it was updated. Spoolio keeps the access code in a private file on your computer and only reads from the printer. Removing a printer also removes its Live Link.
-
-> [!TIP]
+>
 > ### Filament Usage Booking
 > With Spoolman as your source and a Live Link on the printer, Spoolio can book the filament a print used. When a print finishes, it works out which spool was in each slot from the RFID tag, matching it to your Spoolman spools by the `tag` extra field on the spool (or the long serial Bambu uses for RFID detection), and books the grams from the sliced G-code to that spool. Under ***When a Print Finishes*** choose ***Ask Me Before Booking***, ***Book Automatically*** or ***Do Not Track***.
 >
