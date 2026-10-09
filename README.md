@@ -13,13 +13,13 @@ Spoolio _(Spool Inventory Overview)_ is a Bambu Lab inspired filament inventory 
 ## Key Features
 - **Spool cards:** Showing colour, vendor, remaining weight, a progress bar in the spool's own colour and material / colour hex / diameter details. Choose whether the weight shows as grams, a percentage or both.
 - **Two spool sources:** Your self-hosted Spoolman server, or your Bambu Cloud account.
-- **RFID badge:** Reads from the spool's `tag` extra field when present, otherwise from its official RFID tags (requires Spoolman v.0.27.0 or newer).
+- **RFID badge:** Reads from the spool's `tag` extra field when present, otherwise from the Spoolman tags field (requires Spoolman v.0.27.0 or newer).
 - **Filter, sort and group:** By material, manufacturer or location.
 - **Low-stock warning:** Spools under the user defined threshold have their remaining weight turn amber, shading to red as the spool runs out.
 - **Optional reorder button:** Switch on the cart icon in Settings and low-stock spools get a button that opens a web search for reordering (either by a user input Spoolman article no. or it defaults to the filament name).
 - **Filament check when slicing:** After each slice, Spoolio checks the plate's filament against your matching spools and shows a notification in OrcaSlicer: a short-lived one when there's enough, and one that stays until dismissed when there may not be enough filament loaded.
 - **This Plate panel:** Shown after each slice on the Printer tab, with a progress bar for the estimated filament consumption, an **On This Plate** chip on the matching cards, and a marker where you hold several spools of one filament.
-- **Printer tab:** A card per printer showing what is loaded in each AMS, AMS HT and external spool. Build your own by adding printers and AMS units and assigning your spools to the slots, with either spool source.
+- **Printer tab:** A card per printer showing what is loaded in each AMS and external spool. Build your own by adding printers and AMS units and assigning your spools to the slots, with either spool source.
 - **Live Link:** Connect directly to a printer on your local network (works in LAN mode) to show what the printer itself reports for each slot, including the spools it identifies by RFID.
 - **Filament usage booking:** With Spoolman, after a print finishes Spoolio can book the filament used from the sliced G-code to the spool that was loaded, matched by RFID tag. Book it yourself or let Spoolio do it.
 - **Guided settings:** With a connection test before your Spoolman address can be saved.
