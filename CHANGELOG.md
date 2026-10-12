@@ -1,4 +1,23 @@
 # Changelog
+## [0.6.0] - 2026-10-12
+
+Filament usage booking now reads what was actually printed straight from the printer, rather than relying on your sliced G-code, and it no longer loses a print if the connection drops or OrcaSlicer is closed part way through. Multi-colour filaments also finally show their colours on the spool cards.
+
+### Added
+
+- Usage booking from the printer's job file (Spoolman source, with a Live Link). When a print starts, Spoolio downloads the job's `.3mf` from the printer over your local network (FTPS) and books the grams it lists for each slot to the matching spool in Spoolman. This means the amounts match the plate that is actually printing, even if it was sliced or sent from somewhere else. If the job file can't be read, Spoolio falls back to the grams from your sliced G-code as before.
+- Booking survives link drops and restarts. The print Spoolio is tracking is saved on your computer, so if the Live Link drops or OrcaSlicer is restarted mid print, Spoolio picks it back up when it reconnects.
+- Late cards for missed prints. If a print finishes while Spoolio wasn't connected, it shows a card for that print with a note to check the grams before booking. Late cards are never booked automatically, even with *Book Automatically* on.
+
+### Changed
+
+- Multi-colour spool swatches. Spools with more than one colour in Spoolman used to show a grey swatch. The circle now shows the colours, in segments for coaxial filaments and as a smooth gradient for longitudinal ones, on both the spool cards and the `+ Assign Spool` list. The ring and progress bar use one solid colour (the first colour of the spool) so they stay easy to read.
+
+### Known limitations
+
+- Job-file booking needs the printer on the same network, the same as Live Link. If Spoolio can't reach it or find the job file, the grams from your sliced G-code are used instead.
+- The filament check and This Plate panel still match spools on their main colour only, so multi-colour spools may not match a slicer slot automatically.
+
 ## [0.5.0] - 2026-10-09
 
 I'm excited to say that Spoolio can now read your spools from Bambu Cloud as well as Spoolman! (because variety is the spice of life) and it can also book the filament a print used back to Spoolman for a truly local live filament tracking solution.  This sadly cannot be done via Bambu Cloud due to what their API exposes, see more on the limitations section below.
