@@ -6,10 +6,11 @@
 # name = "Spoolio"
 # description = "A Bambu Lab inspired inventory management overview for OrcaSlicer"
 # author = "Dan J Moore"
-# version = "0.5.0"
+# version = "0.6.0"
 # ///
 
 import base64
+import ftplib
 import html
 import json
 import logging
@@ -20,12 +21,15 @@ import socket
 import ssl
 import struct
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import xml.etree.ElementTree as ET
+import zipfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -40,7 +44,7 @@ except (ImportError, AttributeError):
 _SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
 
 PLUGIN_NAME = "Spoolio"
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.6.0"
 # Stamped per operating system by scripts/build.py.
 BUILD_TARGET = "any"
 
@@ -756,13 +760,14 @@ def live_apply(dev_id: str, name: str, doc: object, link: str = "") -> None:
                 state["ext"].clear()
             else:
                 state["ext"].update(ext)
-        job = {k: report[k] for k in ("gcode_state", "mc_percent", "subtask_name", "gcode_file") if k in report}
-        finished = None
+        job = {k: report[k] for k in ("gcode_state", "mc_percent", "subtask_name", "gcode_file") + JOB_KEYS
+               if k in report}
+        events = []
         if job:
             state.setdefault("job", {}).update(job)
-            finished = usage_track(dev_id, state)
-    if finished:
-        usage_finish(finished)
+            events = usage_track(dev_id, state, "gcode_state" in report)
+    for event in events:
+        usage_event(*event)
 
 
 def _live_tray(slot: int, tray: dict) -> dict:
@@ -910,6 +915,9 @@ def _local_session(pid: str, link: dict, stop: threading.Event) -> None:
                 return None
 
             _live["links"][pid] = "waiting"
+            with _live_lock:
+                if pid in _live["printers"]:
+                    _live["printers"][pid]["fresh"] = True
             log.info("Live link to a printer on the local network connected")
             _mqtt_run(sock, "bblp", link["code"], topics, push, on_report,
                       lambda: _live_active() and not stop.is_set())
@@ -989,8 +997,8 @@ def usage_load() -> dict:
         log.exception("Could not read %s", USAGE_FILE)
         data = {}
     data = data if isinstance(data, dict) else {}
-    return {"pending": data.get("pending") if isinstance(data.get("pending"), list) else [],
-            "recent": data.get("recent") if isinstance(data.get("recent"), list) else []}
+    return {key: data.get(key) if isinstance(data.get(key), kind) else kind()
+            for key, kind in (("pending", list), ("recent", list), ("active", dict), ("last", dict), ("done", list))}
 
 
 def usage_save(data: dict) -> None:
@@ -1070,32 +1078,304 @@ def _loaded(state: dict) -> list[dict]:
     return trays
 
 
-def usage_track(dev_id: str, state: dict) -> dict | None:
-    """Track a printer through a print; returns the run when it ends. Holds _live_lock."""
+JOB_KEYS = ("task_id", "subtask_id", "gcode_start_time")
+USAGE_DONE = 40
+LIVE_STATES = ("PREPARE", "RUNNING", "PAUSE")
+
+
+def job_ident(job: dict) -> dict:
+    out = {k: str(job.get(k) or "") for k in JOB_KEYS}
+    out.update(name=str(job.get("subtask_name") or ""), file=str(job.get("gcode_file") or ""))
+    return out
+
+
+def same_job(a: dict | None, b: dict | None) -> bool:
+    """Same print, judged by name and file plus whichever ids both sides know."""
+    if not a or not b or (a.get("name"), a.get("file")) != (b.get("name"), b.get("file")):
+        return False
+    known = [k for k in JOB_KEYS if a.get(k) not in ("", "0") and b.get(k) not in ("", "0")]
+    return all(a[k] == b[k] for k in known)
+
+
+def _ended(run: dict, printer: str, result: str, pct: int) -> dict:
+    return {**run, "printer": printer, "result": result, "pct": 100 if result == "finished" else pct}
+
+
+def usage_track(dev_id: str, state: dict, has_state: bool) -> list[tuple]:
+    """Track a printer through a print; returns events to handle outside the lock. Holds _live_lock.
+
+    The run is saved to disk while it lasts, so a dropped link or a restart picks it up again.
+    """
     job = state.get("job") or {}
     gcode = job.get("gcode_state")
     if not gcode or source() != "spoolman" or not state.get("link") or usage_mode() == "off":
-        return None
+        return []
+    events: list[tuple] = []
+    if not state.get("loaded"):
+        state["loaded"] = True
+        state["fresh"] = True
+        with _usage_lock:
+            store = usage_load()
+        state["run"] = store["active"].get(dev_id)
+        state["last"] = store["last"].get(dev_id)
+        if state["run"] and not state["run"].get("file"):
+            events.append(("fetch", dev_id, state["run"]))
+    fresh = has_state and state.pop("fresh", False)
     pct = max(0, min(100, _int(job.get("mc_percent"), 0)))
+    ident = job_ident(job)
     run = state.get("run")
+    if fresh and run and not same_job(run["job"], ident):
+        # The tracked print ended while the link was down and another one has run since.
+        events.append(("end", dev_id, _ended(run, state["name"], "unknown", run["pct"])))
+        state["run"] = run = None
     if run is None:
+        if fresh and gcode in ("FINISH", "FAILED") and state.get("last") and not same_job(state["last"], ident):
+            events.append(("missed", dev_id, {"job": ident, "printer": state["name"],
+                                              "result": "finished" if gcode == "FINISH" else "cancelled",
+                                              "pct": pct, "link": state["link"]}))
         if gcode in ("IDLE", "FINISH", "FAILED"):
             state["idle_seen"] = True
-        elif gcode in ("PREPARE", "RUNNING") and (state.get("idle_seen") or pct <= 2) and _usage["plan"]:
-            state["run"] = {"id": f"{dev_id}-{int(time.time())}", "plan": _usage["plan"]["slots"],
+        elif gcode in ("PREPARE", "RUNNING") and (state.get("idle_seen") or pct <= 2 or fresh):
+            new = state.get("idle_seen") or pct <= 2
+            plan = _usage["plan"]["slots"] if new and _usage["plan"] else None
+            state["run"] = {"id": f"{dev_id}-{int(time.time())}", "plan": plan, "file": None, "job": ident,
                             "name": str(job.get("subtask_name") or job.get("gcode_file") or "Print")[:80],
-                            "trays": _loaded(state), "pct": pct}
-        return None
-    if gcode in ("PREPARE", "RUNNING", "PAUSE"):
+                            "trays": _loaded(state), "pct": pct, "late": not new}
+            state["idle_seen"] = False
+            events.append(("start", dev_id, dict(state["run"])))
+        if not same_job(state.get("last"), ident) and (ident["name"] or ident["file"]):
+            state["last"] = ident
+            events.append(("last", dev_id, ident))
+        return events
+    if gcode in LIVE_STATES:
+        step = pct // 5 != run["pct"] // 5 or run["job"] != ident
         run["pct"] = max(run["pct"], pct)
-        return None
+        run["job"] = ident
+        if step:
+            events.append(("save", dev_id, dict(run)))
+        return events
     if gcode not in ("FINISH", "FAILED", "IDLE"):
-        return None
+        return events
     state["run"] = None
     state["idle_seen"] = True
-    done = gcode == "FINISH"
-    return {**run, "printer": state["name"], "result": "finished" if done else "cancelled",
-            "pct": 100 if done else run["pct"]}
+    state["last"] = ident if ident["name"] or ident["file"] else state.get("last")
+    result = "finished" if gcode == "FINISH" else "cancelled"
+    events.append(("end", dev_id, _ended(run, state["name"], result, max(run["pct"], pct))))
+    return events
+
+
+FTP_PORT = 990
+JOB_DIRS = ("/", "/cache", "/model", "/sdcard", "/sdcard/cache", "/sdcard/model")
+JOB_MAX = 1024 * 1024 * 1024
+JOB_TRIES = 6
+JOB_RETRY = 30.0
+
+
+class _Ftps(ftplib.FTP_TLS):
+    """Implicit FTPS; data connections reuse the control TLS session, which Bambu printers require."""
+
+    def connect(self, host="", port=0, timeout=-999, source_address=None):
+        self.host, self.port, self.timeout = host, port, timeout
+        raw = socket.create_connection((host, port), timeout=timeout)
+        self.af = raw.family
+        self.sock = self.context.wrap_socket(raw, server_hostname=host)
+        self.file = self.sock.makefile("r", encoding=self.encoding)
+        self.welcome = self.getresp()
+        return self.welcome
+
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            conn = self.context.wrap_socket(conn, server_hostname=self.host, session=self.sock.session)
+        return conn, size
+
+    def pull(self, cmd: str, out, limit: int) -> None:
+        # No TLS unwrap after the transfer: some printers never answer it.
+        self.voidcmd("TYPE I")
+        got = 0
+        with self.transfercmd(cmd) as conn:
+            while chunk := conn.recv(65536):
+                got += len(chunk)
+                if got > limit:
+                    raise ValueError("The job file is too large")
+                out.write(chunk)
+        self.voidresp()
+
+
+def _ftp_open(link: dict) -> _Ftps:
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    ftp = _Ftps(context=context, timeout=15)
+    ftp.connect(link["ip"], FTP_PORT, 15)
+    ftp.login("bblp", link["code"])
+    ftp.prot_p()
+    return ftp
+
+
+def job_names(job: dict) -> list[str]:
+    file, name = job.get("file") or "", job.get("name") or ""
+    names = [file.rsplit("/", 1)[-1]] if file.lower().endswith(".3mf") else []
+    names += [f"{name}.gcode.3mf", f"{name}.3mf"] if name else []
+    return [n.lower() for n in names if n.strip(".")]
+
+
+def _find_job(ftp: _Ftps, job: dict) -> str | None:
+    wanted = job_names(job)
+    if not wanted:
+        return None
+    for folder in JOB_DIRS:
+        out = tempfile.SpooledTemporaryFile()
+        try:
+            ftp.pull(f"NLST {folder}", out, 4 * 1024 * 1024)
+        except (ftplib.Error, OSError, ValueError):
+            continue
+        out.seek(0)
+        found = {line.rsplit("/", 1)[-1].lower(): line.rsplit("/", 1)[-1]
+                 for line in out.read().decode("utf-8", "replace").splitlines() if line.strip()}
+        for name in wanted:
+            if name in found:
+                return folder.rstrip("/") + "/" + found[name]
+        jobs = sorted(n for n in found.values() if n.lower().endswith(".3mf"))
+        if jobs:
+            log.info("Job files in %s: %s", folder, ", ".join(jobs[:20]))
+    return None
+
+
+def parse_slice(data: bytes, file: str = "") -> list[dict] | None:
+    """Grams per filament slot for the printed plate, from Metadata/slice_info.config."""
+    plates = []
+    for plate in ET.fromstring(data).iter("plate"):
+        meta = {m.get("key"): m.get("value") for m in plate.findall("metadata")}
+        rows = []
+        for item in plate.findall("filament"):
+            try:
+                grams = float(item.get("used_g") or 0)
+            except ValueError:
+                grams = 0.0
+            n = _int(item.get("id"), 0)
+            if n > 0 and grams > 0:
+                rows.append({"n": n, "grams": round(grams, 2), "preset": str(item.get("tray_info_idx") or ""),
+                             "colour": _hex6(item.get("color")), "material": str(item.get("type") or "")})
+        if rows:
+            plates.append((_int(meta.get("index"), 0), rows))
+    hint = re.search(r"plate_(\d+)", file)
+    if hint:
+        match = [rows for index, rows in plates if index == int(hint.group(1))]
+        if match:
+            return match[0]
+    return plates[0][1] if len(plates) == 1 else None
+
+
+def fetch_job(link: dict, job: dict) -> list[dict] | None:
+    """Download the printing job's file over FTPS and read its filament use."""
+    ftp = _ftp_open(link)
+    try:
+        path = _find_job(ftp, job)
+        if not path:
+            log.info("The job file wasn't found on the printer (looked for %s in %s)",
+                     ", ".join(job_names(job)) or "nothing", ", ".join(JOB_DIRS))
+            return None
+        log.info("Found the job file at %s", path)
+        with tempfile.TemporaryFile() as out:
+            ftp.pull(f"RETR {path}", out, JOB_MAX)
+            out.seek(0)
+            with zipfile.ZipFile(out) as box:
+                info = box.getinfo("Metadata/slice_info.config")
+                if info.file_size > 4 * 1024 * 1024:
+                    return None
+                data = box.read(info)
+    finally:
+        try:
+            ftp.quit()
+        except (ftplib.Error, OSError):
+            ftp.close()
+    return parse_slice(data, job.get("file") or "")
+
+
+def _try_fetch(dev_id: str, job: dict) -> list[dict] | None:
+    link = (_local.get(dev_id) or {}).get("link")
+    if not link:
+        return None
+    try:
+        return fetch_job(link, job)
+    except (ftplib.Error, OSError, ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        log.warning("Could not read the job file from a printer: %s", exc)
+        return None
+
+
+def _store(change) -> None:
+    with _usage_lock:
+        data = usage_load()
+        change(data)
+        usage_save(data)
+
+
+def _job_fetch(dev_id: str, run_id: str) -> None:
+    """Fetch the job file while the print runs, retrying through link drops."""
+    for _ in range(JOB_TRIES):
+        with _live_lock:
+            run = (_live["printers"].get(dev_id) or {}).get("run")
+            job = dict(run["job"]) if run and run["id"] == run_id else None
+        if job is None:
+            return
+        items = _try_fetch(dev_id, job)
+        if items:
+            with _live_lock:
+                run = (_live["printers"].get(dev_id) or {}).get("run")
+                if run and run["id"] == run_id:
+                    run["file"] = items
+                    saved = dict(run)
+                else:
+                    saved = None
+            if saved:
+                _store(lambda d: d["active"].__setitem__(dev_id, saved))
+            log.info("Read the job file: %d slots", len(items))
+            return
+        time.sleep(JOB_RETRY)
+
+
+def _missed(dev_id: str, info: dict) -> None:
+    ident = info["job"]
+    run_id = f"{dev_id}-" + re.sub(r"[^A-Za-z0-9]", "", "-".join(ident.values()))[:60]
+    with _usage_lock:
+        if run_id in usage_load()["done"]:
+            return
+    items = _try_fetch(dev_id, ident)
+    if not items:
+        log.info("A print ended while Spoolio was away and its job file couldn't be read")
+        return
+    with _live_lock:
+        state = _live["printers"].get(dev_id)
+        trays = _loaded(state) if state else []
+    run = {"id": run_id, "plan": None, "file": items, "job": ident, "trays": trays, "late": True,
+           "name": (ident["name"] or ident["file"] or "Print")[:80], "pct": info["pct"]}
+    usage_finish(_ended(run, info["printer"], info["result"], info["pct"]), dev_id)
+
+
+def _end(dev_id: str, run: dict) -> None:
+    # Finish first: if Orca closes in between, the saved run is picked up and finished again.
+    usage_finish(run, dev_id)
+
+    def drop(d):
+        if (d["active"].get(dev_id) or {}).get("id") == run["id"]:
+            d["active"].pop(dev_id)
+        if run["result"] != "unknown":
+            d["last"][dev_id] = run["job"]
+    _store(drop)
+
+
+def usage_event(kind: str, dev_id: str, data: dict) -> None:
+    if kind in ("start", "save"):
+        _store(lambda d: d["active"].__setitem__(dev_id, data))
+    if kind in ("start", "fetch"):
+        threading.Thread(target=_job_fetch, args=(dev_id, data["id"]), daemon=True).start()
+    elif kind == "last":
+        _store(lambda d: d["last"].__setitem__(dev_id, data))
+    elif kind == "end":
+        threading.Thread(target=_end, args=(dev_id, data), daemon=True).start()
+    elif kind == "missed":
+        threading.Thread(target=_missed, args=(dev_id, data), daemon=True).start()
 
 
 def _spool_label(spool: dict) -> str:
@@ -1104,14 +1384,23 @@ def _spool_label(spool: dict) -> str:
     return " ".join(part for part in (vendor, filament.get("name") or f"Spool {spool.get('id')}") if part)
 
 
-def usage_finish(run: dict) -> None:
-    """Work out each slot's spool and grams, then ask or book."""
+def usage_finish(run: dict, dev_id: str = "") -> None:
+    """Work out each slot's spool and grams, then ask or book. Each run is booked once."""
+    with _usage_lock:
+        if run["id"] in usage_load()["done"]:
+            return
+    items = run.get("file") or (_try_fetch(dev_id, run["job"]) if dev_id and run.get("job") else None)
+    src = "file" if items else "slice"
+    items = items or run.get("plan")
+    if not items:
+        log.info("A print ended but its filament use is unknown")
+        return
     url = clean_url(get_settings().get("spoolman_url"))
     spools = (plate_spools(url) if url else None) or []
     by_id = {sp.get("id"): sp for sp in spools}
-    share = 1.0 if run["result"] == "finished" else run["pct"] / 100
+    share = run["pct"] / 100 if run["result"] == "cancelled" else 1.0
     rows = []
-    for item in run["plan"]:
+    for item in items:
         tray = run["trays"][item["n"] - 1] if 0 < item["n"] <= len(run["trays"]) else None
         spool = match_spool(tray, spools)
         grams = round(item["grams"] * share, 1)
@@ -1121,16 +1410,22 @@ def usage_finish(run: dict) -> None:
                      "colour": item["colour"], "spool": spool["id"] if spool else None,
                      "how": "rfid" if spool else "", "label": _spool_label(by_id[spool["id"]]) if spool else "",
                      "state": "open", "error": ""})
-    if not rows:
-        return
+    late = bool(run.get("late")) or run["result"] == "unknown"
     entry = {"id": run["id"], "printer": run["printer"], "name": run["name"], "result": run["result"],
-             "pct": run["pct"], "time": time.time(), "rows": rows}
+             "pct": run["pct"], "time": time.time(), "rows": rows, "late": late, "src": src}
     with _usage_lock:
         data = usage_load()
-        data["pending"] = [e for e in data["pending"] if e.get("id") != entry["id"]] + [entry]
+        if run["id"] in data["done"]:
+            return
+        data["done"] = [run["id"]] + data["done"][:USAGE_DONE - 1]
+        if rows:
+            data["pending"] = [e for e in data["pending"] if e.get("id") != entry["id"]] + [entry]
         usage_save(data)
-    log.info("A print ended (%s, %d%%): %d slots to book", run["result"], run["pct"], len(rows))
-    if usage_mode() == "auto" and run["result"] == "finished":
+    if not rows:
+        return
+    log.info("A print ended (%s, %d%%, grams from the %s): %d slots to book", run["result"], run["pct"],
+             "job file" if src == "file" else "last slice", len(rows))
+    if usage_mode() == "auto" and run["result"] == "finished" and not late:
         usage_book(entry["id"], None)
 
 
@@ -2099,6 +2394,31 @@ MAIN_PAGE = """
       });
     }
 
+    function swatchHex(v) {
+      const m = String(v || "").trim().replace(/^#/, "").match(/^[0-9a-f]{6}/i);
+      return m ? "#" + m[0] : "";
+    }
+
+    function swatchCols(f) {
+      return String(f.multi_color_hexes || "").split(",").map(swatchHex).filter(Boolean);
+    }
+
+    // One solid colour for the ring and bar; the first colour on multi-colour spools.
+    function swatchMain(f) {
+      const cs = swatchCols(f);
+      return (cs.length < 2 && swatchHex(f.color_hex)) || cs[0] || "#888";
+    }
+
+    function swatch(f) {
+      const cs = swatchCols(f);
+      if (cs.length < 2) return swatchMain(f);
+      if (f.multi_color_direction === "longitudinal") return "linear-gradient(135deg, " + cs.join(", ") + ")";
+      const step = 360 / cs.length;
+      return "conic-gradient(" + cs.map(function (c, i) {
+        return c + " " + i * step + "deg " + (i + 1) * step + "deg";
+      }).join(", ") + ")";
+    }
+
     function savePrinters() {
       orca.postMessage({ type: "printers", printers: cfg });
     }
@@ -2191,12 +2511,14 @@ MAIN_PAGE = """
         return '<option value="' + m[0] + '"' + (usage.mode === m[0] ? " selected" : "") + '>' + m[1] + '</option>';
       }).join("") + '</select></label>';
       const cards = usage.pending.map(function (e) {
-        const result = e.result === "finished" ? "finished" : "stopped at " + e.pct + "%";
+        const result = e.result === "finished" ? "finished" : e.result === "unknown" ? "result unknown" : "stopped at " + e.pct + "%";
+        const note = e.late ? "Spoolio lost contact with the printer during this print, so check the grams before booking." :
+          e.result === "finished" ? "" : "The print did not finish, so the grams are an estimate from its progress.";
         return '<div class="u-card" data-run="' + esc(e.id) + '"><div class="u-h"><b>' + esc(e.name) + '</b> <span class="sub">' + esc(e.printer) + ' \u00b7 ' + result + ' \u00b7 ' + usageTime(e.time) + '</span></div>' +
           e.rows.map(function (r) { return usageRow(e, r); }).join("") +
           '<div class="u-foot"><button class="sbtn primary" data-usage="book"' + (usageBooking ? " disabled" : "") + '>' + (usageBooking ? "Booking..." : "Book Usage") + '</button>' +
           '<button class="sbtn ghost" data-usage="dismiss">Dismiss</button></div>' +
-          (e.result === "finished" ? "" : '<div class="ams-note" style="margin: 6px 0 0">The print did not finish, so the grams are an estimate from its progress.</div>') + '</div>';
+          (note ? '<div class="ams-note" style="margin: 6px 0 0">' + note + '</div>' : "") + '</div>';
       }).join("");
       const recent = usage.recent.slice(0, 3).map(function (x) {
         return '<div class="u-recent">Booked ' + usageGrams(x.grams) + ' to ' + esc(x.label) + ' \u00b7 ' + esc(x.printer) + ' \u00b7 ' + usageTime(x.time) + '</div>';
@@ -2391,7 +2713,7 @@ MAIN_PAGE = """
       return items.map(function (s) {
         const f = s.filament || {};
         const sub = [(f.vendor || {}).name, typeof s.id === "number" ? "#" + s.id : "", s.location].filter(Boolean).join(" \u00b7 ");
-        const color = f.color_hex ? "#" + f.color_hex.replace(/^#/, "") : "#888";
+        const color = swatch(f);
         return '<div class="pi" data-act="pick" data-id="' + esc(s.id) + '"><span class="d" style="background:' + esc(color) + '"></span>' +
           '<span>' + esc(f.name || "Spool " + s.id) + '<small>' + esc(sub) + '</small></span>' +
           '<span class="m">' + formatWeight(s.remaining_weight) + '</span></div>';
@@ -2770,7 +3092,9 @@ MAIN_PAGE = """
     function spoolRowHtml(s) {
       const filament = s.filament || {};
       const vendor = filament.vendor || {};
-      const color = filament.color_hex ? "#" + filament.color_hex.replace(/^#/, "") : "#888";
+      const color = swatch(filament);
+      const main = swatchMain(filament);
+      const ring = swatchCols(filament).length > 1 ? ";border-color:" + main : "";
       const name = filament.name || ("Spool #" + s.id);
       const material = filament.material || "";
       const vendorName = vendor.name || "";
@@ -2835,7 +3159,7 @@ MAIN_PAGE = """
           tagHtml +
           '<div class="spool-body">' +
             '<div class="spool-swatch-col">' +
-              '<div class="spool-swatch" style="background:' + color + '"></div>' +
+              '<div class="spool-swatch" style="background:' + color + ring + '"></div>' +
               rfidHtml +
             '</div>' +
             '<div class="spool-main">' +
@@ -2844,7 +3168,7 @@ MAIN_PAGE = """
                 '<div class="spool-weight' + (tint ? ' low" style="color:' + tint : '') + '">' + wHtml + cartHtml + '</div>' +
               '</div>' +
               '<div class="spool-bar-track" title="' + percentTitle + '">' +
-                '<div class="spool-bar-fill" style="width:' + (percent === null ? 0 : percent) + '%;background:' + color + '"></div>' +
+                '<div class="spool-bar-fill" style="width:' + (percent === null ? 0 : percent) + '%;background:' + main + '"></div>' +
               '</div>' +
               '<div class="spool-subtitle"><span class="sub-text">' + subtitle + '</span>' + chipHtml + '</div>' +
             '</div>' +
