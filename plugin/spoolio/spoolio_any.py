@@ -160,6 +160,7 @@ def get_settings() -> dict:
         "plate_margin_percent": DEFAULT_MARGIN,
         "weight_display": "both",
         "show_cart": False,
+        "progress": {},
     }
     for path in (SETTINGS_FILE, OLD_SETTINGS):
         try:
@@ -204,6 +205,16 @@ def weight_mode() -> str:
 
 def cart_on() -> bool:
     return parse_flag(get_settings().get("show_cart"), default=False)
+
+
+def parse_progress(value: object) -> dict:
+    v = value if isinstance(value, dict) else {}
+    return {"on": parse_flag(v.get("on")), "finish": parse_flag(v.get("finish")),
+            "slot": parse_flag(v.get("slot")), "idle": "hide" if v.get("idle") == "hide" else "line"}
+
+
+def progress_settings() -> dict:
+    return parse_progress(get_settings().get("progress"))
 
 
 def plate_settings() -> tuple[bool, int]:
@@ -649,7 +660,7 @@ def printer_state() -> dict:
     codes = read_codes()
     printers = [dict(p, has_code=bool(codes.get(_code_key(p["id"])))) for p in printers_cfg()]
     live = any(p["ip"] and p["has_code"] for p in printers)
-    return {"printers": printers, "live_ok": live, "usage": usage_state()}
+    return {"printers": printers, "live_ok": live, "usage": usage_state(), "progress": progress_settings()}
 
 
 LOCAL_PORT = 8883
@@ -762,6 +773,18 @@ def live_apply(dev_id: str, name: str, doc: object, link: str = "") -> None:
                 state["ext"].update(ext)
         job = {k: report[k] for k in ("gcode_state", "mc_percent", "subtask_name", "gcode_file") + JOB_KEYS
                if k in report}
+        prog = state.setdefault("prog", {})
+        was = str(prog.get("gcode_state") or "").upper()
+        prog.update({k: report[k] for k in PROG_KEYS if k in report})
+        if isinstance(ams, dict) and "tray_now" in ams:
+            prog["tray_now"] = ams["tray_now"]
+        if "gcode_state" in report:
+            gs = str(report["gcode_state"]).upper()
+            if gs in ("FINISH", "FAILED"):
+                if was in LIVE_STATES:
+                    prog["end"] = time.time()
+            else:
+                prog.pop("end", None)
         events = []
         if job:
             state.setdefault("job", {}).update(job)
@@ -786,6 +809,48 @@ def _live_tray(slot: int, tray: dict) -> dict:
     }
 
 
+PROG_KEYS = ("gcode_state", "mc_percent", "mc_remaining_time", "layer_num", "total_layer_num",
+             "subtask_name", "gcode_file", "stg_cur", "gcode_start_time")
+STAGES = {
+    1: "Auto Bed Levelling", 2: "Heating Bed", 3: "Sweeping XY Mech Mode", 4: "Changing Filament",
+    5: "Paused", 6: "Paused: Filament Runout", 7: "Heating Nozzle", 8: "Calibrating Extrusion",
+    9: "Scanning Bed Surface", 10: "Inspecting First Layer", 11: "Identifying Build Plate",
+    12: "Calibrating Micro Lidar", 13: "Homing Toolhead", 14: "Cleaning Nozzle Tip",
+    15: "Checking Extruder Temperature", 16: "Paused by User", 17: "Paused: Front Cover Removed",
+    18: "Calibrating Micro Lidar", 19: "Calibrating Extrusion Flow", 20: "Paused: Nozzle Temperature Fault",
+    21: "Paused: Bed Temperature Fault", 22: "Unloading Filament", 23: "Paused: Skipped Step",
+    24: "Loading Filament", 25: "Calibrating Motor Noise", 26: "Paused: AMS Lost",
+    27: "Paused: Heat Break Fan", 28: "Paused: Chamber Temperature Fault", 29: "Cooling Chamber",
+    30: "Paused by G-code", 31: "Motor Noise Showoff", 32: "Paused: Nozzle Covered",
+    33: "Paused: Cutter Error", 34: "Paused: First Layer Error", 35: "Paused: Nozzle Clog",
+}
+
+
+def _live_prog(state: dict) -> dict | None:
+    p = state.get("prog") or {}
+    gs = str(p.get("gcode_state") or "").upper()
+    if not gs:
+        return None
+    def num(key: str) -> int | None:
+        value = _int(p.get(key))
+        return value if value >= 0 else None
+
+    tray = None
+    t = _int(p.get("tray_now"))
+    if 0 <= t < 128:
+        tray = {"unit": t // 4, "slot": t % 4}
+    elif 128 <= t < 254:
+        tray = {"unit": t, "slot": 0}
+    elif t == 254:
+        tray = {"unit": "ext", "slot": 0}
+    name = str(p.get("subtask_name") or "").strip() or Path(str(p.get("gcode_file") or "")).name
+    start, end = num("gcode_start_time"), p.get("end")
+    return {"state": gs, "pct": num("mc_percent"), "left": num("mc_remaining_time"), "layer": num("layer_num"),
+            "layers": num("total_layer_num"), "name": name[:80], "stage": STAGES.get(_int(p.get("stg_cur"))),
+            "tray": tray, "took": round((end - start) / 60) if end and start and end > start else None,
+            "end": end}
+
+
 def live_snapshot() -> dict:
     with _live_lock:
         printers = []
@@ -798,7 +863,7 @@ def live_snapshot() -> dict:
                               "trays": [_live_tray(i, slots.get(i, {})) for i in range(size)]})
             ext = _live_tray(0, state["ext"]) if state["ext"] else None
             printers.append({"id": dev_id, "link": state.get("link", ""), "name": state["name"], "age": round(time.time() - state["time"]),
-                             "units": units, "ext": ext})
+                             "units": units, "ext": ext, "job": _live_prog(state)})
         return {"links": dict(_live["links"]), "printers": printers}
 
 
@@ -2264,7 +2329,36 @@ MAIN_PAGE = """
   .u-err { flex-basis: 100%; color: #d9534f; font-size: 12px; }
   .u-foot { display: flex; gap: 8px; margin-top: 8px; }
   .u-recent { padding: 4px 14px 10px; font-size: 12px; color: var(--orca-muted); }
-  #usage-slot:empty { display: none; }
+  #usage-slot:empty, #progress-slot:empty { display: none; }
+  #usage-slot { margin-top: 14px; }
+  .prog { margin: 0 0 14px; border: 1px solid var(--orca-border); border-radius: 10px; background: color-mix(in srgb, var(--orca-fg) 4%, var(--orca-bg) 96%); }
+  .prog-h { display: flex; align-items: baseline; gap: 10px; padding: 10px 14px; color: var(--orca-fg); border-bottom: 1px solid var(--orca-border); }
+  .prog-h .sub, .pj-idle .sub { color: var(--orca-muted); font-size: 12px; }
+  .pj { padding: 12px 14px 13px; color: var(--orca-fg); }
+  .pj + .pj, .pj + .pj-idle, .pj-idle + .pj-idle { border-top: 1px solid var(--orca-border); }
+  .pj-top { display: flex; align-items: center; gap: 10px; }
+  .pj-name { font-weight: 700; font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pj-who { color: var(--orca-muted); font-size: 12px; white-space: nowrap; }
+  .pj-chip { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 99px; white-space: nowrap; background: color-mix(in srgb, var(--orca-accent) 22%, transparent); color: #3cc9b9; }
+  .pj-chip.warn { background: rgba(210, 153, 34, 0.22); color: #e0a030; }
+  .pj-chip.ok { background: rgba(63, 185, 80, 0.18); color: #3fb950; }
+  .pj-chip.bad { background: rgba(217, 83, 79, 0.2); color: #e5605c; }
+  .pj-chip.idle { background: rgba(127, 127, 127, 0.2); color: var(--orca-muted); }
+  .pj-pct { margin-left: auto; font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .pj-track { height: 10px; margin: 9px 0 8px; border-radius: 5px; background: rgba(127, 127, 127, 0.25); overflow: hidden; }
+  .pj-fill { height: 100%; border-radius: 5px; background: var(--orca-accent); }
+  .pj-fill.warn { background: #d29922; }
+  .pj-fill.ok { background: #3fb950; }
+  .pj-fill.bad { background: #d9534f; }
+  .pj-fill.prep { width: 30% !important; background: repeating-linear-gradient(-45deg, var(--orca-accent) 0 8px, color-mix(in srgb, var(--orca-accent) 55%, transparent) 8px 16px); animation: pj-prep 1.6s linear infinite; }
+  @keyframes pj-prep { from { margin-left: -30%; } to { margin-left: 100%; } }
+  .pj-meta { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--orca-muted); }
+  .pj-meta b { color: var(--orca-fg); font-weight: 600; }
+  .pj-slot { display: inline-flex; align-items: center; gap: 6px; }
+  .pj-slot .d { width: 11px; height: 11px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, 0.18); }
+  .pj-idle { display: flex; align-items: center; gap: 10px; padding: 10px 14px; color: var(--orca-fg); }
+  .pj-idle .pj-who { margin-left: auto; }
+  .ams-cell.active .spool-card { border-color: var(--orca-accent) !important; box-shadow: 0 0 0 1px var(--orca-accent); }
   .linkform { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 12px; padding: 12px 14px; border-bottom: 1px solid var(--orca-border); }
   .linkform label { display: flex; flex-direction: column; gap: 4px; flex: 1 1 180px; font-size: 12px; color: var(--orca-muted); }
   .linkform input { background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 13px; }
@@ -2334,9 +2428,10 @@ MAIN_PAGE = """
   <div id="list"></div>
   </div>
   <div id="page-printer" hidden>
-    <div id="usage-slot"></div>
+    <div id="progress-slot"></div>
     <div id="ams-list"></div>
     <div id="plate-slot"></div>
+    <div id="usage-slot"></div>
   </div>
 
   <script>
@@ -2380,6 +2475,8 @@ MAIN_PAGE = """
     let usageBooking = false;
     let plateAttn = false;
     const usageSlot = document.getElementById("usage-slot");
+    const progSlot = document.getElementById("progress-slot");
+    let progress = { on: true, finish: true, slot: true, idle: "line" };
     let linkOpen = "";
     let liveData = { status: "off", printers: [] };
     let liveKey = "";
@@ -2624,19 +2721,32 @@ MAIN_PAGE = """
         '<div class="spool-subtitle"><span class="sub-text">' + esc(sub) + '</span></div></div></div></div>';
     }
 
+    const PROG_STATES = {
+      RUNNING: ["Printing", "", ""], PREPARE: ["Preparing", "", "prep"], SLICING: ["Preparing", "", "prep"],
+      PAUSE: ["Paused", "warn", "warn"], FINISH: ["Finished", "ok", "ok"], FAILED: ["Failed", "bad", "bad"]
+    };
+    const PROG_LIVE = ["RUNNING", "PREPARE", "SLICING", "PAUSE"];
+
+    function activeTray(lv) {
+      const j = lv.job;
+      return progress.on && progress.slot && j && j.tray && PROG_LIVE.indexOf(j.state) >= 0 ? j.tray : null;
+    }
+
     function liveUnits(lv) {
       let ams = 0;
-      const unitHtml = function (label, trays, ext) {
+      const act = activeTray(lv);
+      const unitHtml = function (label, trays, ext, uid) {
         return '<div class="ams-unit">' + label + '</div><div class="ams-grid">' + trays.map(function (t, i) {
-          return '<div class="ams-cell"><div class="ams-n">' + (ext ? "E" : i + 1) + '</div>' + liveCard(t) + '</div>';
+          const on = act && act.unit === uid && act.slot === i;
+          return '<div class="ams-cell' + (on ? " active" : "") + '"><div class="ams-n">' + (ext ? "E" : i + 1) + '</div>' + liveCard(t) + '</div>';
         }).join("") + '</div>';
       };
       let units = lv.units.map(function (u) {
-        if (u.kind === "ht") return unitHtml("AMS HT", u.trays, false);
+        if (u.kind === "ht") return unitHtml("AMS HT", u.trays, false, u.id);
         ams += 1;
-        return unitHtml("AMS " + ams, u.trays, false);
+        return unitHtml("AMS " + ams, u.trays, false, u.id);
       }).join("");
-      if (lv.ext) units += unitHtml("External Spool", [lv.ext], true);
+      if (lv.ext) units += unitHtml("External Spool", [lv.ext], true, "ext");
       return units || '<div class="pnote">Waiting for the printer to report its slots...</div>';
     }
 
@@ -2762,7 +2872,71 @@ MAIN_PAGE = """
         (live ? '' : '<div class="ams-note">A representative view only: built from the spools you&#39;ve assigned. Use Live Link to read the printer itself.</div>') + '</div></div>';
     }
 
+    function progDur(m) {
+      const h = Math.floor(m / 60);
+      return (h ? h + " h " : "") + String(m % 60).padStart(h ? 2 : 1, "0") + " min";
+    }
+
+    function progClock(ms) {
+      return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+
+    function progTray(lv, t) {
+      if (t.unit === "ext") return lv.ext ? { label: "External Spool", tray: lv.ext } : null;
+      const u = lv.units.find(function (x) { return x.id === t.unit; });
+      if (!u || !u.trays[t.slot]) return null;
+      const label = u.kind === "ht" ? "AMS HT" : "AMS " + (lv.units.filter(function (x) { return x.kind === "ams"; }).indexOf(u) + 1) + " Slot " + (t.slot + 1);
+      return { label: label, tray: u.trays[t.slot] };
+    }
+
+    function progRow(lv) {
+      const j = lv.job;
+      const s = PROG_STATES[j.state];
+      const live = PROG_LIVE.indexOf(j.state) >= 0;
+      const pct = j.state === "FINISH" ? 100 : Math.max(0, Math.min(100, j.pct || 0));
+      const meta = [];
+      if (j.stage && j.state !== "FAILED") meta.push('<span><b>' + esc(j.stage) + '</b></span>');
+      if (j.layers) meta.push(j.layer && s[2] !== "prep" ? '<span>Layer <b>' + j.layer + '</b> / ' + j.layers + '</span>' : '<span>' + j.layers + ' layers</span>');
+      if (live && j.left !== null && j.left !== undefined) {
+        meta.push(s[2] === "prep" ? '<span>About ' + progDur(j.left) + '</span>' : '<span><b>' + progDur(j.left) + '</b> left</span>');
+        if (progress.finish && s[2] !== "prep") meta.push('<span>Done around ' + progClock(Date.now() + j.left * 60000) + '</span>');
+      }
+      if (j.state === "FINISH" && j.took) meta.push('<span>Took <b>' + progDur(j.took) + '</b></span>');
+      if (j.state === "FINISH" && j.end) meta.push('<span>Finished at ' + progClock(j.end * 1000) + '</span>');
+      if (j.state === "FAILED" && j.layer) meta.push('<span>Stopped at Layer ' + j.layer + '</span>');
+      const t = live && j.tray ? progTray(lv, j.tray) : null;
+      if (t) {
+        const colour = t.tray.colour ? "#" + t.tray.colour : "#888";
+        meta.push('<span class="pj-slot"><span class="d" style="background:' + colour + '"></span>' + t.label + (t.tray.name ? ' \u00b7 ' + esc(t.tray.name) : "") + '</span>');
+      }
+      return '<div class="pj"><div class="pj-top"><span class="pj-name">' + esc(j.name || "Print") + '</span><span class="pj-chip ' + s[1] + '">' + s[0] + '</span>' +
+        progWho(lv) + '<span class="pj-pct">' + (s[2] === "prep" ? "" : pct + "%") + '</span></div>' +
+        '<div class="pj-track"><div class="pj-fill ' + s[2] + '" style="width:' + pct + '%"></div></div>' +
+        '<div class="pj-meta">' + meta.join("") + '</div></div>';
+    }
+
+    function progWho(lv) {
+      return '<span class="pj-who"><span class="live-dot' + (lv.age > 180 ? " stale" : "") + '"></span>' + esc(lv.name) + '</span>';
+    }
+
+    function renderProgress() {
+      const list = liveOn && progress.on ? liveData.printers.filter(function (lv) {
+        return (liveData.links || {})[lv.link] === "live" && lv.job;
+      }) : [];
+      const busy = list.filter(function (lv) { return PROG_STATES[lv.job.state]; });
+      const idle = progress.idle === "hide" ? [] : list.filter(function (lv) { return !PROG_STATES[lv.job.state]; });
+      if (!busy.length && !idle.length) { progSlot.innerHTML = ""; return; }
+      const idleRow = function (lv, title) {
+        return '<div class="pj-idle">' + (title ? "<b>Print Progress</b>" : "") + '<span class="pj-chip idle">Idle</span>' +
+          '<span class="sub">No print running</span>' + progWho(lv) + '</div>';
+      };
+      if (!busy.length) { progSlot.innerHTML = '<div class="prog">' + idle.map(function (lv, i) { return idleRow(lv, i === 0); }).join("") + '</div>'; return; }
+      progSlot.innerHTML = '<div class="prog"><div class="prog-h"><b>Print Progress</b><span class="sub">Live from the printer</span></div>' +
+        busy.map(progRow).join("") + idle.map(function (lv) { return idleRow(lv, false); }).join("") + '</div>';
+    }
+
     function renderPrinters() {
+      renderProgress();
       const byId = new Map();
       allSpools.forEach(function (s) { byId.set(String(s.id), s); });
       let html = cfg.map(function (p) { return manualPanel(p, byId); }).join("") + linked.map(linkedPanel).join("");
@@ -3305,6 +3479,7 @@ MAIN_PAGE = """
       if (typeof payload.show_printer_tab === "boolean") showTab = payload.show_printer_tab;
       liveOn = payload.live_ok === true;
       if (payload.usage) setUsage(payload.usage);
+      if (payload.progress) progress = payload.progress;
       if (liveOn) pollLive();
       populateFilterOptions();
       buildPrinters();
@@ -3327,6 +3502,7 @@ MAIN_PAGE = """
         liveData = data.live;
         if (data.usage) setUsage(data.usage);
         if (key !== liveKey && !picking && !renaming && !linkOpen) { liveKey = key; renderPrinters(); }
+        renderProgress();
       }
     });
 
@@ -3454,6 +3630,21 @@ SETTINGS_PAGE = """
   .ws-bar { height: 5px; margin: 6px 0 5px; border-radius: 3px; background: rgba(127, 127, 127, 0.25); overflow: hidden; }
   .ws-bar i { display: block; height: 100%; width: 64%; background: #1a1a1a; }
   .ws-sub { font-size: 12px; color: var(--orca-muted); font-style: italic; }
+  #prog-opts { padding-left: 25px; }
+  .pp-card { padding: 12px 14px; border: 1px solid var(--orca-border); border-radius: 14px; background: var(--orca-border); background: color-mix(in srgb, var(--orca-fg) 5%, var(--orca-bg) 95%); }
+  .pp-top { display: flex; align-items: center; gap: 10px; }
+  .pp-name { font-weight: 700; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pp-chip { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 99px; background: color-mix(in srgb, var(--orca-accent) 22%, transparent); color: #3cc9b9; }
+  .pp-pct { margin-left: auto; font-size: 18px; font-weight: 800; }
+  .pp-bar { height: 8px; margin: 8px 0 7px; border-radius: 4px; background: rgba(127, 127, 127, 0.25); overflow: hidden; }
+  .pp-bar i { display: block; height: 100%; width: 37%; background: var(--orca-accent); }
+  .pp-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--orca-muted); }
+  .pp-meta b { color: var(--orca-fg); }
+  #pp-slot { display: inline-flex; align-items: center; gap: 6px; }
+  #pp-slot .d { width: 10px; height: 10px; border-radius: 50%; background: #ae835b; border: 2px solid rgba(255, 255, 255, 0.18); }
+  .pp-off { display: none; color: var(--orca-muted); font-style: italic; }
+  .prog-off #prog-opts, .prog-off #pp-card { display: none; }
+  .prog-off .pp-off { display: block; }
   input[type="checkbox"] { width: 16px; height: 16px; padding: 0; margin: 0; accent-color: var(--orca-accent); }
   .status.ok { color: #3fb950; }
   .status.error { color: #d9534f; }
@@ -3535,7 +3726,8 @@ SETTINGS_PAGE = """
     <label for="plate-margin">Safety Margin (%):</label>
     <input id="plate-margin" type="number" min="0" max="50" step="5" value="__PLATE_MARGIN__">
   </div>
-  <div class="hint">OrcaSlicer also has to run the check: switch on Spoolio Filament Check in your process settings, under <span style="white-space: nowrap">Others &gt; Slicing Pipeline Plugin</span>.</div><!--/check-->
+<!--/check-->
+  <!--check-hint--><div class="hint">OrcaSlicer also has to run the check: switch on Spoolio Filament Check in your process settings, under <span style="white-space: nowrap">Others &gt; Slicing Pipeline Plugin</span>.</div><!--/check-hint-->
 
   <div class="divider spaced"></div>
 
@@ -3545,16 +3737,36 @@ SETTINGS_PAGE = """
     <label><input type="radio" name="weight-display" value="grams">Grams</label>
     <label><input type="radio" name="weight-display" value="percent">Percentage</label>
     <label><input type="radio" name="weight-display" value="both">Both</label>
-  </div>
-  <div class="ws-card">
+  </div><!--/weights-->
+  <!--weights-preview--><div class="ws-card">
     <div class="ws-swatch"></div>
     <div class="ws-main">
       <div class="ws-top"><span class="ws-name">PLA Matte - Black</span><span id="weight-sample"></span></div>
       <div class="ws-bar"><i></i></div>
       <div class="ws-sub">PLA \u00b7 #1A1A1A \u00b7 1.75mm</div>
     </div>
+  </div><!--/weights-preview-->
+
+  <div class="divider spaced"></div>
+
+  <!--printer--><h3><span class="emoji">🧵</span>Configure Printer</h3>
+  <label class="check-row"><input id="show-progress" type="checkbox">Show Print Progress on the Printer Tab</label>
+  <div id="prog-opts">
+    <label class="check-row"><input id="prog-finish" type="checkbox">Show the Estimated Finish Time</label>
+    <label class="check-row"><input id="prog-slot" type="checkbox">Highlight the AMS Slot in Use</label>
+    <div class="field-label">When no print is running:</div>
+    <div class="seg" id="idle-seg">
+      <label><input type="radio" name="progress-idle" value="line">Show an Idle Line</label>
+      <label><input type="radio" name="progress-idle" value="hide">Hide Print Progress</label>
+    </div>
   </div>
-  <div class="hint">The percentage is what is left of the spool's original weight.</div><!--/weights-->
+  <div class="hint">Print progress requires a Live Link connection to the printer(s).</div><!--/printer-->
+  <!--printer-preview--><div class="pp-card" id="pp-card">
+    <div class="pp-top"><span class="pp-name">Desk_Organiser_Plate_1</span><span class="pp-chip">Printing</span><span class="pp-pct">37%</span></div>
+    <div class="pp-bar"><i></i></div>
+    <div class="pp-meta"><span>Layer <b>142</b> / 380</span><span><b>2 h 04 min</b> left</span><span id="pp-finish">Done around 11:24</span><span id="pp-slot"><span class="d"></span>AMS 1 Slot 2</span></div>
+  </div>
+  <div class="pp-card pp-off" id="pp-off">Print Progress is hidden. The Printer tab starts with your printers.</div><!--/printer-preview-->
 
   <div class="divider spaced"></div>
 
@@ -3743,6 +3955,30 @@ SETTINGS_PAGE = """
     wRadios.forEach(function (r) { r.addEventListener("change", showWeight); });
     document.querySelector('input[name="weight-display"][value=' + __WEIGHT_MODE__ + ']').checked = true;
     showWeight();
+    const progOn = document.getElementById("show-progress");
+    const progFinish = document.getElementById("prog-finish");
+    const progSlot = document.getElementById("prog-slot");
+    const idleRadios = document.querySelectorAll('input[name="progress-idle"]');
+    function progPick() {
+      const idle = document.querySelector('input[name="progress-idle"]:checked');
+      return { on: progOn.checked, finish: progFinish.checked, slot: progSlot.checked, idle: idle ? idle.value : "line" };
+    }
+    function showProgress() {
+      (progOn.closest(".srow") || document.body).classList.toggle("prog-off", !progOn.checked);
+      document.getElementById("pp-finish").hidden = !progFinish.checked;
+      document.getElementById("pp-slot").hidden = !progSlot.checked;
+      idleRadios.forEach(function (r) { r.parentNode.classList.toggle("on", r.checked); });
+    }
+    [progOn, progFinish, progSlot].concat(Array.from(idleRadios)).forEach(function (el) {
+      el.addEventListener("change", showProgress);
+    });
+    (function (p) {
+      progOn.checked = p.on;
+      progFinish.checked = p.finish;
+      progSlot.checked = p.slot;
+      document.querySelector('input[name="progress-idle"][value="' + p.idle + '"]').checked = true;
+    })(__PROGRESS__);
+    showProgress();
     const updateEl = document.getElementById("update-status");
     document.getElementById("check-update").addEventListener("click", function () {
       updateEl.textContent = "Checking...";
@@ -3825,6 +4061,7 @@ SETTINGS_PAGE = """
         plate_margin: document.getElementById("plate-margin").value,
         weight_display: wPick(),
         show_cart: document.getElementById("show-cart").checked,
+        progress: progPick(),
       });
     });
     refreshSave();
@@ -3848,7 +4085,8 @@ def main_html() -> str:
 
 def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
                   plate_check: bool = True, plate_margin: int = DEFAULT_MARGIN,
-                  weight: str = "both", cart: bool = False, source: str = "spoolman") -> str:
+                  weight: str = "both", cart: bool = False, source: str = "spoolman",
+                  progress: dict | None = None) -> str:
     """``spoolman_info`` describes the saved URL, not whatever is typed in the field."""
     verified_url = clean_url(current_url) if spoolman_info.get("ok") else ""
     if spoolman_info.get("ok"):
@@ -3874,6 +4112,7 @@ def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
         PLATE_MARGIN=plate_margin,
         WEIGHT_MODE=json.dumps(parse_weights(weight)),
         CART_CHECKED="checked" if cart else "",
+        PROGRESS=json.dumps(parse_progress(progress)),
         LOG_PATH=html.escape(str(LOG_FILE)),
         STATUS_TEXT=html.escape(status_text),
         STATUS_CLASS=status_class,
@@ -3981,31 +4220,32 @@ TAB_HEADER_CSS = """
 """
 
 
-# Wide windows put each setting beside its guide, preview or diagnostics in a grid. Narrow
-# windows stack the cells, guide first.
+# Each topic is a card: the settings on the left, beside their preview or guide on the right.
+# Narrow windows stack the two halves.
 TAB_SETTINGS_CSS = """
   #view-settings { margin: 0 auto; }
-  #view-settings .settings-grid {
-    display: grid; grid-template-columns: minmax(0, 9fr) minmax(0, 11fr);
+  #view-settings .srow {
+    margin: 0 0 14px; border: 1px solid var(--orca-border); border-radius: 12px;
+    background: color-mix(in srgb, var(--orca-fg) 3%, var(--orca-bg) 97%);
   }
-  #view-settings .cell { padding: 14px 0; }
-  /* Fixed heading height, content centred: paired headings stay level whatever the emoji size. */
-  #view-settings .cell h3 { display: flex; align-items: center; height: 30px; }
-  #view-settings .cell-guide, #view-settings .cell-preview, #view-settings .cell-weights, #view-settings .cell-diag {
-    grid-column: 1; padding-right: 32px;
+  #view-settings .srow > h3 {
+    display: flex; align-items: center; margin: 0; padding: 12px 18px; border-bottom: 1px solid var(--orca-border);
   }
-  #view-settings .cell-server, #view-settings .cell-reorder, #view-settings .cell-check {
-    grid-column: 2; padding-left: 32px;
+  #view-settings .srow-body {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px; padding: 14px 18px 16px;
   }
-  #view-settings .cell-guide, #view-settings .cell-server { grid-row: 1; padding-top: 0; }
-  #view-settings .cell-preview, #view-settings .cell-reorder { grid-row: 2; }
-  #view-settings .cell-weights, #view-settings .cell-check { grid-row: 3; }
-  #view-settings .cell-diag { grid-row: 4; padding-bottom: 0; }
-  #view-settings .footer { border-top: none; }
-  #view-settings .cell-guide h3 { margin-bottom: 16px; }
-  #view-settings .cell-guide .step:last-child { margin-bottom: 0; }
-  #view-settings .cell-diag .about { margin-top: 0; }
-  #view-settings .about .version-row { margin-bottom: 8px; }
+  #view-settings .srow-r .label {
+    margin-bottom: 8px; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--orca-muted);
+  }
+  #view-settings .srow-r > .hint { margin-top: 0; }
+  #view-settings .srow .step { margin-bottom: 10px; }
+  #view-settings .srow .step:last-child { margin-bottom: 0; }
+  #view-settings .srow .seg:last-child { margin-bottom: 0; }
+  #view-settings .srow .check-row:last-child { margin-bottom: 0; }
+  #view-settings .footer { border-top: none; padding-top: 6px; }
+  #view-settings .foot-diag { margin-right: auto; min-width: 0; font-size: 11px; line-height: 1.6; color: var(--orca-muted); }
+  #view-settings .foot-diag .version-row, #view-settings .foot-diag .about { margin: 0; }
   #view-settings .preview {
     padding: 14px 16px; border: 1px solid var(--orca-border); border-radius: 10px;
     background: var(--orca-border);
@@ -4022,14 +4262,11 @@ TAB_SETTINGS_CSS = """
   #view-settings .preview-note { color: var(--orca-muted); }
   #view-settings .preview-list:not(:empty) + .preview-note:not(:empty) { margin-top: 6px; }
   @media (max-width: 900px) {
-    #view-settings .settings-grid { grid-template-columns: minmax(0, 1fr); }
-    #view-settings .cell { grid-column: auto; grid-row: auto; padding: 14px 0; }
-    #view-settings .cell-guide { padding-top: 0; }
+    #view-settings .srow-body { grid-template-columns: minmax(0, 1fr); gap: 16px; }
   }
 """
 
 TAB_PREVIEW_HTML = """
-    <h3><span class="emoji">📦</span>Filament Reorder Preview</h3>
     <div class="preview" aria-live="polite">
       <div class="preview-count" id="preview-count"></div>
       <ul class="preview-list" id="preview-list"></ul>
@@ -4142,6 +4379,14 @@ TAB_BRIDGE = """
     var mode = document.querySelector('input[name="weight-display"][value="' + (data.weight_display || "both") + '"]');
     if (mode) { mode.checked = true; mode.dispatchEvent(new Event("change")); }
     document.getElementById("show-cart").checked = data.show_cart === true;
+    var prog = data.progress || {};
+    document.getElementById("prog-finish").checked = prog.finish !== false;
+    document.getElementById("prog-slot").checked = prog.slot !== false;
+    var idle = document.querySelector('input[name="progress-idle"][value="' + (prog.idle === "hide" ? "hide" : "line") + '"]');
+    if (idle) idle.checked = true;
+    var progOn = document.getElementById("show-progress");
+    progOn.checked = prog.on !== false;
+    progOn.dispatchEvent(new Event("change"));
     document.getElementById("update-status").textContent = "";
   });
 })();
@@ -4150,7 +4395,8 @@ TAB_BRIDGE = """
 
 def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
              plate_check: bool = True, plate_margin: int = DEFAULT_MARGIN,
-             weight: str = "both", cart: bool = False, source: str = "spoolman") -> str:
+             weight: str = "both", cart: bool = False, source: str = "spoolman",
+             progress: dict | None = None) -> str:
     """The spool list and Settings as two views of one page, under a shared header.
 
     Built from the standalone pages, which SpoolioWindow still shows as separate windows.
@@ -4158,7 +4404,7 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
     main_css, main_body, main_js = _split_page(main_html())
     settings_css, settings_body, settings_js = _split_page(settings_html(
         current_url, {"ok": False, "pending": True}, low_stock_grams, plate_check, plate_margin,
-        weight, cart, source,
+        weight, cart, source, progress,
     ))
     main_body, main_header = _take_header(main_body)
     tabs_at = main_body.index('<div id="tabs"')
@@ -4169,26 +4415,27 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
     on_main = initial_view == "main"
     settings_button = _button(main_header, "settings-btn")
     feedback_button = _button(settings_header, "feedback")
-    steps, reorder = _section(settings_body, "steps"), _section(settings_body, "reorder")
-    check, server = _section(settings_body, "check"), _section(settings_body, "server")
-    about = _section(settings_body, "about")
-    weights = _section(settings_body, "weights")
-    footer = _section(settings_body, "footer")
-    # The version and update check move out of the footer into the Diagnostics section.
+    sec = {name: _section(settings_body, name) for name in (
+        "steps", "reorder", "check", "check-hint", "server", "about", "weights", "weights-preview",
+        "printer", "printer-preview", "footer")}
+    # The version, update check and log path sit beside the footer buttons.
+    footer = sec["footer"]
     version_row = re.search(r'<div class="version-row">.*?</div>', footer, re.S).group(0)
-    footer = footer.replace(version_row, "")
-    about = about.replace('<div class="logpath">', version_row + '<div class="logpath">', 1)
-    wrench = "\U0001F6E0\uFE0F"
-    settings_view = f"""<div class="settings-grid">
-  <div class="cell cell-guide"><h3><span class="emoji">🚀</span>Getting Started</h3>{steps}</div>
-  <div class="cell cell-server">{server}</div>
-  <div class="cell cell-reorder">{reorder}</div>
-  <div class="cell cell-preview">{TAB_PREVIEW_HTML}</div>
-  <div class="cell cell-check">{check}</div>
-  <div class="cell cell-weights">{weights}</div>
-  <div class="cell cell-diag"><h3><span class="emoji">{wrench}</span>Diagnostics</h3>{about}</div>
-</div>
-{footer}"""
+    footer = footer.replace(version_row, f'<div class="foot-diag">{version_row}{sec["about"]}</div>')
+
+    def card(left: str, label: str, right: str) -> str:
+        title, rest = re.match(r"\s*(<h3>.*?</h3>)(.*)", left, re.S).groups()
+        return (f'<div class="srow">{title}<div class="srow-body"><div class="srow-l">{rest}</div>'
+                f'<div class="srow-r"><div class="label">{label}</div>{right}</div></div></div>')
+
+    settings_view = "\n".join([
+        card(sec["server"], "How It Works", sec["steps"]),
+        card(sec["reorder"], "Preview", TAB_PREVIEW_HTML),
+        card(sec["weights"], "Preview", sec["weights-preview"]),
+        card(sec["check"], "Before You Start", sec["check-hint"]),
+        card(sec["printer"], "Preview", sec["printer-preview"]),
+        footer,
+    ])
     return f"""<!doctype html>
 <html>
 <head>
@@ -4244,7 +4491,8 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
         return get_settings().get("spoolman_url", "")
 
     def _save_settings(self, url, low_stock, plate_check=True,
-                       plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman"):
+                       plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
+                       progress=None):
         settings = get_settings()
         settings["spool_source"] = parse_source(src)
         if settings["spool_source"] == "spoolman":
@@ -4254,6 +4502,8 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
         settings["plate_margin_percent"] = parse_margin(plate_margin)
         settings["weight_display"] = parse_weights(weight)
         settings["show_cart"] = parse_flag(cart, default=False)
+        if progress is not None:
+            settings["progress"] = parse_progress(progress)
         if save_settings(settings):
             log.info("Settings saved (url=%s, low stock=%s g, filament check=%s, margin=%s%%)",
                      url, settings["low_stock_grams"], settings["plate_check"],
@@ -4284,6 +4534,7 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                 plate_margin=plate_settings()[1],
                 weight=weight_mode(),
                 cart=cart_on(),
+                progress=progress_settings(),
             ),
             title=f"{PLUGIN_NAME} - Settings & About",
             width=SETTINGS_SIZE[0],
@@ -4349,7 +4600,7 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                 return
             saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
                                         data.get("plate_margin"), data.get("weight_display"),
-                                        data.get("show_cart"), src)
+                                        data.get("show_cart"), src, data.get("progress"))
             if saved:
                 self._after_save()
                 if self._settings_window is not None:
@@ -4534,6 +4785,7 @@ if _PAGES:
                     plate_margin=plate_settings()[1],
                     weight=weight_mode(),
                     cart=cart_on(),
+                    progress=progress_settings(),
                 )
             except Exception:
                 log.exception("get_ui() raised")
@@ -4600,7 +4852,8 @@ if _PAGES:
             threading.Thread(target=worker, daemon=True).start()
 
         def _save_settings(self, url, low_stock, plate_check=True,
-                           plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman"):
+                           plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
+                           progress=None):
             settings = get_settings()
             settings["spool_source"] = parse_source(src)
             if settings["spool_source"] == "spoolman":
@@ -4610,6 +4863,8 @@ if _PAGES:
             settings["plate_margin_percent"] = parse_margin(plate_margin)
             settings["weight_display"] = parse_weights(weight)
             settings["show_cart"] = parse_flag(cart, default=False)
+            if progress is not None:
+                settings["progress"] = parse_progress(progress)
             if save_settings(settings):
                 log.info("Settings saved (url=%s, low stock=%s g, filament check=%s, margin=%s%%)",
                          url, settings["low_stock_grams"], settings["plate_check"],
@@ -4637,6 +4892,7 @@ if _PAGES:
                 "plate_margin": plate_settings()[1],
                 "weight_display": weight_mode(),
                 "show_cart": cart_on(),
+                "progress": progress_settings(),
             })
             self._check_connection(saved_url, self._settings_window)
 
@@ -4692,7 +4948,7 @@ if _PAGES:
                     return
                 saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
                                             data.get("plate_margin"), data.get("weight_display"),
-                                            data.get("show_cart"), src)
+                                            data.get("show_cart"), src, data.get("progress"))
                 if saved:
                     self._after_save()
                     self._settings_window.close()
