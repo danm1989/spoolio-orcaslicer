@@ -94,12 +94,12 @@ OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the fir
 > [!IMPORTANT]
 > ### Bambu Cloud Limitations
 > - **Unofficial and experimental.** This uses Bambu's unofficial cloud service, which Bambu can change without notice. If it stops working, sign out and back in, if that still fails then please report it.
-  > - **Sign-in expires.** Spoolio keeps only the sign-in token, not your password, so when Bambu expires the token you'll be asked to sign in again from Settings.
-> - **Read only.** Spoolio can read your Bambu filament library but cannot write to it, so nothing you do in Spoolio changes your Bambu spools.
-> - **No usage booking.** Filament usage booking is only available with Spoolman. Spoolio has no way to write used weight back to the Bambu library, and I haven't verified whether Bambu tracks remaining weight itself for RFID spools.
-> - **No live AMS through the cloud.** A printer in LAN mode isn't bound to your account, so Bambu Cloud doesn't list it and sends no AMS data. Use ***Live Link*** (works with either source) for live slots, or assign spools by hand.
-> - **Slot view can lag.** The spools your library has linked to a slot are a representative view only and can differ from what is physically loaded.
-> - **Printer tab setup is local.** Printers, AMS units and slot assignments you set up are stored in Spoolio on your computer, not in your Bambu account.
+>     - **Sign-in expires.** Spoolio keeps only the sign-in token, not your password, so when Bambu expires the token you'll be asked to sign in again from Settings.
+> - Spoolio can only ***read*** your Bambu filament library but cannot write to it, so nothing you do in Spoolio changes your Bambu spools.
+> - Filament usage booking is ***<ins>only</ins>*** available with Spoolman. Spoolio has no way to write used weight back to the Bambu library, and I haven't verified whether being logged into Bambu Cloud tracks remaining weight itself for RFID spools.
+> - There is no live AMS through the cloud. A printer in LAN mode isn't bound to your account, so Bambu Cloud doesn't list it and sends no AMS data. Use ***Live Link*** (works with either source) for live slots, or assign spools by hand.
+> - The spools your library has linked to a slot are a representative view only and can differ from what is physically loaded.
+> - The Printer tab setup is local. Printers, AMS units and slot assignments you set up are stored in Spoolio on your computer, not in your Bambu account.
 >
 > ### Live Link and Booking Limitations
 > - Live Link needs the printer on the same network with LAN mode on, and only connects while the Printer tab is open or usage booking is on.
