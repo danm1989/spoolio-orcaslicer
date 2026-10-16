@@ -9,7 +9,7 @@ The Printer tab now includes print progress for each linked printer. The Setting
 - Configure Printer in Settings. If you don't have multiple printers then the print progress can be turned off if you wish. The print progress card can be further customised to show estimated finish time, slot in use and whether to show the printer if it's in an idle state.
 
 ### Changed
-- The order of the Print tab has been chaned.  Print Proress is now shown first, then your AMS system, followed by "This Plate". The filament usage booking now sits underneath this, as it made more logical sense to be here as material is booked after the plate has finished printing.
+- The order of the Print tab has been chaned.  Print Proress is now shown first, then your AMS system, followed by `This Plate`. The filament usage booking now sits underneath this, as it made more logical sense to be here as material is booked after the plate has finished printing.
 
 - Settings page is now laid out in a card style format.  Each section is card with either a live preview or a guide. For narrow window device e.g. laptop, the two halves of each card stack.  Some notes have been removed, as some settings are quite self explantatory e.g. weights as grams or percentage of spools original weight.
 
@@ -56,7 +56,7 @@ Due to the changes, I've introduced two new tabs, aptly titled Spools and Printe
 - ***Bambu Cloud is unofficial and experimental.*** Bambu can change it without notice, and your sign-in token expires after 90 days, so you will be asked to asked to sign in again after this time.
     - ***Bambu Cloud is read only.*** Spoolio can only read your Bambu filament library and never write to it.
     - ***No live AMS through Bambu Cloud.*** A printer in LAN mode isn't bound to your account, so the cloud doesn't list it. Use Live Link for live slots.
-    - <ins>Bambu Cloud slot view can lag behind what is physically loaded, so treat it as representative only.</ins>
+    - Bambu Cloud slot view can lag behind what is physically loaded, so treat it as **<ins>representative</ins>** only.
 
 - ***Filament usage booking is Spoolman only***. With Bambu Cloud as the source the booking panel is off, because there is no way to write used weight back to the Bambu library. Whether Bambu tracks remaining weight itself for RFID spools is unverified if connected via the Cloud after a print - I'm assuming not if you have no printer connected to your Bambu account via the cloud.
 
