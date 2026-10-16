@@ -4229,10 +4229,10 @@ TAB_SETTINGS_CSS = """
     background: color-mix(in srgb, var(--orca-fg) 3%, var(--orca-bg) 97%);
   }
   #view-settings .srow > h3 {
-    display: flex; align-items: center; margin: 0; padding: 12px 18px; border-bottom: 1px solid var(--orca-border);
+    display: flex; align-items: center; margin: 0; padding: 14px 18px 0;
   }
   #view-settings .srow-body {
-    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px; padding: 14px 18px 16px;
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px; padding: 12px 18px 16px;
   }
   #view-settings .srow-r .label {
     margin-bottom: 8px; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
