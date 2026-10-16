@@ -12,15 +12,16 @@ Spoolio _(Spool Inventory Overview)_ is a Bambu Lab inspired filament inventory 
 
 ## Key Features
 - **Spool cards:** Showing colour, vendor, remaining weight, a progress bar in the spool's own colour and material / colour hex and diameter details.
-- **Two spool sources:** Your self-hosted Spoolman server, or your Bambu Cloud account.
-- **RFID:** Reads from the spool's `tag` extra field when present, otherwise from its official RFID tags (requires Spoolman v.0.27.0 or newer).
-- **Live Link:** Connect directly to a printer on your local network and see what the printer reports for each AMS slot, matched by RFID.
+- **Two sources:** Your self-hosted Spoolman server, or your Bambu Cloud account.
+- **RFID:** Reads from the spool's `tag` extra field when present, or Spoolman's own `tag` field (requires Spoolman v.0.27.0 or newer).
 - **Printer tab:** A card per printer showing what is loaded in each AMS and external spool. Custom build your own by adding printers and AMS units and assigning your spools to the slots, with either spool source.
-- **This Plate panel:** Shown after each slice on the Printer tab, with a progress bar for the estimated filament consumption, an **On This Plate** chip on the matching cards, and a marker where you hold several spools of one filament.
+- **Live Link:** Connect directly to printer(s) on your local network and see what the printer reports for each AMS slot, matched by RFID.
 - **Filament Consumption booking:** With Spoolman, after a print finishes Spoolio can book the filament consumed directly from the `.3mf` to the spool, matched by its RFID tag. Book it yourself or let Spoolio do it.
+
+## Other Features
 - **Filter, sort and group:** By material, manufacturer or location.
-- **Low-stock warning:** Spools under the user defined threshold have their remaining weight turn amber, shading to red as the spool runs out.
-- **Optional reorder button:** Switch on the cart icon in Settings and low-stock spools get a button that opens a web search for reordering (either by a user input Spoolman article no. or it defaults to the filament name).
+- **Low-stock warning:** Spools under the user defined threshold have their remaining weight colour graded as they get closer to empty.
+- **Reorder button:** Switch on the cart icon in `Settings` and low-stock spools get a button that opens a web search for reordering (either by a user input Spoolman article no. or it defaults to the filament name).
 - **Setup your way:** Customise and configure Spoolio how you want.  How cards look, what units you prefer, thresholds, printers and more.
 - Matches OrcaSlicer's **light and dark theming**.
 - Built for **Windows, macOS and Linux** (x86_64 and arm64).
@@ -79,7 +80,7 @@ OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the fir
 
 > [!TIP]
 > ### Printer Tab
-> The **Printer** tab sits beside **Spools** and shows a card for each of your printers. Click ***+ Add Printer***, then add an AMS (4 slots), an AMS HT (1 slot) or an external spool, you can create it to match your setup, and use ***+ Assign Spool*** to choose which of your spools is in each slot. This is stored in Spoolio only and nothing is changed in Spoolman or Bambu Cloud. With Bambu Cloud, spools your library has linked to a slot also show, but that can lag behind what is physically loaded.
+> The **Printer** tab sits beside **Spools** and shows a card for each of your printers. Click ***+ Add Printer***, then add an AMS or an external spool, you can create it to match your setup, and use ***+ Assign Spool*** to choose which of your spools is in each slot. This is stored in Spoolio only and nothing is changed in Spoolman or Bambu Cloud. With Bambu Cloud, spools your library has linked to a slot also show, but that can lag behind what is physically loaded.
 >
 > ### Live Link
 > To read a printer directly, press ***Live Link*** on its card and enter its IP address, its serial number (optional, but helps if you have several printers) and its access code, all found in the printer's network settings with LAN mode on. The slots then show what the printer reports and how long ago it was updated. Spoolio keeps the access code in a private file on your computer and only reads from the printer. Removing a printer also removes its Live Link.
@@ -92,18 +93,17 @@ OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the fir
 
 > [!IMPORTANT]
 > ### Bambu Cloud Limitations
+> - **Unofficial and experimental.** This uses Bambu's unofficial cloud service, which Bambu can change without notice. If it stops working, sign out and back in, if that still fails then please report it.
+  > - **Sign-in expires.** Spoolio keeps only the sign-in token, not your password, so when Bambu expires the token you'll be asked to sign in again from Settings.
 > - **Read only.** Spoolio can read your Bambu filament library but cannot write to it, so nothing you do in Spoolio changes your Bambu spools.
 > - **No usage booking.** Filament usage booking is only available with Spoolman. Spoolio has no way to write used weight back to the Bambu library, and I haven't verified whether Bambu tracks remaining weight itself for RFID spools.
 > - **No live AMS through the cloud.** A printer in LAN mode isn't bound to your account, so Bambu Cloud doesn't list it and sends no AMS data. Use ***Live Link*** (works with either source) for live slots, or assign spools by hand.
 > - **Slot view can lag.** The spools your library has linked to a slot are a representative view only and can differ from what is physically loaded.
-> - **Unofficial and experimental.** This uses Bambu's unofficial cloud service, which Bambu can change without notice. If it stops working, sign out and back in, if that still fails then please report it.
-> - **Sign-in expires.** Spoolio keeps only the sign-in token, not your password, so when Bambu expires the token you'll be asked to sign in again from Settings.
 > - **Printer tab setup is local.** Printers, AMS units and slot assignments you set up are stored in Spoolio on your computer, not in your Bambu account.
 >
 > ### Live Link and Booking Limitations
 > - Live Link needs the printer on the same network with LAN mode on, and only connects while the Printer tab is open or usage booking is on.
 > - Booking assumes the slicer's filament slots follow the order of the printer's slots (AMS 1 slots 1 to 4, then the next AMS, and so on), so check the first few bookings if you use a different mapping.
-> - Slicer weights are estimates, and cancelled prints are estimated from the progress, so booked amounts can differ slightly from what was really used.
 
 > [!TIP]
 > ### Filament Check 
