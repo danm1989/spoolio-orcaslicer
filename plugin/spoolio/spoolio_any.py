@@ -2931,7 +2931,7 @@ MAIN_PAGE = """
           '<span class="sub">No print running</span>' + progWho(lv) + '</div>';
       };
       if (!busy.length) { progSlot.innerHTML = '<div class="prog">' + idle.map(function (lv, i) { return idleRow(lv, i === 0); }).join("") + '</div>'; return; }
-      progSlot.innerHTML = '<div class="prog"><div class="prog-h"><b>Print Progress</b><span class="sub">Live from the printer</span></div>' +
+      progSlot.innerHTML = '<div class="prog"><div class="prog-h"><b>Print Progress</b><span class="sub"><span class="live-dot' + (busy.every(function (lv) { return lv.age > 180; }) ? " stale" : "") + '"></span>Live</span></div>' +
         busy.map(progRow).join("") + idle.map(function (lv) { return idleRow(lv, false); }).join("") + '</div>';
     }
 
