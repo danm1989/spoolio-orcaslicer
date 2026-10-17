@@ -2687,7 +2687,7 @@ MAIN_PAGE = """
       const lv = liveByLink(p.id);
       const st = (liveData.links || {})[p.id];
       if (lv && st === "live") {
-        return '<span class="live-dot' + (lv.age > 180 ? " stale" : "") + '"></span>Live \u00b7 updated ' + liveWhen(lv);
+        return '<span class="live-dot' + (lv.age > 180 ? " stale" : "") + '"></span>Live';
       }
       if (st === "auth") return "Wrong access code";
       if (st === "unreachable") return "Can't reach " + esc(p.ip) + " - is the printer on and in LAN mode?";
@@ -2749,10 +2749,6 @@ MAIN_PAGE = """
       }).join("");
       if (lv.ext) units += unitHtml("External Spool", [lv.ext], true, "ext");
       return units || '<div class="pnote">Waiting for the printer to report its slots...</div>';
-    }
-
-    function liveWhen(lv) {
-      return lv.age < 10 ? "just now" : lv.age < 120 ? lv.age + " s ago" : Math.round(lv.age / 60) + " min ago";
     }
 
     function linkedPanel(p) {
