@@ -1,17 +1,28 @@
 # Changelog
+## [0.7.1] - 2026-10-18
+
+A small tidy-up of the Printer tab so the live status reads the same everywhere and the panels match the card style in Settings.
+
+### Changed
+- Live status is now consistent. The Print Progress heading and each linked printer show a green dot and "Live" instead of "Live from the printer" and "Live · updated just now". The dot still turns amber if a printer hasn't reported for a few minutes.
+
+- Print Progress text sizes. The panel used a mix of text sizes; titles and job names are now one size, everything else is one smaller size, and the percentage is smaller.
+
+- Removed the divider line under the Print Progress and printer card headings, to match the Settings cards
+
 ## [0.7.0] - 2026-10-16
 
-The Printer tab now includes print progress for each linked printer. The Settings page has been tidied up and follows the card theme throughout.  A new section for the Printer tab has been added.
+The Printer tab now includes print progress for each linked printer. The Settings page has been tidied up and follows the card theme throughout and includes a new section for the Printer tab.
 
 ### Added
-- Print progress. This uses the connected printer(s) own MQTT messaging to draw a live progress bar. This is particularly useful for multiple printers that are connected on the same LAN; and doesn't require an equal number of OrcaSlicer instances for each sliced print to monitor the progress via the Device page.
+- Print progress. This uses the connected printer(s) own MQTT messaging to draw a live progress bar. This is particularly useful for multiple printers that are connected on the same LAN and doesn't require separate numbers of OrcaSlicer instances for each sliced print to monitor the progress via the Device page.
 
 - Configure Printer in Settings. If you don't have multiple printers then the print progress can be turned off if you wish. The print progress card can be further customised to show estimated finish time, slot in use and whether to show the printer if it's in an idle state.
 
 ### Changed
-- The order of the Print tab has been chaned.  Print Proress is now shown first, then your AMS system, followed by `This Plate`. The filament usage booking now sits underneath this, as it made more logical sense to be here as material is booked after the plate has finished printing.
+- The order of the Print tab has been changed.  Print Progress is now shown first, then your AMS system, followed by `This Plate`. The filament usage booking now sits underneath this, as it made more logical sense to be here as material is booked after the plate has finished printing.
 
-- Settings page is now laid out in a card style format.  Each section is card with either a live preview or a guide. For narrow window device e.g. laptop, the two halves of each card stack.  Some notes have been removed, as some settings are quite self explantatory e.g. weights as grams or percentage of spools original weight.
+- Settings page is now laid out in a card style format.  Each section is card with either a live preview or a guide. For narrow window device e.g. laptop, the two halves of each card stack.  Some notes have been removed, as some settings are quite self explanatory e.g. weights as grams or percentage of spools original weight.
 
 ## [0.6.0] - 2026-10-12
 
