@@ -1,11 +1,5 @@
 name: Publish to OrcaCloud
 
-# Runs when a GitHub release is published. Nothing happens until you:
-#   1. Create the plugin on Orca Cloud and connect this repo under
-#      Edit plugin > GitHub publishing, and
-#   2. Set the repository variable ORCACLOUD_PUBLISH to "true"
-#      (Settings > Secrets and variables > Actions > Variables).
-
 on:
   release:
     types: [published]
