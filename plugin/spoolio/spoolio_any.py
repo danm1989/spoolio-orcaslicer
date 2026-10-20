@@ -6,7 +6,7 @@
 # name = "Spoolio"
 # description = "A Bambu Lab inspired inventory management overview for OrcaSlicer"
 # author = "Dan J Moore"
-# version = "0.7.1"
+# version = "0.7.2"
 # ///
 
 import base64
