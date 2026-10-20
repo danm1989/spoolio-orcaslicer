@@ -1,4 +1,15 @@
 # Changelog
+## [0.7.2] - 2026-10-20
+
+Live Link now reconnects to your printer within seconds after your computer wakes from sleep, instead of taking a minute or two.  Bump for the OrcaSlicer 2.5.0 Alpha release.
+
+### Fixed
+- Faster reconnect after sleep. Spoolio now notices when your computer has woken from sleep and reconnects to the printer straight away, rather than waiting on the old connection until it timed out.
+
+- Dropped connections are spotted sooner. Spoolio checks the printer is still answering every 15 seconds, and if it hasn't replied for 35 seconds, the Live Link is restarted. Previously a printer that went quiet could leave the link stuck until your operating system gave up on it.
+
+- Quicker retries. If the printer can't be reached, Spoolio tries again after 2 seconds, then 5, then every 15, instead of always waiting 15 seconds.
+
 ## [0.7.1] - 2026-10-18
 
 A small tidy-up of the Printer tab so the live status reads the same everywhere and the panels match the card style in Settings.
@@ -8,7 +19,7 @@ A small tidy-up of the Printer tab so the live status reads the same everywhere 
 
 - Print Progress text sizes. The panel used a mix of text sizes; titles and job names are now one size, everything else is one smaller size, and the percentage is smaller.
 
-- Removed the divider line under the Print Progress and printer card headings, to match the Settings cards
+- Removed the divider line under the Print Progress and printer card headings, to match the Settings cards.
 
 ## [0.7.0] - 2026-10-16
 
