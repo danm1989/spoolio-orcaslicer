@@ -665,8 +665,10 @@ def printer_state() -> dict:
 
 LOCAL_PORT = 8883
 LIVE_IDLE = 90.0
-LIVE_PING = 30.0
-LIVE_RETRY = 15.0
+LIVE_PING = 15.0
+LIVE_DEAD = 35.0
+LIVE_JUMP = 10.0
+LIVE_RETRY = (2.0, 5.0, 15.0)
 _live: dict = {"seen": 0.0, "printers": {}, "links": {}, "keep": False}
 _local: dict = {}
 _live_lock = threading.Lock()
@@ -937,9 +939,18 @@ def _mqtt_run(sock, user: str, password: str, topics: list[str], push: list[tupl
         sock.sendall(_mqtt_subscribe(topic, number))
     for topic, payload in push:
         sock.sendall(_mqtt_publish(topic, payload))
-    ping = time.monotonic()
+    ping = heard = mark = time.monotonic()
+    wall = time.time()
     while keep():
         packet = _mqtt_read(sock)
+        now, clock = time.monotonic(), time.time()
+        if (clock - wall) - (now - mark) > LIVE_JUMP:
+            raise ConnectionError("The computer woke from sleep")
+        mark, wall = now, clock
+        if packet:
+            heard = now
+        elif now - heard > LIVE_DEAD:
+            raise ConnectionError("The printer stopped answering")
         if packet and packet[0] >> 4 == 3:
             body = packet[1]
             size = struct.unpack("!H", body[:2])[0]
@@ -989,8 +1000,10 @@ def _local_session(pid: str, link: dict, stop: threading.Event) -> None:
 
 
 def _local_run(pid: str, link: dict, stop: threading.Event) -> None:
+    fails = 0
     while _live_active() and not stop.is_set():
         _live["links"][pid] = "connecting"
+        start = time.monotonic()
         try:
             _local_session(pid, link, stop)
         except AuthError:
@@ -998,9 +1011,10 @@ def _local_run(pid: str, link: dict, stop: threading.Event) -> None:
             log.warning("A printer refused the access code")
             return
         except Exception as exc:
-            _live["links"][pid] = "unreachable"
+            fails = 0 if time.monotonic() - start > LIVE_DEAD else fails + 1
+            _live["links"][pid] = "unreachable" if fails else "connecting"
             log.warning("Live link to a printer stopped: %s", exc)
-            stop.wait(LIVE_RETRY)
+            stop.wait(LIVE_RETRY[min(fails, len(LIVE_RETRY) - 1)])
     _live["links"].pop(pid, None)
 
 
