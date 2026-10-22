@@ -6,7 +6,7 @@
 # name = "Spoolio"
 # description = "A Bambu Lab inspired inventory management overview for OrcaSlicer"
 # author = "Dan J Moore"
-# version = "0.7.2"
+# version = "0.8.2"
 # ///
 
 import base64
@@ -44,7 +44,7 @@ except (ImportError, AttributeError):
 _SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
 
 PLUGIN_NAME = "Spoolio"
-PLUGIN_VERSION = "0.7.2"
+PLUGIN_VERSION = "0.8.2"
 # Stamped per operating system by scripts/build.py.
 BUILD_TARGET = "any"
 
@@ -160,6 +160,7 @@ def get_settings() -> dict:
         "plate_margin_percent": DEFAULT_MARGIN,
         "weight_display": "both",
         "show_cart": False,
+        "spool_columns": 1,
         "progress": {},
     }
     for path in (SETTINGS_FILE, OLD_SETTINGS):
@@ -205,6 +206,14 @@ def weight_mode() -> str:
 
 def cart_on() -> bool:
     return parse_flag(get_settings().get("show_cart"), default=False)
+
+
+def parse_columns(value: object) -> int:
+    return 2 if value in (2, "2") else 1
+
+
+def spool_columns() -> int:
+    return parse_columns(get_settings().get("spool_columns"))
 
 
 def parse_progress(value: object) -> dict:
@@ -1057,7 +1066,7 @@ def live_poll() -> dict:
 
 USAGE_FILE = DATA_DIR / "usage.json"
 USAGE_MODES = ("ask", "auto", "off")
-USAGE_RECENT = 8
+USAGE_PRINTS = 5
 _usage: dict = {"plan": None}
 _usage_lock = threading.RLock()
 
@@ -1076,8 +1085,10 @@ def usage_load() -> dict:
         log.exception("Could not read %s", USAGE_FILE)
         data = {}
     data = data if isinstance(data, dict) else {}
+    if "prints" not in data and isinstance(data.get("pending"), list):
+        data["prints"] = [dict(e, state="pending") for e in data["pending"] if isinstance(e, dict)][:USAGE_PRINTS]
     return {key: data.get(key) if isinstance(data.get(key), kind) else kind()
-            for key, kind in (("pending", list), ("recent", list), ("active", dict), ("last", dict), ("done", list))}
+            for key, kind in (("prints", list), ("active", dict), ("last", dict), ("done", list))}
 
 
 def usage_save(data: dict) -> None:
@@ -1091,8 +1102,7 @@ def usage_state() -> dict:
     enabled = source() == "spoolman"
     with _usage_lock:
         data = usage_load()
-    return {"enabled": enabled, "mode": usage_mode(),
-            "pending": data["pending"] if enabled else [], "recent": data["recent"] if enabled else []}
+    return {"enabled": enabled, "mode": usage_mode(), "prints": data["prints"] if enabled else []}
 
 
 def usage_plan(slots: list[dict]) -> None:
@@ -1491,14 +1501,14 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
                      "state": "open", "error": ""})
     late = bool(run.get("late")) or run["result"] == "unknown"
     entry = {"id": run["id"], "printer": run["printer"], "name": run["name"], "result": run["result"],
-             "pct": run["pct"], "time": time.time(), "rows": rows, "late": late, "src": src}
+             "pct": run["pct"], "time": time.time(), "rows": rows, "late": late, "src": src, "state": "pending"}
     with _usage_lock:
         data = usage_load()
         if run["id"] in data["done"]:
             return
         data["done"] = [run["id"]] + data["done"][:USAGE_DONE - 1]
         if rows:
-            data["pending"] = [e for e in data["pending"] if e.get("id") != entry["id"]] + [entry]
+            data["prints"] = ([entry] + [e for e in data["prints"] if e.get("id") != entry["id"]])[:USAGE_PRINTS]
         usage_save(data)
     if not rows:
         return
@@ -1517,6 +1527,25 @@ def spoolman_use(spool_id: int, grams: float) -> None:
     _spool_cache["time"] = 0.0
 
 
+def spoolman_unuse(spool_id: int, grams: float) -> None:
+    url = f"{clean_url(get_settings().get('spoolman_url'))}/api/v1/spool/{int(spool_id)}"
+    with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
+        used = float(json.loads(resp.read().decode("utf-8")).get("used_weight") or 0)
+    body = json.dumps({"used_weight": round(max(0.0, used - grams), 1)}).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="PATCH", headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=TIMEOUT):
+        pass
+    _spool_cache["time"] = 0.0
+
+
+def _spoolman_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"Spoolman refused it (HTTP {exc.code})"
+    if isinstance(exc, urllib.error.URLError):
+        return f"Could not reach Spoolman ({exc.reason})"
+    return str(exc)
+
+
 def usage_book(entry_id: str, chosen: list | None) -> None:
     """Book the open rows to their spools; chosen holds manual picks."""
     wanted = {}
@@ -1527,7 +1556,7 @@ def usage_book(entry_id: str, chosen: list | None) -> None:
     by_id = {sp.get("id"): sp for sp in (plate_spools(url) if url else None) or []}
     with _usage_lock:
         data = usage_load()
-        entry = next((e for e in data["pending"] if e.get("id") == entry_id), None)
+        entry = next((e for e in data["prints"] if e.get("id") == entry_id), None)
         if entry is None:
             return
         for row in entry["rows"]:
@@ -1543,23 +1572,35 @@ def usage_book(entry_id: str, chosen: list | None) -> None:
                 continue
             try:
                 spoolman_use(spool, grams)
-            except urllib.error.HTTPError as exc:
-                row.update(state="error", error=f"Spoolman refused it (HTTP {exc.code})")
-                continue
-            except urllib.error.URLError as exc:
-                row.update(state="error", error=f"Could not reach Spoolman ({exc.reason})")
-                continue
             except Exception as exc:
-                row.update(state="error", error=str(exc))
+                row.update(state="error", error=_spoolman_error(exc))
                 continue
-            label = _spool_label(by_id[spool]) if spool in by_id else f"spool {spool}"
+            label = _spool_label(by_id[spool]) if spool in by_id else row.get("label") or f"spool {spool}"
             row.update(state="booked", error="", spool=spool, grams=round(grams, 1), label=label)
-            data["recent"].insert(0, {"time": time.time(), "printer": entry["printer"], "name": entry["name"],
-                                      "grams": row["grams"], "label": label})
             log.info("Booked %.1f g to Spoolman spool %s", grams, spool)
-        if all(row["state"] == "booked" for row in entry["rows"]):
-            data["pending"].remove(entry)
-        data["recent"] = data["recent"][:USAGE_RECENT]
+        entry["state"] = "booked" if all(row["state"] == "booked" for row in entry["rows"]) else "pending"
+        usage_save(data)
+
+
+def usage_undo(entry_id: str) -> None:
+    """Add a booked print's grams back to its spools."""
+    with _usage_lock:
+        data = usage_load()
+        entry = next((e for e in data["prints"] if e.get("id") == entry_id), None)
+        if entry is None or entry.get("state") != "booked":
+            return
+        for row in entry["rows"]:
+            if row["state"] != "booked":
+                continue
+            try:
+                spoolman_unuse(row["spool"], row["grams"])
+            except Exception as exc:
+                row["error"] = _spoolman_error(exc)
+                continue
+            row.update(state="undone", error="")
+            log.info("Added %.1f g back to Spoolman spool %s", row["grams"], row["spool"])
+        if not any(row["state"] == "booked" for row in entry["rows"]):
+            entry["state"] = "undone"
         usage_save(data)
 
 
@@ -1572,11 +1613,8 @@ def usage_action(data: dict) -> dict:
         _local_sync()
     elif kind == "usage_book":
         usage_book(str(data.get("run") or ""), data.get("rows"))
-    elif kind == "usage_dismiss":
-        with _usage_lock:
-            store = usage_load()
-            store["pending"] = [e for e in store["pending"] if e.get("id") != str(data.get("run") or "")]
-            usage_save(store)
+    elif kind == "usage_undo":
+        usage_undo(str(data.get("run") or ""))
     return usage_state()
 
 
@@ -2278,6 +2316,10 @@ MAIN_PAGE = """
   .group-card .group-bar-fill.low { background: #d9534f; }
   .group-items { padding-left: 4px; }
   .group.collapsed .group-items { display: none; }
+  #list.cols-2, #list.cols-2 .group-items { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 10px; align-items: start; }
+  #list.cols-2 > .group, #list.cols-2 > .empty { grid-column: 1 / -1; }
+  #list.cols-2 .group.collapsed .group-items { display: none; }
+  @media (max-width: 640px) { #list.cols-2, #list.cols-2 .group-items { grid-template-columns: minmax(0, 1fr); } }
   .tabs { display: inline-flex; margin: 0 0 12px; border: 1px solid var(--orca-border); border-radius: 8px; overflow: hidden; }
   .tabs[hidden], #page-spools[hidden], #page-printer[hidden] { display: none; }
   .tabs button { background: transparent; color: var(--orca-fg); border: 0; border-right: 1px solid var(--orca-border); border-radius: 0; padding: 7px 20px; font-weight: 600; cursor: pointer; }
@@ -2330,9 +2372,10 @@ MAIN_PAGE = """
   .usage-bar b { font-weight: 700; }
   .usage-bar .sub { color: var(--orca-muted); font-size: 12px; margin-right: auto; }
   .usage select, .u-spool select { background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px; max-width: 100%; }
-  .u-card { border-top: 1px solid var(--orca-border); padding: 10px 14px; }
-  .u-h { color: var(--orca-fg); margin-bottom: 6px; }
-  .u-h .sub { color: var(--orca-muted); font-size: 12px; }
+  .u-card { border: 1px solid var(--orca-border); border-radius: 14px; background: color-mix(in srgb, var(--orca-fg) 5%, var(--orca-bg) 95%); padding: 12px 14px; }
+  .u-h { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; color: var(--orca-fg); margin-bottom: 6px; }
+  .u-h .sub { color: var(--orca-muted); font-size: 12px; margin-right: auto; }
+  .u-h .u-chip { margin-left: 0; }
   .u-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 6px 0; color: var(--orca-fg); }
   .u-row .d { width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, 0.15); flex: none; }
   .u-slot { color: var(--orca-muted); min-width: 110px; }
@@ -2340,9 +2383,28 @@ MAIN_PAGE = """
   .u-g { width: 74px; background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px; }
   .u-chip { margin-left: 8px; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 99px; background: rgba(63, 185, 80, 0.18); color: #3fb950; }
   .u-chip.warn { background: rgba(210, 153, 34, 0.22); color: #e0a030; }
+  .u-chip.off { background: color-mix(in srgb, var(--orca-fg) 12%, transparent); color: var(--orca-muted); }
   .u-err { flex-basis: 100%; color: #d9534f; font-size: 12px; }
-  .u-foot { display: flex; gap: 8px; margin-top: 8px; }
-  .u-recent { padding: 4px 14px 10px; font-size: 12px; color: var(--orca-muted); }
+  .u-amt { color: var(--orca-muted); white-space: nowrap; }
+  .u-card.undone .u-row { color: var(--orca-muted); }
+  .u-card.undone .u-spool, .u-card.undone .u-amt { text-decoration: line-through; }
+  .rb-h { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid var(--orca-border); color: var(--orca-fg); cursor: pointer; user-select: none; }
+  .rb-h .arrow { width: 12px; color: var(--orca-muted); }
+  .rb-h .sub { color: var(--orca-muted); font-size: 12px; margin-right: auto; }
+  .rb-h .u-chip { margin-left: 0; }
+  .rb-list { display: flex; flex-direction: column; gap: 10px; padding: 0 14px 14px; }
+  .rb-mask { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(0, 0, 0, 0.55); }
+  .rb-pop { width: min(460px, 100%); box-sizing: border-box; background: var(--orca-bg); border: 1px solid var(--orca-border); border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45); padding: 16px; color: var(--orca-fg); font-size: 13px; }
+  .rb-pop b.t { display: block; font-size: 15px; margin-bottom: 6px; }
+  .rb-pop .sub { color: var(--orca-muted); font-size: 12px; }
+  .rb-tbl { margin: 12px 0; border: 1px solid var(--orca-border); border-radius: 8px; }
+  .rb-sp { padding: 8px 12px; }
+  .rb-sp + .rb-sp { border-top: 1px solid var(--orca-border); }
+  .rb-sp .n { display: flex; align-items: center; gap: 8px; font-weight: 700; margin-bottom: 4px; }
+  .rb-sp .d { width: 12px; height: 12px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, 0.15); flex: none; }
+  .rb-sp .w { display: flex; gap: 6px; color: var(--orca-muted); font-size: 12px; padding-left: 22px; }
+  .rb-sp .w b { color: #3fb950; }
+  .rb-bar { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
   #usage-slot:empty, #progress-slot:empty { display: none; }
   #usage-slot { margin-top: 14px; }
   .prog { margin: 0 0 14px; border: 1px solid var(--orca-border); border-radius: 10px; background: color-mix(in srgb, var(--orca-fg) 4%, var(--orca-bg) 96%); font-size: 11px; }
@@ -2485,9 +2547,13 @@ MAIN_PAGE = """
     let armed = "";
     let renaming = "";
     let liveOn = false;
-    let usage = { enabled: false, mode: "ask", pending: [], recent: [] };
+    let usage = { enabled: false, mode: "ask", prints: [] };
     let usageEdits = {};
     let usageBooking = false;
+    let usageUndoing = false;
+    let rbUndo = null;
+    let rbOpen = false;
+    try { rbOpen = localStorage.getItem("spoolio.bookings") === "1"; } catch (err) {}
     let plateAttn = false;
     const usageSlot = document.getElementById("usage-slot");
     const progSlot = document.getElementById("progress-slot");
@@ -2571,7 +2637,7 @@ MAIN_PAGE = """
     }
 
     function syncDot() {
-      tabDot.hidden = !(plateAttn || (usage.enabled && usage.pending.length > 0));
+      tabDot.hidden = !(plateAttn || (usage.enabled && usage.prints.some(function (p) { return p.state === "pending"; })));
     }
 
     function usageTime(t) {
@@ -2604,7 +2670,7 @@ MAIN_PAGE = """
       if (r.state === "booked") {
         who = esc(r.label) + '<span class="u-chip">Booked ' + usageGrams(r.grams) + '</span>';
       } else if (r.spool) {
-        who = esc(r.label) + '<span class="u-chip">Matched by RFID</span>';
+        who = esc(r.label) + (r.how === "rfid" ? '<span class="u-chip">Matched by RFID</span>' : "");
       } else {
         who = '<select data-usage="spool">' + spoolOptions(r).replace('value="' + esc(edit.spool || "") + '"', 'value="' + esc(edit.spool || "") + '" selected') + '</select>' +
           '<span class="u-chip warn">Not Identified</span>';
@@ -2616,35 +2682,88 @@ MAIN_PAGE = """
         (r.error ? '<div class="u-err">' + esc(r.error) + '</div>' : "") + '</div>';
     }
 
+    function rbWhen(t) {
+      const d = new Date(t * 1000);
+      const hm = usageTime(t);
+      const days = Math.round((new Date(new Date().toDateString()) - new Date(d.toDateString())) / 864e5);
+      return days === 0 ? "Today " + hm : days === 1 ? "Yesterday " + hm :
+        d.getDate() + " " + d.toLocaleString("en-GB", { month: "short" }) + " " + hm;
+    }
+
+    function rbTotal(p) {
+      return p.rows.reduce(function (a, r) { return a + r.grams; }, 0);
+    }
+
+    function rbCard(p) {
+      const result = p.result === "finished" ? "Finished" : p.result === "unknown" ? "Result Unknown" : "Stopped at " + p.pct + "%";
+      const chip = p.state === "booked" ? '<span class="u-chip">Booked ' + usageGrams(rbTotal(p)) + '</span>' :
+        p.state === "undone" ? '<span class="u-chip off">Undone</span>' : '<span class="u-chip warn">Not Booked</span>';
+      const busy = usageBooking || usageUndoing;
+      const btn = p.state === "booked" ? '<button class="sbtn" data-usage="undo"' + (busy ? " disabled" : "") + '>Undo</button>' :
+        '<button class="sbtn primary" data-usage="book"' + (busy ? " disabled" : "") + '>' + (usageBooking === p.id ? "Booking..." : "Book") + '</button>';
+      const rows = p.state === "pending" ? p.rows.map(function (r) { return usageRow(p, r); }).join("") :
+        p.rows.map(function (r) {
+          const colour = r.colour ? "#" + String(r.colour).replace(/^#/, "") : "#888";
+          return '<div class="u-row"><span class="d" style="background:' + esc(colour) + '"></span>' +
+            '<span class="u-slot">Slot ' + r.slot + (r.material ? " · " + esc(r.material) : "") + '</span>' +
+            '<span class="u-spool">' + esc(r.label) + '</span><span class="u-amt">' + usageGrams(r.grams) + '</span>' +
+            (r.error ? '<div class="u-err">' + esc(r.error) + '</div>' : "") + '</div>';
+        }).join("");
+      const note = p.state !== "pending" ? "" :
+        p.late ? "Spoolio lost contact with the printer during this print, so check the grams before booking." :
+        p.result === "finished" ? "" : "The print did not finish, so the grams are an estimate from its progress.";
+      return '<div class="u-card' + (p.state === "undone" ? " undone" : "") + '" data-run="' + esc(p.id) + '"><div class="u-h"><b>' + esc(p.name) + '</b>' +
+        '<span class="sub">' + esc(p.printer) + ' · ' + result + ' · ' + rbWhen(p.time) + '</span>' + chip + btn + '</div>' + rows +
+        (note ? '<div class="ams-note" style="margin: 6px 0 0">' + note + '</div>' : "") + '</div>';
+    }
+
+    function rbPop() {
+      const p = usage.prints.find(function (x) { return x.id === rbUndo; });
+      if (!p) return "";
+      const rows = p.rows.filter(function (r) { return r.state === "booked"; });
+      const spools = rows.map(function (r) {
+        const s = allSpools.find(function (x) { return x.id === r.spool; }) || {};
+        const left = s.remaining_weight || 0;
+        const colour = r.colour ? "#" + String(r.colour).replace(/^#/, "") : "#888";
+        return '<div class="rb-sp"><div class="n"><span class="d" style="background:' + esc(colour) + '"></span>' + esc(r.label) + '</div>' +
+          '<div class="w">' + usageGrams(left) + ' + ' + usageGrams(r.grams) + ' = <b>' + usageGrams(left + r.grams) + '</b></div></div>';
+      }).join("");
+      const many = rows.length > 1;
+      return '<div class="rb-mask" data-usage="cancel"><div class="rb-pop"><b class="t">Undo This Booking?</b>' +
+        '<div>' + esc(p.name) + ' used ' + usageGrams(rbTotal({ rows: rows })) + (many ? ' from ' + rows.length + ' spools' : '') +
+        '. Spoolio will add it back to ' + (many ? 'each spool' : 'the spool') + ' in Spoolman.</div>' +
+        '<div class="rb-tbl">' + spools + '</div>' +
+        '<div class="sub">The print stays in Recent Bookings, so you can book it again later.</div>' +
+        '<div class="rb-bar"><button class="sbtn ghost" data-usage="cancel">Cancel</button><button class="sbtn primary" data-usage="unbook"' +
+        (usageUndoing ? " disabled" : "") + '>' + (usageUndoing ? "Adding Back..." : "Add Back to Spoolman") + '</button></div></div></div>';
+    }
+
     function renderUsage() {
       syncDot();
-      if (!usage.enabled || (!liveOn && !usage.pending.length && !usage.recent.length)) { usageSlot.innerHTML = ""; return; }
+      if (!usage.enabled || (!liveOn && !usage.prints.length)) { usageSlot.innerHTML = ""; return; }
       const mode = '<label>When a Print Finishes <select data-usage="mode">' + [["ask", "Ask Me Before Booking"], ["auto", "Book Automatically"], ["off", "Do Not Track"]].map(function (m) {
         return '<option value="' + m[0] + '"' + (usage.mode === m[0] ? " selected" : "") + '>' + m[1] + '</option>';
       }).join("") + '</select></label>';
-      const cards = usage.pending.map(function (e) {
-        const result = e.result === "finished" ? "finished" : e.result === "unknown" ? "result unknown" : "stopped at " + e.pct + "%";
-        const note = e.late ? "Spoolio lost contact with the printer during this print, so check the grams before booking." :
-          e.result === "finished" ? "" : "The print did not finish, so the grams are an estimate from its progress.";
-        return '<div class="u-card" data-run="' + esc(e.id) + '"><div class="u-h"><b>' + esc(e.name) + '</b> <span class="sub">' + esc(e.printer) + ' \u00b7 ' + result + ' \u00b7 ' + usageTime(e.time) + '</span></div>' +
-          e.rows.map(function (r) { return usageRow(e, r); }).join("") +
-          '<div class="u-foot"><button class="sbtn primary" data-usage="book"' + (usageBooking ? " disabled" : "") + '>' + (usageBooking ? "Booking..." : "Book Usage") + '</button>' +
-          '<button class="sbtn ghost" data-usage="dismiss">Dismiss</button></div>' +
-          (note ? '<div class="ams-note" style="margin: 6px 0 0">' + note + '</div>' : "") + '</div>';
-      }).join("");
-      const recent = usage.recent.slice(0, 3).map(function (x) {
-        return '<div class="u-recent">Booked ' + usageGrams(x.grams) + ' to ' + esc(x.label) + ' \u00b7 ' + esc(x.printer) + ' \u00b7 ' + usageTime(x.time) + '</div>';
-      }).join("");
-      usageSlot.innerHTML = '<div class="usage"><div class="usage-bar"><b>Filament Usage</b><span class="sub">Booked to Spoolman. Spools are matched by RFID tag.</span>' + mode + '</div>' + cards + recent + '</div>';
+      const list = usage.prints.slice(0, 5);
+      const todo = list.filter(function (p) { return p.state === "pending"; }).length;
+      const head = list.length ? '<div class="rb-h" data-usage="toggle"><span class="arrow">' + (rbOpen ? "▾" : "▸") + '</span><b>Recent Bookings</b>' +
+        '<span class="sub">Last ' + list.length + (list.length === 1 ? ' Print' : ' Prints') + '</span>' +
+        (todo ? '<span class="u-chip warn">' + todo + ' To Book</span>' : "") + '</div>' : "";
+      const body = list.length && rbOpen ? '<div class="rb-list">' + list.map(rbCard).join("") + '</div>' : "";
+      usageSlot.innerHTML = '<div class="usage"><div class="usage-bar"><b>Filament Usage</b><span class="sub"></span>' + mode + '</div>' +
+        head + body + '</div>' + (rbUndo ? rbPop() : "");
     }
 
     function setUsage(u, done) {
-      const was = usage.recent.length ? usage.recent[0].time : 0;
       usage = u;
       Object.keys(usageEdits).forEach(function (id) {
-        if (!usage.pending.some(function (e) { return e.id === id; })) delete usageEdits[id];
+        if (!usage.prints.some(function (e) { return e.id === id && e.state === "pending"; })) delete usageEdits[id];
       });
-      if (done && usageBooking) { usageBooking = false; orca.postMessage({ type: "refresh" }); }
+      if (done && (usageBooking || usageUndoing)) {
+        usageBooking = false;
+        if (usageUndoing) { usageUndoing = false; rbUndo = null; }
+        orca.postMessage({ type: "refresh" });
+      }
       const at = document.activeElement;
       if (at && usageSlot.contains(at) && at.matches('[data-usage="spool"], [data-usage="grams"]')) syncDot(); else renderUsage();
     }
@@ -2672,12 +2791,22 @@ MAIN_PAGE = """
     });
 
     usageSlot.addEventListener("click", function (e) {
-      const btn = e.target.closest("button[data-usage]");
+      const btn = e.target.closest("[data-usage]");
+      if (!btn || btn.disabled) return;
+      const kind = btn.dataset.usage;
       const card = e.target.closest(".u-card");
-      if (!btn || !card) return;
-      if (btn.dataset.usage === "dismiss") {
-        orca.postMessage({ type: "usage_dismiss", run: card.dataset.run });
-      } else if (btn.dataset.usage === "book" && !usageBooking) {
+      if (kind === "toggle") {
+        rbOpen = !rbOpen;
+        try { localStorage.setItem("spoolio.bookings", rbOpen ? "1" : "0"); } catch (err) {}
+      } else if (kind === "cancel") {
+        if (e.target !== btn || usageUndoing) return;
+        rbUndo = null;
+      } else if (kind === "undo" && card) {
+        rbUndo = card.dataset.run;
+      } else if (kind === "unbook" && rbUndo && !usageUndoing) {
+        usageUndoing = true;
+        orca.postMessage({ type: "usage_undo", run: rbUndo });
+      } else if (kind === "book" && card && !usageBooking) {
         const rows = [...card.querySelectorAll(".u-row")].map(function (row) {
           const sel = row.querySelector('select[data-usage="spool"]');
           const g = row.querySelector('input[data-usage="grams"]');
@@ -2686,10 +2815,12 @@ MAIN_PAGE = """
           if (sel && sel.value) out.spool = sel.value;
           return out;
         }).filter(Boolean);
-        usageBooking = true;
-        renderUsage();
+        usageBooking = card.dataset.run;
         orca.postMessage({ type: "usage_book", run: card.dataset.run, rows: rows });
+      } else {
+        return;
       }
+      renderUsage();
     });
 
     function liveByLink(id) {
@@ -3486,6 +3617,7 @@ MAIN_PAGE = """
       if (typeof payload.low_stock_grams === "number") lowStockGrams = payload.low_stock_grams;
       if (typeof payload.weight_display === "string") wMode = payload.weight_display;
       if (typeof payload.show_cart === "boolean") cart = payload.show_cart;
+      if (payload.spool_columns) listEl.classList.toggle("cols-2", payload.spool_columns === 2);
       if (Array.isArray(payload.printers)) cfg = payload.printers;
       if (typeof payload.show_printer_tab === "boolean") showTab = payload.show_printer_tab;
       liveOn = payload.live_ok === true;
@@ -3641,6 +3773,13 @@ SETTINGS_PAGE = """
   .ws-bar { height: 5px; margin: 6px 0 5px; border-radius: 3px; background: rgba(127, 127, 127, 0.25); overflow: hidden; }
   .ws-bar i { display: block; height: 100%; width: 64%; background: #1a1a1a; }
   .ws-sub { font-size: 12px; color: var(--orca-muted); font-style: italic; }
+  .lay-prev { display: grid; gap: 8px; }
+  .lay-prev.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lay-prev .ws-card { padding: 9px 11px 8px; gap: 9px; }
+  .lay-prev .ws-swatch { width: 26px; height: 26px; }
+  .lay-prev .ws-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lay-prev .ws-top span:last-child { font-size: 12px; flex: none; }
+  .lay-prev .ws-bar { margin: 5px 0 0; }
   #prog-opts { padding-left: 25px; }
   .pp-card { padding: 12px 14px; border: 1px solid var(--orca-border); border-radius: 14px; background: var(--orca-border); background: color-mix(in srgb, var(--orca-fg) 5%, var(--orca-bg) 95%); }
   .pp-top { display: flex; align-items: center; gap: 10px; }
@@ -3757,6 +3896,22 @@ SETTINGS_PAGE = """
       <div class="ws-sub">PLA \u00b7 #1A1A1A \u00b7 1.75mm</div>
     </div>
   </div><!--/weights-preview-->
+
+  <div class="divider spaced"></div>
+
+  <!--layout--><h3><span class="emoji">\U0001f4cb</span>Configure Spool List</h3>
+  <div class="field-label">Show spools on the Spools tab as:</div>
+  <div class="seg" id="cols-seg">
+    <label><input type="radio" name="spool-cols" value="1">Single Column</label>
+    <label><input type="radio" name="spool-cols" value="2">Two Columns</label>
+  </div>
+  <div class="hint">In a narrow window, two columns fall back to a single column so names stay readable.</div><!--/layout-->
+  <!--layout-preview--><div class="lay-prev" id="lay-prev">
+    <div class="ws-card"><div class="ws-swatch" style="background:#1a1a1a"></div><div class="ws-main"><div class="ws-top"><span class="ws-name">PLA Matte - Black</span><span>640 g</span></div><div class="ws-bar"><i style="width:64%;background:#1a1a1a"></i></div></div></div>
+    <div class="ws-card"><div class="ws-swatch" style="background:#C12E1F"></div><div class="ws-main"><div class="ws-top"><span class="ws-name">PLA Basic - Red</span><span>530 g</span></div><div class="ws-bar"><i style="width:53%;background:#C12E1F"></i></div></div></div>
+    <div class="ws-card"><div class="ws-swatch" style="background:#2850A8"></div><div class="ws-main"><div class="ws-top"><span class="ws-name">PETG HF - Cobalt Blue</span><span>770 g</span></div><div class="ws-bar"><i style="width:77%;background:#2850A8"></i></div></div></div>
+    <div class="ws-card"><div class="ws-swatch" style="background:#3F8E43"></div><div class="ws-main"><div class="ws-top"><span class="ws-name">PLA Basic - Bambu Green</span><span>700 g</span></div><div class="ws-bar"><i style="width:70%;background:#3F8E43"></i></div></div></div>
+  </div><!--/layout-preview-->
 
   <div class="divider spaced"></div>
 
@@ -3966,6 +4121,18 @@ SETTINGS_PAGE = """
     wRadios.forEach(function (r) { r.addEventListener("change", showWeight); });
     document.querySelector('input[name="weight-display"][value=' + __WEIGHT_MODE__ + ']').checked = true;
     showWeight();
+    const cRadios = document.querySelectorAll('input[name="spool-cols"]');
+    function cPick() {
+      const picked = document.querySelector('input[name="spool-cols"]:checked');
+      return picked ? Number(picked.value) : 1;
+    }
+    function showCols() {
+      cRadios.forEach(function (r) { r.parentNode.classList.toggle("on", r.checked); });
+      document.getElementById("lay-prev").classList.toggle("two", cPick() === 2);
+    }
+    cRadios.forEach(function (r) { r.addEventListener("change", showCols); });
+    document.querySelector('input[name="spool-cols"][value="' + __COLUMNS__ + '"]').checked = true;
+    showCols();
     const progOn = document.getElementById("show-progress");
     const progFinish = document.getElementById("prog-finish");
     const progSlot = document.getElementById("prog-slot");
@@ -4072,6 +4239,7 @@ SETTINGS_PAGE = """
         plate_margin: document.getElementById("plate-margin").value,
         weight_display: wPick(),
         show_cart: document.getElementById("show-cart").checked,
+        spool_columns: cPick(),
         progress: progPick(),
       });
     });
@@ -4097,7 +4265,7 @@ def main_html() -> str:
 def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
                   plate_check: bool = True, plate_margin: int = DEFAULT_MARGIN,
                   weight: str = "both", cart: bool = False, source: str = "spoolman",
-                  progress: dict | None = None) -> str:
+                  progress: dict | None = None, columns: int = 1) -> str:
     """``spoolman_info`` describes the saved URL, not whatever is typed in the field."""
     verified_url = clean_url(current_url) if spoolman_info.get("ok") else ""
     if spoolman_info.get("ok"):
@@ -4123,6 +4291,7 @@ def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
         PLATE_MARGIN=plate_margin,
         WEIGHT_MODE=json.dumps(parse_weights(weight)),
         CART_CHECKED="checked" if cart else "",
+        COLUMNS=parse_columns(columns),
         PROGRESS=json.dumps(parse_progress(progress)),
         LOG_PATH=html.escape(str(LOG_FILE)),
         STATUS_TEXT=html.escape(status_text),
@@ -4390,6 +4559,8 @@ TAB_BRIDGE = """
     var mode = document.querySelector('input[name="weight-display"][value="' + (data.weight_display || "both") + '"]');
     if (mode) { mode.checked = true; mode.dispatchEvent(new Event("change")); }
     document.getElementById("show-cart").checked = data.show_cart === true;
+    var cols = document.querySelector('input[name="spool-cols"][value="' + (data.spool_columns === 2 ? 2 : 1) + '"]');
+    if (cols) { cols.checked = true; cols.dispatchEvent(new Event("change")); }
     var prog = data.progress || {};
     document.getElementById("prog-finish").checked = prog.finish !== false;
     document.getElementById("prog-slot").checked = prog.slot !== false;
@@ -4407,7 +4578,7 @@ TAB_BRIDGE = """
 def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
              plate_check: bool = True, plate_margin: int = DEFAULT_MARGIN,
              weight: str = "both", cart: bool = False, source: str = "spoolman",
-             progress: dict | None = None) -> str:
+             progress: dict | None = None, columns: int = 1) -> str:
     """The spool list and Settings as two views of one page, under a shared header.
 
     Built from the standalone pages, which SpoolioWindow still shows as separate windows.
@@ -4415,7 +4586,7 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
     main_css, main_body, main_js = _split_page(main_html())
     settings_css, settings_body, settings_js = _split_page(settings_html(
         current_url, {"ok": False, "pending": True}, low_stock_grams, plate_check, plate_margin,
-        weight, cart, source, progress,
+        weight, cart, source, progress, columns,
     ))
     main_body, main_header = _take_header(main_body)
     tabs_at = main_body.index('<div id="tabs"')
@@ -4428,7 +4599,7 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
     feedback_button = _button(settings_header, "feedback")
     sec = {name: _section(settings_body, name) for name in (
         "steps", "reorder", "check", "check-hint", "server", "about", "weights", "weights-preview",
-        "printer", "printer-preview", "footer")}
+        "layout", "layout-preview", "printer", "printer-preview", "footer")}
     # The version, update check and log path sit beside the footer buttons.
     footer = sec["footer"]
     version_row = re.search(r'<div class="version-row">.*?</div>', footer, re.S).group(0)
@@ -4443,6 +4614,7 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
         card(sec["server"], "How It Works", sec["steps"]),
         card(sec["reorder"], "Preview", TAB_PREVIEW_HTML),
         card(sec["weights"], "Preview", sec["weights-preview"]),
+        card(sec["layout"], "Preview", sec["layout-preview"]),
         card(sec["check"], "Before You Start", sec["check-hint"]),
         card(sec["printer"], "Preview", sec["printer-preview"]),
         footer,
@@ -4503,7 +4675,7 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
 
     def _save_settings(self, url, low_stock, plate_check=True,
                        plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
-                       progress=None):
+                       progress=None, columns=None):
         settings = get_settings()
         settings["spool_source"] = parse_source(src)
         if settings["spool_source"] == "spoolman":
@@ -4513,6 +4685,8 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
         settings["plate_margin_percent"] = parse_margin(plate_margin)
         settings["weight_display"] = parse_weights(weight)
         settings["show_cart"] = parse_flag(cart, default=False)
+        if columns is not None:
+            settings["spool_columns"] = parse_columns(columns)
         if progress is not None:
             settings["progress"] = parse_progress(progress)
         if save_settings(settings):
@@ -4546,6 +4720,7 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                 weight=weight_mode(),
                 cart=cart_on(),
                 progress=progress_settings(),
+                columns=spool_columns(),
             ),
             title=f"{PLUGIN_NAME} - Settings & About",
             width=SETTINGS_SIZE[0],
@@ -4611,7 +4786,8 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                 return
             saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
                                         data.get("plate_margin"), data.get("weight_display"),
-                                        data.get("show_cart"), src, data.get("progress"))
+                                        data.get("show_cart"), src, data.get("progress"),
+                                        data.get("spool_columns"))
             if saved:
                 self._after_save()
                 if self._settings_window is not None:
@@ -4667,7 +4843,7 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
             self._panel.post({"type": "live", "live": live_poll(), "usage": usage_state()})
         elif msg_type == "printer_code":
             save_printer_code(data.get("id"), data.get("code"))
-        elif msg_type in ("usage_mode", "usage_book", "usage_dismiss"):
+        elif msg_type in ("usage_mode", "usage_book", "usage_undo"):
             threading.Thread(target=lambda: self._panel.post({"type": "usage", "usage": usage_action(data)}), daemon=True).start()
 
     def _push_data(self):
@@ -4693,7 +4869,8 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
             self._refreshing = False
             if panel.is_open():
                 panel.post({"type": "spools", "low_stock_grams": low_stock_grams,
-                            "weight_display": weight_mode(), "show_cart": cart_on(), **printer_state(), **result})
+                            "weight_display": weight_mode(), "show_cart": cart_on(),
+                            "spool_columns": spool_columns(), **printer_state(), **result})
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -4797,6 +4974,7 @@ if _PAGES:
                     weight=weight_mode(),
                     cart=cart_on(),
                     progress=progress_settings(),
+                    columns=spool_columns(),
                 )
             except Exception:
                 log.exception("get_ui() raised")
@@ -4827,7 +5005,7 @@ if _PAGES:
                     self.post_message({"type": "live", "live": live_poll(), "usage": usage_state()})
                 elif msg_type == "printer_code":
                     save_printer_code(data.get("id"), data.get("code"))
-                elif msg_type in ("usage_mode", "usage_book", "usage_dismiss"):
+                elif msg_type in ("usage_mode", "usage_book", "usage_undo"):
                     threading.Thread(target=lambda: self.post_message({"type": "usage", "usage": usage_action(data)}), daemon=True).start()
                 elif msg_type == "plate_recheck":
                     threading.Thread(target=recheck, daemon=True).start()
@@ -4858,13 +5036,14 @@ if _PAGES:
                 result = load_spools()
                 self._refreshing = False
                 self.post_message({"type": "spools", "low_stock_grams": low_stock_grams,
-                                   "weight_display": weight_mode(), "show_cart": cart_on(), **printer_state(), **result})
+                                   "weight_display": weight_mode(), "show_cart": cart_on(),
+                                   "spool_columns": spool_columns(), **printer_state(), **result})
 
             threading.Thread(target=worker, daemon=True).start()
 
         def _save_settings(self, url, low_stock, plate_check=True,
                            plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
-                           progress=None):
+                           progress=None, columns=None):
             settings = get_settings()
             settings["spool_source"] = parse_source(src)
             if settings["spool_source"] == "spoolman":
@@ -4874,6 +5053,8 @@ if _PAGES:
             settings["plate_margin_percent"] = parse_margin(plate_margin)
             settings["weight_display"] = parse_weights(weight)
             settings["show_cart"] = parse_flag(cart, default=False)
+            if columns is not None:
+                settings["spool_columns"] = parse_columns(columns)
             if progress is not None:
                 settings["progress"] = parse_progress(progress)
             if save_settings(settings):
@@ -4903,6 +5084,7 @@ if _PAGES:
                 "plate_margin": plate_settings()[1],
                 "weight_display": weight_mode(),
                 "show_cart": cart_on(),
+                "spool_columns": spool_columns(),
                 "progress": progress_settings(),
             })
             self._check_connection(saved_url, self._settings_window)
@@ -4959,7 +5141,8 @@ if _PAGES:
                     return
                 saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
                                             data.get("plate_margin"), data.get("weight_display"),
-                                            data.get("show_cart"), src, data.get("progress"))
+                                            data.get("show_cart"), src, data.get("progress"),
+                                            data.get("spool_columns"))
                 if saved:
                     self._after_save()
                     self._settings_window.close()
