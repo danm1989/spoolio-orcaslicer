@@ -1,4 +1,26 @@
 # Changelog
+## [0.8.2] - 2026-10-23
+
+This update now introduces two major changes. The Spools tab can now show your spools in two columns, and a redesigned Recent Bookings list. Some users may prefer to showcase their spool list in a single column format, so a new option has been added to the Settings menu to choose between layouts.
+
+### Added
+- A new Configure Spool List card in Settings lets you choose Single Column or Two Columns for the Spools tab, with a preview beside it. Spool cards look the same in both layouts, and when you group spools, each group's spools are split across the two columns. 
+
+- Filament Usage now has a collapsible Recent Bookings list, currently it only retains the last five prints, otherwise it begins to look a tad cluttered. A chip still persists on prints that still need booking.
+
+- Once a print is booked, its Book button changes to Undo. Undo opens a popup that shows each spool's weight now, the amount being added back, and the new total. If you confirm, Spoolio adds the weight back to each spool in Spoolman. The print stays in the list marked as Undone, so you can book it again later.
+
+### Changed
+- Prints waiting to be booked are now shown in Recent Bookings. They have the same spool picker and grams boxes as before, and the Dismiss button has been removed.
+
+- Each print in Recent Bookings is shown as its own card, with the printer, the result and when it ended (for example "Today 08:58" or "Yesterday 21:30").
+
+- Removed the "Booked to Spoolman. Spools are matched by RFID tag." line from the Filament Usage header. The 'Matched by RFID' chip somewhat makes this self explanatory...I hope. 
+
+### Known limitations
+- Undo sets the spool's used weight in Spoolman back by the booked amount. If you have changed that spool's weight in Spoolman since it was booked, check it after undoing.
+Prints that were waiting to be booked carry over when you update. The older "Booked x g to..." lines don't carry over, because they don't record which print they came from.
+
 ## [0.7.2] - 2026-10-20
 
 Live Link now reconnects to your printer within seconds after your computer wakes from sleep, instead of taking a minute or two.  Bump for the OrcaSlicer 2.5.0 Alpha release.
