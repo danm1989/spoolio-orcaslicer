@@ -3065,8 +3065,9 @@ MAIN_PAGE = """
       const list = liveOn && progress.on ? liveData.printers.filter(function (lv) {
         return (liveData.links || {})[lv.link] === "live" && lv.job;
       }) : [];
-      const busy = list.filter(function (lv) { return PROG_STATES[lv.job.state]; });
-      const idle = progress.idle === "hide" ? [] : list.filter(function (lv) { return !PROG_STATES[lv.job.state]; });
+      const hide = progress.idle === "hide";
+      const busy = list.filter(function (lv) { return hide ? PROG_LIVE.indexOf(lv.job.state) >= 0 : PROG_STATES[lv.job.state]; });
+      const idle = hide ? [] : list.filter(function (lv) { return !PROG_STATES[lv.job.state]; });
       if (!busy.length && !idle.length) { progSlot.innerHTML = ""; return; }
       const idleRow = function (lv, title) {
         return '<div class="pj-idle">' + (title ? "<b>Print Progress</b>" : "") + '<span class="pj-chip idle">Idle</span>' +
@@ -3922,7 +3923,7 @@ SETTINGS_PAGE = """
     <label class="check-row"><input id="prog-slot" type="checkbox">Highlight the AMS Slot in Use</label>
     <div class="field-label">When no print is running:</div>
     <div class="seg" id="idle-seg">
-      <label><input type="radio" name="progress-idle" value="line">Show an Idle Line</label>
+      <label><input type="radio" name="progress-idle" value="line">Keep Print Progress Visible</label>
       <label><input type="radio" name="progress-idle" value="hide">Hide Print Progress</label>
     </div>
   </div>
