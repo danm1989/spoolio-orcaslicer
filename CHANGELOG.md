@@ -1,4 +1,18 @@
 # Changelog
+
+## [0.8.4] - 2026-11-05
+
+### Fixed
+- Spoolio now notes which tray the printer reports as feeding and matches that tray’s RFID tag to the matching spools. Previously Spoolio assumed slicer filament 1 meant the first tray, which if using an AMS would be slot 1, so it read AMS slot 1’s tag and booked to that spool, effectively ignoring the source of where the spool was being fed from e.g. AMS 2 Slot 1. This then caused a booking inconsistency at the end of a print as the AMS 2 Slot 1 would be booked against AMS 1 Slot 1. 
+
+## [0.8.3] - 2026-10-29
+
+### Fixed
+- Hide Print Progress now actually does what it says on the tin.  Bambu printers keep reporting “Finished” until the next print starts, and the Printer tab was counting a Finished (or Failed) job as a running print. That meant “Hide Print Progress” never kicked in and the 100% card just stayed there. 
+
+### Changed
+- Renamed the 'Show an Idle Line' option to 'Keep Print Progress Visible' to better describe what this was intended for.
+
 ## [0.8.2] - 2026-10-23
 
 This update now introduces two major changes. The Spools tab can now show your spools in two columns, and a redesigned Recent Bookings list. Some users may prefer to showcase their spool list in a single column format, so a new option has been added to the Settings menu to choose between layouts.
