@@ -6,7 +6,7 @@
 # name = "Spoolio"
 # description = "A Bambu Lab inspired inventory management overview for OrcaSlicer"
 # author = "Dan J Moore"
-# version = "0.8.3"
+# version = "0.8.4"
 # ///
 
 import base64
@@ -44,7 +44,7 @@ except (ImportError, AttributeError):
 _SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
 
 PLUGIN_NAME = "Spoolio"
-PLUGIN_VERSION = "0.8.3"
+PLUGIN_VERSION = "0.8.4"
 # Stamped per operating system by scripts/build.py.
 BUILD_TARGET = "any"
 
@@ -789,6 +789,7 @@ def live_apply(dev_id: str, name: str, doc: object, link: str = "") -> None:
         prog.update({k: report[k] for k in PROG_KEYS if k in report})
         if isinstance(ams, dict) and "tray_now" in ams:
             prog["tray_now"] = ams["tray_now"]
+        events = _note_tray(dev_id, state)
         if "gcode_state" in report:
             gs = str(report["gcode_state"]).upper()
             if gs in ("FINISH", "FAILED"):
@@ -796,10 +797,9 @@ def live_apply(dev_id: str, name: str, doc: object, link: str = "") -> None:
                     prog["end"] = time.time()
             else:
                 prog.pop("end", None)
-        events = []
         if job:
             state.setdefault("job", {}).update(job)
-            events = usage_track(dev_id, state, "gcode_state" in report)
+            events += usage_track(dev_id, state, "gcode_state" in report)
     for event in events:
         usage_event(*event)
 
@@ -1157,14 +1157,55 @@ def match_spool(tray: dict | None, spools: list[dict]) -> dict | None:
 
 
 def _loaded(state: dict) -> list[dict]:
-    """Trays in slicer slot order."""
+    """Trays in slicer slot order, each with its printer tray number as key."""
     trays = []
     for unit_id in sorted(state["units"], key=lambda u: (u >= 128, u)):
         slots = state["units"][unit_id]
-        trays += [dict(slots.get(i, {})) for i in range(1 if unit_id >= 128 else 4)]
-    if not trays and state["ext"]:
-        trays.append(dict(state["ext"]))
+        trays += [dict(slots.get(i, {}), key=unit_id if unit_id >= 128 else unit_id * 4 + i)
+                  for i in range(1 if unit_id >= 128 else 4)]
+    if state["ext"]:
+        trays.append(dict(state["ext"], key=254, spare=bool(trays)))
     return trays
+
+
+def _note_tray(dev_id: str, state: dict) -> list[tuple]:
+    """Remember each tray that feeds the running print. Holds _live_lock."""
+    run, p = state.get("run"), state.get("prog") or {}
+    t = _int(p.get("tray_now"))
+    if not run or not 0 <= t <= 254 or str(p.get("gcode_state") or "").upper() != "RUNNING":
+        return []
+    if _int(p.get("layer_num"), 0) < 1 or t in run.setdefault("used", []):
+        return []
+    run["used"].append(t)
+    if t not in [tr.get("key") for tr in run["trays"]]:
+        run["trays"] = _loaded(state)
+    log.info("Print is using printer tray %d", t)
+    return [("save", dev_id, dict(run))]
+
+
+def _fits(item: dict, tray: dict) -> bool:
+    if not _same_mat(item.get("material"), tray.get("tray_type")):
+        return False
+    gap = colour_diff(item.get("colour") or "", _hex6(tray.get("tray_color")))
+    return gap is None or gap <= COLOUR_TOLERANCE
+
+
+def run_tray(run: dict, item: dict, count: int) -> dict | None:
+    """The tray a filament slot printed from: the trays seen feeding the print come first."""
+    trays = run.get("trays") or []
+    keyed = {tr["key"]: tr for tr in trays if "key" in tr}
+    used = [keyed[k] for k in run.get("used") or [] if k in keyed]
+    if count == 1 and len(used) == 1:
+        return used[0]
+    slots = [tr for tr in trays if not tr.get("spare")]
+    pos = slots[item["n"] - 1] if 0 < item["n"] <= len(slots) else None
+    pool = used or trays
+    fit = [tr for tr in pool if _fits(item, tr)]
+    if len(fit) == 1:
+        return fit[0]
+    if pos is not None and (not used or pos in used) and (not fit or pos in fit):
+        return pos
+    return None
 
 
 JOB_KEYS = ("task_id", "subtask_id", "gcode_start_time")
@@ -1490,7 +1531,7 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
     share = run["pct"] / 100 if run["result"] == "cancelled" else 1.0
     rows = []
     for item in items:
-        tray = run["trays"][item["n"] - 1] if 0 < item["n"] <= len(run["trays"]) else None
+        tray = run_tray(run, item, len(items))
         spool = match_spool(tray, spools)
         grams = round(item["grams"] * share, 1)
         if grams <= 0:
