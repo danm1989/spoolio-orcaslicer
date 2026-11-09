@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.5] - 2026-11-09
+
+This release includes statistics for those data loving users.  As per the built user experience, this feature is entirely optional. In addition this also fixes a bug identified with the 'Live Link' feature sometimes requiring the user to include the serial number of the printer for the handshake to authenticate.  Also identified and fixed an issue with how the H2 series of Bambu printers report their active filaments. 
+
+### Added
+- A new Statistics tab has been added to the UI.  This feature is entirely user optional and is enabled via the Settings menu.  Currently this defaults to 'On' in the latest release but it can be disabled if you wish.  The statistics is meant really for either print farms or users who commercialise their prints, rather than a hobbyist.  There is a lot contained within this tab so best to check it out yourselves rather than me list everything it tracks.
+
+### Fixed
+- Fixed an issue where Live Link wouldn't authenticate the handshake without a serial number. When blank, Live Link would subscribe to a wild card topic, and sometimes the printer would refuse or ignore the request.  Live Link should now read from Bambu printers TLS certificate to obtain the serial number, and if the printer still refuses the user will be prompted to manually input their serial number.
+
+- Fixed an issue with the H2 series printers, following the release of 0.8.4.  The H2 series report their active filament tray via the extruder.  The X, P and A series still use the "current tray" method which was fixed in the previous release. Spoolio now picks whichever field the printer sends.
+
+### Limitations
+- The stats tab creates a history.json file to actively manage the statistics, however this file is only created on first use.  The history will persist through subsequent releases but just wanted to highlight this. Spoolman does offer a history tracking option via Prometheus, which could then be used in Grafana.  I did investigate this but ultimately went with the local solution instead of the overly complex implementation this route takes.
+
 ## [0.8.4] - 2026-11-05
 
 ### Fixed

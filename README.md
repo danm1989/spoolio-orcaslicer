@@ -17,6 +17,7 @@ Spoolio _(Spool Inventory Overview)_ is a Bambu Lab inspired filament inventory 
 - **Printer tab:** A card per printer showing what is loaded in each AMS and external spool. Custom build your own by adding printers and AMS units and assigning your spools to the slots, with either spool source.
 - **Live Link:** Connect directly to printer(s) on your local network and see what the printer reports for each AMS slot, matched by RFID.
 - **Filament Consumption booking:** With Spoolman, after a print finishes Spoolio can book the filament consumed directly from the `.3mf` to the spool, matched by its RFID tag. Book it yourself or let Spoolio do it.
+- **Statistics:** Spoolio tracks each print, filament consumed by colour and material and what it costs to produce.
 
 ## Other Features
 - **Filter, sort and group:** By material, manufacturer or location.
@@ -32,10 +33,14 @@ Spoolio _(Spool Inventory Overview)_ is a Bambu Lab inspired filament inventory 
   <img src="assets/orca-cloud/spoolio-store-image-spool-list.png" alt="Spoolio spool list" width="800">
 </p>
 <p align="center">
-  <img src="assets/orca-cloud/spoolio-store-image-printer.png" alt="Spoolio Printer tab with a live AMS and the This Plate panel" width="800">
+  <img src="assets/orca-cloud/spoolio-store-image-printer.png" width="800">
 </p>
 <p align="center">
-  <img src="assets/orca-cloud/spoolio-store-image-settings.png" alt="Spoolio Settings page" width="800">
+  <img src="assets/orca-cloud/spoolio-store-image-settings.png" width="800">
+</p>
+
+<p align="center">
+  <img src="assets/orca-cloud/spoolio-store-image-stats.png" width="800">
 </p>
 
 ## Requirements
