@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.6] - 2026-11-10
+
+### Added
+- A new graph for the statistics tab, showing an estimated cost of the material lost due to purge towers and supports (estimated from the sliced G-code)
+
+### Changed
+- Moved the statistics config in the Settings tab to the bottom of the page. This is where it should have been anyway...my mistake.
+
 ## [0.9.5] - 2026-11-09
 
 This release includes statistics for those data loving users.  As per the built user experience, this feature is entirely optional. In addition this also fixes a bug identified with the 'Live Link' feature sometimes requiring the user to include the serial number of the printer for the handshake to authenticate.  Also identified and fixed an issue with how the H2 series of Bambu printers report their active filaments. 
