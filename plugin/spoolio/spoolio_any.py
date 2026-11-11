@@ -10,7 +10,8 @@
 # ///
 
 # Spoolio - filament management for OrcaSlicer
-# Copyright (C) 2026 Dan J Moore
+# Copyright (c) 2026 Dan J Moore
+# Licensed under the PolyForm Shield License 1.0.0, see LICENSE.
 
 import base64
 import ftplib
