@@ -1888,11 +1888,20 @@ def _find_job(ftp: _Ftps, job: dict) -> str | None:
     return None
 
 
+CAL_RE = re.compile(r"calibration|flow ?rate|pressure advance|\bpa (line|pattern|tower)|temp(erature)? (test|tower)"
+                    r"|volumetric speed|retraction (test|tower)|^retraction$|vfa test|input shaping|cornering test", re.I)
+
+
+def is_cal(name: str) -> bool:
+    return bool(CAL_RE.search((name or "").strip()))
+
+
 def parse_slice(data: bytes, file: str = "") -> list[dict] | None:
     """Grams per filament slot for the printed plate, from Metadata/slice_info.config."""
     plates = []
     for plate in ET.fromstring(data).iter("plate"):
         meta = {m.get("key"): m.get("value") for m in plate.findall("metadata")}
+        cal = any(is_cal(o.get("name") or "") for o in plate.findall("object"))
         rows = []
         for item in plate.findall("filament"):
             try:
@@ -1902,7 +1911,8 @@ def parse_slice(data: bytes, file: str = "") -> list[dict] | None:
             n = _int(item.get("id"), 0)
             if n > 0 and grams > 0:
                 rows.append({"n": n, "grams": round(grams, 2), "preset": str(item.get("tray_info_idx") or ""),
-                             "colour": _hex6(item.get("color")), "material": str(item.get("type") or "")})
+                             "colour": _hex6(item.get("color")), "material": str(item.get("type") or ""),
+                             **({"cal": True} if cal else {})})
         if rows:
             plates.append((_int(meta.get("index"), 0), rows))
     hint = re.search(r"plate_(\d+)", file)
@@ -2147,7 +2157,8 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
         books = bool((_live["printers"].get(dev_id) or {}).get("books"))
     entry = {"id": run["id"], "printer": run["printer"], "name": run["name"], "result": run["result"],
              "pct": run["pct"], "time": time.time(), "rows": rows, "late": late, "src": src, "state": "pending",
-             "tracked": books and bool(run.get("net"))}
+             "tracked": books and bool(run.get("net")),
+             "cal": is_cal(run["name"]) or any(i.get("cal") for i in items)}
     with _usage_lock:
         data = usage_load()
         if run["id"] in data["done"]:
@@ -2320,7 +2331,7 @@ def hist_note(entry: dict, by_id: dict) -> None:
     if rows:
         hist.append({"id": entry["id"], "time": entry.get("time") or time.time(), "name": entry.get("name") or "",
                      "printer": entry.get("printer") or "", "result": entry.get("result") or "",
-                     "pct": entry.get("pct"), "rows": rows})
+                     "pct": entry.get("pct"), "rows": rows, **({"cal": True} if entry.get("cal") else {})})
         hist.sort(key=lambda e: e.get("time") or 0)
     elif old is None:
         return
@@ -2409,9 +2420,15 @@ def stats_data(period: object) -> dict:
                         "weeks": round(wk, 1) if wk is not None else None,
                         "pct": max(0, min(100, left / full * 100)) if full else None})
     out.sort(key=lambda x: (not x["low"], x["weeks"] if x["weeks"] is not None else 99, x["left"]))
-    ws = {"model": 0.0, "support": 0.0, "purge": 0.0, "cost": 0.0, "mcost": 0.0, "scost": 0.0, "pcost": 0.0, "prints": 0}
+    ws = {"model": 0.0, "support": 0.0, "purge": 0.0, "cal": 0.0, "cost": 0.0, "mcost": 0.0, "scost": 0.0, "pcost": 0.0,
+          "ccost": 0.0, "prints": 0}
     worst = []
     for e in sel:
+        if e.get("cal") or is_cal(e.get("name") or ""):
+            ws["prints"] += 1
+            ws["cal"] += sum(r["grams"] for r in e["rows"])
+            ws["ccost"] += sum(r["cost"] for r in e["rows"] if isinstance(r.get("cost"), (int, float)))
+            continue
         rows = [r for r in e["rows"] if "ws" in r]
         if not rows:
             continue
@@ -2440,7 +2457,8 @@ def stats_data(period: object) -> dict:
             "top": sorted(top.values(), key=lambda x: -x["g"])[:5], "weeks": weeks, "soon": out[:5],
             "waste": ws if ws["prints"] else None, "worst": sorted(worst, key=lambda x: -x["g"])[:3],
             "history": [{"time": e["time"], "name": e["name"], "printer": e["printer"], "result": e["result"],
-                         "pct": e.get("pct"), "rows": e["rows"]} for e in reversed(sel)]}
+                         "pct": e.get("pct"), "rows": e["rows"], "cal": bool(e.get("cal") or is_cal(e.get("name") or ""))}
+                        for e in reversed(sel)]}
 
 
 def is_newer(latest: str, current: str) -> bool:
@@ -3281,6 +3299,7 @@ MAIN_PAGE = """
   .ph .m { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px 2px 4px; border-radius: 99px; background: color-mix(in srgb, var(--orca-fg) 8%, transparent); font-size: 12px; white-space: nowrap; }
   .ph .m i { width: 10px; height: 10px; border-radius: 50%; border: 1px solid var(--orca-border); }
   .ph .fail { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 99px; background: rgba(217, 83, 79, .18); color: #ff8a85; margin-left: 6px; }
+  .ph .cal { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 99px; background: rgba(126, 140, 224, .2); color: #a9b3f0; margin-left: 6px; }
   .ph .more { display: block; margin: 10px auto 0; }
   @media (max-width: 760px) { .st-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } .st-grid, .wi-in { grid-template-columns: minmax(0, 1fr); } }
   .tabs button { background: transparent; color: var(--orca-fg); border: 0; border-right: 1px solid var(--orca-border); border-radius: 0; padding: 7px 20px; font-weight: 600; cursor: pointer; }
@@ -4318,20 +4337,20 @@ MAIN_PAGE = """
       }).join("");
     }
 
-    const W_COLS = { model: "var(--orca-accent)", support: "#e0a030", purge: "#d9534f" };
+    const W_COLS = { model: "var(--orca-accent)", support: "#e0a030", purge: "#d9534f", cal: "#7e8ce0" };
 
     function stWaste(e) {
       const rows = e.rows.filter(function (r) { return typeof r.ws === "number"; });
-      if (!rows.length) return null;
+      if (e.cal || !rows.length) return null;
       return rows.reduce(function (a, r) { return a + r.grams * (r.ws + r.wp); }, 0);
     }
 
     function stRatios(d) {
       const w = d.waste;
       if (!w) return '<div class="st-card wi"><h3>Usage Ratios</h3><div class="st-empty">Supports and purge show up for prints Spoolio reads from the printer&#39;s job file.</div></div>';
-      const all = w.model + w.support + w.purge;
+      const all = w.model + w.support + w.purge + w.cal;
       const pct = function (g) { return Math.round(g / all * 100) + '%'; };
-      const parts = [["model", "Model", w.model, w.mcost], ["support", "Supports", w.support, w.scost], ["purge", "Purge and Prime Tower", w.purge, w.pcost]];
+      const parts = [["model", "Model", w.model, w.mcost], ["support", "Supports", w.support, w.scost], ["purge", "Purge and Prime Tower", w.purge, w.pcost], ["cal", "Calibration", w.cal, w.ccost]];
       const top = d.worst.length ? d.worst.map(function (x) {
         return '<div class="st-row"><span class="st-sw" style="background:' + W_COLS[x.kind] + '"></span><span class="l">' + esc(x.name || "Print") + '</span>' +
           '<span class="t"><i style="width:' + (x.g / d.worst[0].g * 100) + '%;background:' + W_COLS[x.kind] + '"></i></span><span class="v">' +
@@ -4339,7 +4358,7 @@ MAIN_PAGE = """
       }).join("") : '<div class="st-empty">No waste in this period.</div>';
       return '<div class="st-card wi"><h3>Usage Ratios</h3><div class="wi-in"><div><div class="wi-bar">' + parts.map(function (x) {
         return x[2] > 0 ? '<i style="flex:' + x[2] + ';background:' + W_COLS[x[0]] + '" title="' + x[1] + ': ' + stW(x[2]) + '"></i>' : '';
-      }).join("") + '</div><div class="wi-leg">' + parts.map(function (x) {
+      }).join("") + '</div><div class="wi-leg">' + parts.filter(function (x) { return x[0] !== "cal" || x[2] > 0; }).map(function (x) {
         return '<div><span class="k" style="background:' + W_COLS[x[0]] + '"></span><span class="n">' + x[1] + '</span><span class="v">' + stW(x[2]) +
           ' &middot; ' + pct(x[2]) + (w.cost || w.mcost ? ' &middot; ' + stMoney(x[3]) : '') + '</span></div>';
       }).join("") + '</div><div class="wi-note">An estimate from the print&#39;s .3mf job file on the printer. ' +
@@ -4356,7 +4375,8 @@ MAIN_PAGE = """
         const costs = e.rows.filter(function (r) { return typeof r.cost === "number"; });
         const cost = costs.length ? costs.reduce(function (a, r) { return a + r.cost; }, 0) : null;
         const wg = stWaste(e);
-        const fail = e.result === "cancelled" ? '<span class="fail">Failed at ' + (e.pct || 0) + '%</span>' : '';
+        const fail = (e.result === "cancelled" ? '<span class="fail">Failed at ' + (e.pct || 0) + '%</span>' : '') +
+          (e.cal ? '<span class="cal">Calibration</span>' : '');
         return '<tr><td class="d">' + stDate(e.time) + '</td><td><span class="nm">' + esc(e.name || "Print") + '</span>' + fail +
           (e.printer ? '<br><span class="pr">' + esc(e.printer) + '</span>' : '') + '</td><td><div class="mats">' + e.rows.map(function (r) {
             return '<span class="m" title="' + esc(r.label) + '"><i style="background:' + stCol(r.colour) + '"></i>' + esc(r.material || "") + ' ' + r.grams.toFixed(1) + ' g</span>';
@@ -4385,7 +4405,7 @@ MAIN_PAGE = """
         '<div class="st-tile"><span>Filament Cost</span><b>' + stMoney(d.cost) + '</b></div>' +
         '<div class="st-tile' + (d.low ? ' low' : '') + '"><span>Low Stock</span><b>' + d.low + '</b></div>' +
         '<div class="st-tile w"><span>Wasted Filament</span><b>' + (d.waste ? stW(d.waste.support + d.waste.purge) : '&ndash;') + '</b><small>' +
-        (d.waste ? (d.waste.cost ? stMoney(d.waste.cost) + ' &middot; ' : '') + Math.round((d.waste.support + d.waste.purge) / (d.waste.model + d.waste.support + d.waste.purge) * 100) + '% of all filament' : 'From job files on the printer') +
+        (d.waste ? (d.waste.cost ? stMoney(d.waste.cost) + ' &middot; ' : '') + Math.round((d.waste.support + d.waste.purge) / (d.waste.model + d.waste.support + d.waste.purge + d.waste.cal) * 100) + '% of all filament' : 'From job files on the printer') +
         '</small></div></div>' +
         '<div class="st-grid"><div class="st-card"><h3>Used per Week</h3>' + stWeeks(d) + '</div>' +
         '<div class="st-card"><h3>Materials Used</h3>' + stDonut(d) + '</div>' +
