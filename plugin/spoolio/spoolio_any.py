@@ -634,6 +634,7 @@ def load_spools() -> dict:
 
 PRINTER_SLOTS = {"ams": 4, "ht": 1, "ext": 1}
 KLIPPER_SLOTS = {"mmu": 16, "tool": 8}
+NET = ("klipper", "prusalink", "octoprint")
 
 
 def parse_printers(value: object) -> list[dict]:
@@ -645,7 +646,7 @@ def parse_printers(value: object) -> list[dict]:
     for item in value[:8]:
         if not isinstance(item, dict):
             continue
-        kl = item.get("type") == "klipper"
+        kl = item.get("type") in NET
         kinds = KLIPPER_SLOTS if kl else PRINTER_SLOTS
         units = []
         for unit in (item.get("units") if isinstance(item.get("units"), list) else [])[:8]:
@@ -669,7 +670,9 @@ def parse_printers(value: object) -> list[dict]:
         host = r"(https?://)?[A-Za-z0-9.\-]+(:\d{1,5})?" if kl else r"[A-Za-z0-9.\-]+"
         printers.append({"id": str(item.get("id") or f"p{len(printers) + 1}")[:32], "name": name, "units": units,
                          "ip": ip if re.fullmatch(host, ip) else "", "serial": "" if kl else serial,
-                         "type": "klipper" if kl else "bambu"})
+                         "type": item["type"] if kl else "bambu",
+                         "user": str(item.get("user") or "").strip()[:32] if item.get("type") == "prusalink" else "",
+                         "orca": str(item.get("orca") or "").strip()[:120] if kl else ""})
     return printers
 
 
@@ -901,7 +904,7 @@ def _live_prog(state: dict) -> dict | None:
 
     tray = None
     t = tray_key(p)
-    if state.get("kind") == "klipper":
+    if state.get("kind") == "net":
         g, k = _int(p.get("gate")), _int(p.get("tool"))
         tray = {"unit": "mmu", "slot": g} if g >= 0 else {"unit": "tool", "slot": k} if k >= 0 else None
     elif 0 <= t < 128:
@@ -914,7 +917,7 @@ def _live_prog(state: dict) -> dict | None:
     start, end = num("gcode_start_time"), p.get("end")
     return {"state": gs, "pct": num("mc_percent"), "left": num("mc_remaining_time"), "layer": num("layer_num"),
             "layers": num("total_layer_num"), "name": name[:80],
-            "stage": p.get("stage") if state.get("kind") == "klipper" else STAGES.get(_int(p.get("stg_cur"))),
+            "stage": p.get("stage") if state.get("kind") == "net" else STAGES.get(_int(p.get("stg_cur"))),
             "tray": tray, "took": round((end - start) / 60) if end and start and end > start else None,
             "end": end}
 
@@ -923,12 +926,12 @@ def live_snapshot() -> dict:
     with _live_lock:
         printers = []
         for dev_id, state in _live["printers"].items():
-            if state.get("kind") == "klipper":
+            if state.get("kind") == "net":
                 gates = state.get("gates")
                 units = [{"id": "mmu", "kind": "mmu", "trays": [dict(_live_tray(i, g), spool_id=g["spool_id"],
                                                                      empty=g["empty"] and not g["spool_id"])
                                                                 for i, g in enumerate(gates)]}] if gates else []
-                printers.append({"id": dev_id, "link": state.get("link", ""), "name": state["name"], "kind": "klipper",
+                printers.append({"id": dev_id, "link": state.get("link", ""), "name": state["name"], "kind": "net",
                                  "age": round(time.time() - state["time"]), "units": units, "ext": None,
                                  "active_spool": state.get("active"), "books": bool(state.get("books")),
                                  "job": _live_prog(state)})
@@ -1104,7 +1107,7 @@ def _local_run(pid: str, link: dict, stop: threading.Event) -> None:
         _live["links"][pid] = "connecting"
         start = time.monotonic()
         try:
-            (mr_session if link.get("type") == "klipper" else _local_session)(pid, link, stop)
+            NET_SESSIONS.get(link.get("type"), _local_session)(pid, link, stop)
         except AuthError:
             _live["links"][pid] = "auth"
             log.warning("A printer refused the access code or API key")
@@ -1127,10 +1130,9 @@ def _local_sync() -> bool:
     wanted = {}
     for printer in printers_cfg():
         code = codes.get(_code_key(printer["id"]), "")
-        kl = printer["type"] == "klipper"
-        if printer.get("ip") and (code or kl):
+        if printer.get("ip") and (code or printer["type"] == "klipper"):
             wanted[printer["id"]] = {"ip": printer["ip"], "serial": printer["serial"], "code": code,
-                                     "name": printer["name"], "type": printer["type"]}
+                                     "name": printer["name"], "type": printer["type"], "user": printer["user"]}
     for pid in list(_local):
         entry = _local[pid]
         if wanted.get(pid) != entry["link"]:
@@ -1246,7 +1248,6 @@ def mr_apply(pid: str, link: dict, status: dict, extra: dict) -> None:
     th = status.get("toolhead") if isinstance(status.get("toolhead"), dict) else {}
     mmu = status.get("mmu") if isinstance(status.get("mmu"), dict) else None
     file = str(ps.get("filename") or "")
-    gs = MR_STATES.get(str(ps.get("state") or "").lower(), "IDLE")
     pct = max(0, min(100, round((_num(vs.get("progress")) or 0) * 100)))
     info = ps.get("info") if isinstance(ps.get("info"), dict) else {}
     meta = extra.get("meta") or {}
@@ -1254,28 +1255,34 @@ def mr_apply(pid: str, link: dict, status: dict, extra: dict) -> None:
     left = est - took if est else (took / (pct / 100) - took if pct >= 1 else None)
     action = str((mmu or {}).get("action") or "")
     hh = str((mmu or {}).get("spoolman_support") or "off").lower()
+    net_put(pid, link, MR_STATES.get(str(ps.get("state") or "").lower(), "IDLE"), pct, Path(file).stem, file, left,
+            extra.get("job") or "", gates=_mr_gates(mmu) if mmu else None, active=extra.get("spool"),
+            books=bool(extra.get("sm") and (extra.get("spool") or hh in ("push", "pull"))),
+            layer=info.get("current_layer"), layers=info.get("total_layer"),
+            tool=_int((mmu or {}).get("tool")) if mmu else _mr_tool(th.get("extruder")),
+            gate=_int(mmu.get("gate")) if mmu else -1, stage=action if action and action.lower() != "idle" else None)
+
+
+def net_put(pid: str, link: dict, gs: str, pct: int, name: str, file: str, left: float | None, job: str,
+            gates: list | None = None, active: int | None = None, books: bool = False, layer=None, layers=None,
+            tool: int = -1, gate: int = -1, stage: str | None = None) -> None:
+    """Merge one status from a non-Bambu printer into the live state."""
     with _live_lock:
         state = _live["printers"].setdefault(pid, {"name": link["name"], "units": {}, "ext": {}, "time": 0.0,
-                                                  "link": pid, "kind": "klipper"})
-        state["time"] = time.time()
-        state["gates"] = _mr_gates(mmu) if mmu else None
-        state["active"] = extra.get("spool")
-        state["books"] = bool(extra.get("sm") and (extra.get("spool") or hh in ("push", "pull")))
+                                                  "link": pid, "kind": "net"})
+        state.update(time=time.time(), gates=gates, active=active, books=books)
         prog = state.setdefault("prog", {})
         was = prog.get("gcode_state")
-        prog.update(gcode_state=gs, mc_percent=pct, layer_num=info.get("current_layer"),
-                    total_layer_num=info.get("total_layer"), subtask_name=Path(file).stem, gcode_file=file,
-                    mc_remaining_time=round(max(0.0, left) / 60) if left is not None else None,
-                    tool=_int((mmu or {}).get("tool")) if mmu else _mr_tool(th.get("extruder")),
-                    gate=_int(mmu.get("gate")) if mmu else -1,
-                    stage=action if action and action.lower() != "idle" else None)
+        prog.update(gcode_state=gs, mc_percent=pct, layer_num=layer, total_layer_num=layers, subtask_name=name,
+                    gcode_file=file, mc_remaining_time=round(max(0.0, left) / 60) if left is not None else None,
+                    tool=tool, gate=gate, stage=stage)
         if gs in ("FINISH", "FAILED"):
             if was in LIVE_STATES:
                 prog["end"] = time.time()
         else:
             prog.pop("end", None)
-        state.setdefault("job", {}).update(gcode_state=gs, mc_percent=pct, subtask_name=Path(file).stem,
-                                           gcode_file=file, task_id=extra.get("job") or "")
+        state.setdefault("job", {}).update(gcode_state=gs, mc_percent=pct, subtask_name=name, gcode_file=file,
+                                           task_id=job)
         events = usage_track(pid, state, True)
     for event in events:
         usage_event(*event)
@@ -1357,10 +1364,12 @@ def printer_test(data: dict) -> dict:
     host = str(data.get("host") or "").strip()[:64]
     if not re.fullmatch(r"(https?://)?[A-Za-z0-9.\-]+(:\d{1,5})?", host):
         return {"type": "printer_test", "id": pid, "ok": False, "text": "Enter the printer's address, such as voron.local"}
-    return {"type": "printer_test", "id": pid, **mr_test(host, code)}
+    kind = data.get("kind") if data.get("kind") in NET else "klipper"
+    user = str(data.get("user") or "").strip()[:32]
+    return {"type": "printer_test", "id": pid, **NET_TESTS[kind](host, code, user)}
 
 
-def mr_test(host: str, code: str) -> dict:
+def mr_test(host: str, code: str, user: str = "") -> dict:
     """What Spoolio finds at a Moonraker address."""
     link = {"ip": host, "code": code}
     try:
@@ -1381,6 +1390,186 @@ def mr_test(host: str, code: str) -> dict:
         parts.append(f"Happy Hare, {len(gates)} Gates")
     sm = _mr_try(link, "/server/spoolman/status")
     return {"ok": True, "text": " · ".join(parts), "books": bool(sm.get("spoolman_connected"))}
+
+
+NET_POLL = 3.0
+PL_STATES = {"PRINTING": "RUNNING", "PAUSED": "PAUSE", "ATTENTION": "PAUSE", "FINISHED": "FINISH",
+             "STOPPED": "FAILED", "ERROR": "FAILED"}
+OP_STATES = {"printing": "RUNNING", "printing from sd": "RUNNING", "starting": "RUNNING", "resuming": "RUNNING",
+             "pausing": "PAUSE", "paused": "PAUSE", "finishing": "RUNNING", "cancelling": "FAILED"}
+GCODE_TAIL = 262144
+
+
+def net_open(link: dict, path: str, head: dict | None = None):
+    """One GET to PrusaLink or OctoPrint; digest sign-in when a user is set, else the API key."""
+    url = mr_base(link["ip"]) + path
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    handlers: list = [urllib.request.HTTPSHandler(context=ctx)]
+    head = dict(head or {})
+    if link.get("user"):
+        mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        mgr.add_password(None, url, link["user"], link.get("code") or "")
+        handlers.append(urllib.request.HTTPDigestAuthHandler(mgr))
+    elif link.get("code"):
+        head["X-Api-Key"] = link["code"]
+    try:
+        return urllib.request.build_opener(*handlers).open(urllib.request.Request(url, headers=head), timeout=TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise AuthError("The printer refused the password or API key") from exc
+        raise
+
+
+def net_get(link: dict, path: str) -> dict:
+    with net_open(link, path) as resp:
+        body = resp.read()
+    doc = json.loads(body.decode("utf-8")) if body.strip() else {}
+    if not isinstance(doc, dict):
+        raise ValueError("Not a JSON reply")
+    return doc
+
+
+def _net_try(link: dict, path: str) -> dict:
+    try:
+        return net_get(link, path)
+    except AuthError:
+        raise
+    except MR_ERRORS:
+        return {}
+
+
+def _heads(pid: str) -> int:
+    cfg = next((p for p in printers_cfg() if p["id"] == pid), None)
+    return next((len(u["slots"]) for u in (cfg or {}).get("units", []) if u["kind"] == "tool"), 1)
+
+
+def pl_session(pid: str, link: dict, stop: threading.Event) -> None:
+    """Poll PrusaLink while the live link is wanted."""
+    net_get(link, "/api/version")
+    log.info("Live link to a PrusaLink printer connected")
+    job: dict = {}
+    while _live_active() and not stop.is_set():
+        st = net_get(link, "/api/v1/status")
+        pr = st.get("printer") if isinstance(st.get("printer"), dict) else {}
+        jb = st.get("job") if isinstance(st.get("job"), dict) else {}
+        jid = str(jb.get("id") or "")
+        if jid and str(job.get("id") or "") != jid:
+            job = _net_try(link, "/api/v1/job")
+        f = job.get("file") if isinstance(job.get("file"), dict) else {}
+        file = (str(f.get("path") or "").rstrip("/") + "/" + str(f.get("name") or "")) if f.get("name") else ""
+        gs = PL_STATES.get(str(pr.get("state") or "").upper(), "IDLE")
+        pct = max(0, min(100, round(_num(jb.get("progress")) or 0)))
+        _live["links"][pid] = "live"
+        net_put(pid, link, gs, pct, Path(str(f.get("display_name") or f.get("name") or "")).stem, file,
+                _num(jb.get("time_remaining")), str(job.get("id") or ""), tool=0 if _heads(pid) == 1 else -1)
+        stop.wait(NET_POLL)
+
+
+def pl_fetch_job(link: dict, job: dict) -> list[dict] | None:
+    file = job.get("file") or ""
+    if not file:
+        return None
+    cur = _net_try(link, "/api/v1/job")
+    f = cur.get("file") if isinstance(cur.get("file"), dict) else {}
+    meta = f.get("meta") if f.get("name") and file.endswith("/" + str(f["name"])) else None
+    if not isinstance(meta, dict) or "filament used [g] per tool" not in meta:
+        meta = net_get(link, "/api/v1/files" + urllib.parse.quote(file)).get("meta") or {}
+    return net_items(meta)
+
+
+def net_items(meta: dict) -> list[dict] | None:
+    """Grams per tool from slicer metadata, as PrusaLink or the G-code itself gives it."""
+    weights = meta.get("filament used [g] per tool")
+    if not isinstance(weights, list):
+        weights = [float(v) for v in re.findall(r"[\d.]+", str(meta.get("filament used [g]") or ""))]
+    types = meta.get("filament_type per tool")
+    types = types if isinstance(types, list) else split_list(meta.get("filament_type"))
+    colours = split_list(meta.get("filament_colour") or meta.get("extruder_colour"))
+    rows = []
+    for i, grams in enumerate(weights):
+        grams = _num(grams) or 0.0
+        if grams > 0:
+            rows.append({"n": i + 1, "grams": round(grams, 2), "preset": "",
+                         "colour": _hex6(colours[i]) if i < len(colours) else "",
+                         "material": str(types[i]) if i < len(types) else ""})
+    return rows or None
+
+
+def pl_test(host: str, code: str, user: str = "") -> dict:
+    link = {"ip": host, "code": code, "user": user or "maker"}
+    try:
+        ver = net_get(link, "/api/version")
+    except AuthError:
+        return {"ok": False, "text": "PrusaLink refused the username or password"}
+    except MR_ERRORS as exc:
+        return {"ok": False, "text": f"Can't reach PrusaLink at {mr_base(host)} ({exc})"}
+    info = _net_try(link, "/api/v1/info")
+    parts = [str(ver.get("text") or "PrusaLink"), str(info.get("name") or info.get("hostname") or "")]
+    if info.get("mmu"):
+        parts.append("MMU")
+    return {"ok": True, "text": " · ".join(x for x in parts if x)}
+
+
+def op_session(pid: str, link: dict, stop: threading.Event) -> None:
+    """Poll OctoPrint while the live link is wanted."""
+    net_get(link, "/api/version")
+    log.info("Live link to an OctoPrint printer connected")
+    last, job_id, file = "IDLE", "", ""
+    while _live_active() and not stop.is_set():
+        doc = net_get(link, "/api/job")
+        jb = doc.get("job") if isinstance(doc.get("job"), dict) else {}
+        pg = doc.get("progress") if isinstance(doc.get("progress"), dict) else {}
+        f = jb.get("file") if isinstance(jb.get("file"), dict) else {}
+        pct = max(0, min(100, int(_num(pg.get("completion")) or 0)))
+        gs = OP_STATES.get(str(doc.get("state") or "").lower())
+        if gs is None:
+            gs = last if last in ("FINISH", "FAILED", "IDLE") else "FINISH" if pct >= 100 else "FAILED"
+        if gs == "RUNNING" and last not in ("RUNNING", "PAUSE"):
+            file = str(f.get("path") or f.get("name") or "")
+            job_id = f"{file}@{int(time.time() - (_num(pg.get('printTime')) or 0)) // 60}"
+        last = gs
+        _live["links"][pid] = "live"
+        net_put(pid, link, gs, pct, Path(file).stem, file, _num(pg.get("printTimeLeft")), job_id,
+                tool=0 if _heads(pid) == 1 else -1)
+        stop.wait(NET_POLL)
+
+
+def op_fetch_job(link: dict, job: dict) -> list[dict] | None:
+    """Grams per tool from the slicer's notes at the end of the G-code."""
+    file = job.get("file") or ""
+    if not file:
+        return None
+    tail = b""
+    with net_open(link, "/downloads/files/local/" + urllib.parse.quote(file), {"Range": f"bytes=-{GCODE_TAIL}"}) as resp:
+        while chunk := resp.read(65536):
+            tail = (tail + chunk)[-GCODE_TAIL:]
+    meta = {}
+    for m in re.finditer(r"^;\s*([a-z_ ]+(?:\[g\])?)\s*=\s*(.*)$", tail.decode("utf-8", "replace"), re.M):
+        meta.setdefault(m.group(1).strip(), m.group(2).strip())
+    return net_items(meta)
+
+
+def op_test(host: str, code: str, user: str = "") -> dict:
+    link = {"ip": host, "code": code}
+    if not code:
+        return {"ok": False, "text": "Enter an OctoPrint API key"}
+    try:
+        ver = net_get(link, "/api/version")
+        net_get(link, "/api/job")
+    except AuthError:
+        return {"ok": False, "text": "OctoPrint refused the API key"}
+    except MR_ERRORS as exc:
+        return {"ok": False, "text": f"Can't reach OctoPrint at {mr_base(host)} ({exc})"}
+    plugins = (_net_try(link, "/plugin/pluginmanager/plugins").get("plugins") or [])
+    books = any("spool" in str(x.get("key") or "").lower() and x.get("enabled") for x in plugins if isinstance(x, dict))
+    return {"ok": True, "text": f"OctoPrint {ver.get('server') or ''}".strip(), "books": books}
+
+
+NET_SESSIONS = {"klipper": mr_session, "prusalink": pl_session, "octoprint": op_session}
+NET_FETCH = {"klipper": mr_fetch_job, "prusalink": pl_fetch_job, "octoprint": op_fetch_job}
+NET_TESTS = {"klipper": mr_test, "prusalink": pl_test, "octoprint": op_test}
 
 
 USAGE_FILE = DATA_DIR / "usage.json"
@@ -1480,7 +1669,7 @@ def match_spool(tray: dict | None, spools: list[dict]) -> dict | None:
 
 def _loaded(state: dict) -> list[dict]:
     """Trays in slicer slot order, each with its printer tray number as key."""
-    if state.get("kind") == "klipper":
+    if state.get("kind") == "net":
         return _mr_loaded(state)
     trays = []
     for unit_id in sorted(state["units"], key=lambda u: (u >= 128, u)):
@@ -1597,7 +1786,7 @@ def usage_track(dev_id: str, state: dict, has_state: bool) -> list[tuple]:
             state["run"] = {"id": f"{dev_id}-{int(time.time())}", "plan": plan, "file": None, "job": ident,
                             "name": str(job.get("subtask_name") or job.get("gcode_file") or "Print")[:80],
                             "trays": _loaded(state), "pct": pct, "late": not new,
-                            "klipper": state.get("kind") == "klipper"}
+                            "net": state.get("kind") == "net"}
             state["idle_seen"] = False
             events.append(("start", dev_id, dict(state["run"])))
         if not same_job(state.get("last"), ident) and (ident["name"] or ident["file"]):
@@ -1834,7 +2023,7 @@ def _try_fetch(dev_id: str, job: dict) -> list[dict] | None:
     if not link:
         return None
     try:
-        return (mr_fetch_job if link.get("type") == "klipper" else fetch_job)(link, job)
+        return NET_FETCH.get(link.get("type"), fetch_job)(link, job)
     except AuthError as exc:
         log.warning("Could not read the job from a printer: %s", exc)
         return None
@@ -1888,7 +2077,7 @@ def _missed(dev_id: str, info: dict) -> None:
         state = _live["printers"].get(dev_id)
         trays = _loaded(state) if state else []
     run = {"id": run_id, "plan": None, "file": items, "job": ident, "trays": trays, "late": True,
-           "klipper": bool(state and state.get("kind") == "klipper"),
+           "net": bool(state and state.get("kind") == "net"),
            "name": (ident["name"] or ident["file"] or "Print")[:80], "pct": info["pct"]}
     usage_finish(_ended(run, info["printer"], info["result"], info["pct"]), dev_id)
 
@@ -1948,7 +2137,7 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
             continue
         how = ("tool" if tray.get("head") else "gate") if tray and "tools" in tray else "rfid"
         where = (f"T{item['n'] - 1}" if tray.get("head") else f"Gate {tray['key']}") if how != "rfid" else \
-            (f"T{item['n'] - 1}" if run.get("klipper") else "")
+            (f"T{item['n'] - 1}" if run.get("net") else "")
         rows.append({"slot": item["n"], "grams": grams, "preset": item["preset"], "material": item["material"],
                      "colour": item["colour"], "spool": spool["id"] if spool else None,
                      "how": how if spool else "", "label": _spool_label(by_id[spool["id"]]) if spool else "",
@@ -1958,7 +2147,7 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
         books = bool((_live["printers"].get(dev_id) or {}).get("books"))
     entry = {"id": run["id"], "printer": run["printer"], "name": run["name"], "result": run["result"],
              "pct": run["pct"], "time": time.time(), "rows": rows, "late": late, "src": src, "state": "pending",
-             "tracked": books and bool(run.get("klipper"))}
+             "tracked": books and bool(run.get("net"))}
     with _usage_lock:
         data = usage_load()
         if run["id"] in data["done"]:
@@ -1971,7 +2160,7 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
         return
     log.info("A print ended (%s, %d%%, grams from the %s): %d slots to book", run["result"], run["pct"],
              "job file" if src == "file" else "last slice", len(rows))
-    if usage_mode() == "auto" and run["result"] == "finished" and not late and not run.get("klipper"):
+    if usage_mode() == "auto" and run["result"] == "finished" and not late and not run.get("net"):
         usage_book(entry["id"], None)
 
 
@@ -2695,6 +2884,72 @@ def check_plate(slots: list[dict], margin: int, fresh: bool = False) -> tuple[tu
     return plate_notice(results), results
 
 
+_sliced: dict = {"preset": "", "slots": [], "payload": None}
+
+
+def heads_fill(slots: list[dict], preset: str, pid: str = "") -> dict | None:
+    """Put the sliced filaments on the toolheads, or MMU gates, of the non-Bambu printer they are for."""
+    _sliced.update(preset=preset, slots=slots)
+    cfg = printers_cfg()
+    net = [p for p in cfg if p["type"] in NET and p["units"]]
+    if not net or not preset or not slots or slots[0].get("ams"):
+        return None
+    if pid:
+        for q in cfg:
+            q["orca"] = preset if q["id"] == pid else "" if q["orca"] == preset else q["orca"]
+    p = next((x for x in net if x["orca"] == preset), None)
+    if p is None:
+        if len(net) > 1 or net[0]["orca"]:
+            return {"preset": preset, "choose": [x["id"] for x in net]}
+        p = net[0]
+        p["orca"] = preset
+    with _live_lock:
+        hh = bool((_live["printers"].get(p["id"]) or {}).get("gates"))
+    unit = None if hh else next((u for u in p["units"] if u["kind"] == "mmu"), None) or \
+        next((u for u in p["units"] if u["kind"] == "tool"), None)
+    out = {"preset": preset, "printer": p["id"], "time": time.strftime("%H:%M"), "rows": []}
+    spools = plate_spools(spool_key()) if spool_key() else None
+    if unit is None or spools is None:
+        save_printers(cfg)
+        return dict(out, error="hh" if hh else "unit" if unit is None else "spools")
+    placed: set[str] = set()
+    for i, slot in enumerate(slots[:len(unit["slots"])]):
+        ids = [str(x["id"]) for x in match_spools(slot, spools) if str(x["id"]) not in placed]
+        cur = unit["slots"][i]
+        state = "kept" if cur in ids else "set" if len(ids) == 1 else "pick" if ids else "none"
+        if state == "set":
+            for q in cfg:
+                for u in q["units"]:
+                    u["slots"] = [None if x == ids[0] else x for x in u["slots"]]
+            unit["slots"][i] = ids[0]
+        if state in ("set", "kept"):
+            placed.add(unit["slots"][i])
+        out["rows"].append({"n": i, "kind": unit["kind"], "state": state, "count": len(ids), "colour": slot["colour"],
+                            "name": slot["preset"].split("@")[0].strip() or slot["material"]})
+    save_printers(cfg)
+    log.info("Filled %s from the slice: %s", unit["kind"], ", ".join(f"{r['n']} {r['state']}" for r in out["rows"]))
+    return out
+
+
+def run_heads(slots: list[dict], preset: str, pid: str = "") -> None:
+    time.sleep(NOTICE_DELAY)
+    try:
+        _sliced["payload"] = heads_fill(slots, preset, pid)
+        send_heads()
+    except Exception:
+        log.exception("Filling the toolheads failed")
+
+
+def send_heads() -> None:
+    page = _plate["page"]
+    if page is None or _sliced["payload"] is None:
+        return
+    try:
+        page.post_message({"type": "heads", "heads": _sliced["payload"], "printers": printer_state()["printers"]})
+    except Exception:
+        log.exception("Could not update the printer panel")
+
+
 def run_check(slots: list[dict], margin: int) -> None:
     time.sleep(NOTICE_DELAY)
     try:
@@ -3070,6 +3325,8 @@ MAIN_PAGE = """
   .ams-empty { border-style: dashed; opacity: 0.7; }
   .ams-dash { background: transparent !important; border: 2px dashed var(--orca-border) !important; box-shadow: none !important; }
   .ams-note { margin-top: 12px; font-size: 12px; color: var(--orca-muted); }
+  .ams-note.heads { color: var(--orca-fg); }
+  .ams-note.heads .sbtn { margin-left: 8px; }
   .plate.on-printer > .divider:last-child { display: none; }
   .live-dot { display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; background: #3fb950; }
   .live-dot.stale { background: #e0a030; }
@@ -3286,6 +3543,8 @@ MAIN_PAGE = """
     const KINDS = { ams: 4, ht: 1, ext: 1, mmu: 4, tool: 1 };
     const RANK = { ams: 0, ht: 1, ext: 2, mmu: 3, tool: 4 };
     const GROW = { mmu: 16, tool: 8 };
+    const NET = { klipper: "Moonraker", prusalink: "PrusaLink", octoprint: "OctoPrint" };
+    let heads = null;
     let tests = {};
     try { const t = localStorage.getItem("spoolio.tab"); if (t === "printer" || t === "stats") tab = t; } catch (err) {}
     const statsEl = document.getElementById("page-stats");
@@ -3564,23 +3823,23 @@ MAIN_PAGE = """
     }
 
     function linkStatus(p) {
-      if (p.type === "klipper") {
+      if (NET[p.type]) {
         if (!p.ip) return "";
         const kl = liveByLink(p.id);
         const ks = (liveData.links || {})[p.id];
         if (kl && ks === "live") {
-          return '<span class="live-dot' + (kl.age > 180 ? " stale" : "") + '"></span>Live via Moonraker' +
-            (kl.books ? '<span class="kchip" title="Moonraker is linked to Spoolman and books usage itself">Printer Books Usage</span>' : "");
+          return '<span class="live-dot' + (kl.age > 180 ? " stale" : "") + '"></span>Live via ' + NET[p.type] +
+            (kl.books ? '<span class="kchip" title="The printer is linked to Spoolman and books usage itself">Printer Books Usage</span>' : "");
         }
-        if (ks === "auth") return "Moonraker refused the API key";
-        if (ks === "unreachable") return "Can't reach " + esc(p.ip) + " - is Moonraker running?";
+        if (ks === "auth") return NET[p.type] + (p.type === "prusalink" ? " refused the password" : " refused the API key");
+        if (ks === "unreachable") return "Can't reach " + esc(p.ip) + " - is " + NET[p.type] + " running?";
         return "Connecting to " + esc(p.ip) + "...";
       }
       if (!p.ip || !p.has_code) return "";
       const lv = liveByLink(p.id);
       const st = (liveData.links || {})[p.id];
       if (lv && st === "live") {
-        return '<span class="live-dot' + (lv.age > 180 ? " stale" : "") + '"></span>Live';
+        return '<span class="live-dot' + (lv.age > 180 ? " stale" : "") + '"></span>Live via LAN Mode';
       }
       if (st === "auth") return "Wrong access code";
       if (st === "serial") return "The printer needs its serial number - add it under Live Link";
@@ -3590,22 +3849,40 @@ MAIN_PAGE = """
     }
 
     function linkForm(p) {
-      const t = (p.draft || p.type) === "klipper" ? "klipper" : "bambu";
-      const seg = '<div class="lseg"><span>Printer Type</span><div class="kseg">' + [["bambu", "Bambu Lab"], ["klipper", "Klipper (Moonraker)"]].map(function (x) {
+      const t = p.draft || p.type || "bambu";
+      const seg = '<div class="lseg"><span>Printer Type</span><div class="kseg">' + [["bambu", "Bambu Lab"], ["klipper", "Klipper (Moonraker)"], ["prusalink", "PrusaLink"], ["octoprint", "OctoPrint"]].map(function (x) {
         return '<button class="' + (t === x[0] ? "on" : "") + '" data-act="link-type" data-t="' + x[0] + '" data-p="' + esc(p.id) + '">' + x[1] + '</button>';
       }).join("") + '</div></div>';
       const bar = '<div class="bar"><button class="sbtn" data-act="link-save" data-p="' + esc(p.id) + '">Save</button>' +
-        (t === "klipper" ? '<button class="sbtn ghost" data-act="link-test" data-p="' + esc(p.id) + '">Test</button>' : "") +
+        (NET[t] ? '<button class="sbtn ghost" data-act="link-test" data-p="' + esc(p.id) + '">Test</button>' : "") +
         '<button class="sbtn ghost" data-act="link-cancel" data-p="' + esc(p.id) + '">Cancel</button>' +
         (p.ip ? '<button class="sbtn ghost" data-act="link-remove" data-p="' + esc(p.id) + '">Remove Link</button>' : "") + '</div>';
-      const saved = p.has_code ? "Saved - leave blank to keep" : "";
+      const saved = p.has_code && t === p.type ? "Saved - leave blank to keep" : "";
+      const ip = t === p.type ? p.ip || "" : "";
+      const note = function (s) { return '<div class="ams-note" style="flex-basis: 100%; margin: 0">' + s + '</div>'; };
+      const test = '<div class="ktest">' + (tests[p.id] || "") + '</div>' + (p.orca ? '<div class="ktest">Fills its toolheads from slices for the OrcaSlicer printer &ldquo;' + esc(p.orca) + '&rdquo;' +
+        '<button class="sbtn ghost" data-act="heads-unbind" data-p="' + esc(p.id) + '">Stop</button></div>' : "");
+      if (t === "prusalink") {
+        return '<div class="linkform" data-t="prusalink">' + seg +
+          '<label>Printer Address<input data-f="ip" value="' + esc(ip) + '" placeholder="192.168.1.70" autocomplete="off"></label>' +
+          '<label>Username<input data-f="user" value="' + esc(p.user || "maker") + '" autocomplete="off"></label>' +
+          '<label>Password<input data-f="code" type="password" autocomplete="off" placeholder="' + (saved || "Settings > Network > PrusaLink") + '"></label>' +
+          bar + test + note("The address and password are on the printer under Settings > Network > PrusaLink. " +
+          "Spoolio only reads from the printer. PrusaLink doesn&#39;t say which toolhead is printing, so assign a spool to each toolhead here.") + '</div>';
+      }
+      if (t === "octoprint") {
+        return '<div class="linkform" data-t="octoprint">' + seg +
+          '<label>OctoPrint Address<input data-f="ip" value="' + esc(ip) + '" placeholder="octopi.local" autocomplete="off"></label>' +
+          '<label>API Key<input data-f="code" type="password" autocomplete="off" placeholder="' + (saved || "Settings > Application Keys") + '"></label>' +
+          bar + test + note("Make an application key for Spoolio in OctoPrint under Settings > Application Keys. Spoolio only reads from OctoPrint and never sends G-code. " +
+          "If an OctoPrint Spoolman plugin is installed, it may book usage itself, so check before booking a print in Spoolio.") + '</div>';
+      }
       if (t === "klipper") {
         return '<div class="linkform" data-t="klipper">' + seg +
-          '<label>Moonraker Address<input data-f="ip" value="' + esc(p.ip || "") + '" placeholder="voron.local or 192.168.1.60:7125" autocomplete="off"></label>' +
+          '<label>Moonraker Address<input data-f="ip" value="' + esc(ip) + '" placeholder="voron.local or 192.168.1.60:7125" autocomplete="off"></label>' +
           '<label>API Key<input data-f="code" type="password" autocomplete="off" placeholder="' + (saved || "Optional - only if Moonraker asks for one") + '"></label>' +
-          bar + '<div class="ktest">' + (tests[p.id] || "") + '</div>' +
-          '<div class="ams-note" style="flex-basis: 100%; margin: 0">Use the address you open Mainsail or Fluidd with. Spoolio only reads from Moonraker and never sends G-code. ' +
-          'If Moonraker is linked to Spoolman, the printer may book its own usage, so check before booking a print in Spoolio.</div></div>';
+          bar + test + note("Use the address you open Mainsail or Fluidd with. Spoolio only reads from Moonraker and never sends G-code. " +
+          "If Moonraker is linked to Spoolman, the printer may book its own usage, so check before booking a print in Spoolio.") + '</div>';
       }
       return '<div class="linkform" data-t="bambu">' + seg +
         '<label>IP Address<input data-f="ip" value="' + esc(p.ip || "") + '" placeholder="192.168.1.50" autocomplete="off"></label>' +
@@ -3694,7 +3971,7 @@ MAIN_PAGE = """
     function manualCell(p, ui, si, byId, act) {
       const u = p.units[ui];
       const id = u.slots[si];
-      const lv = p.type === "klipper" ? liveByLink(p.id) : null;
+      const lv = NET[p.type] ? liveByLink(p.id) : null;
       const auto = !id && lv && u.kind === "tool" && u.slots.length === 1 && lv.active_spool ? byId.get(String(lv.active_spool)) : null;
       const s = id ? byId.get(String(id)) : auto;
       const where = ' data-p="' + esc(p.id) + '" data-u="' + ui + '" data-s="' + si + '"';
@@ -3760,10 +4037,34 @@ MAIN_PAGE = """
         }).join("") + '</div>';
     }
 
+    function headsNote(p) {
+      if (!heads || !NET[p.type]) return "";
+      const preset = "&ldquo;" + esc(heads.preset) + "&rdquo;";
+      if (heads.choose) {
+        return heads.choose.indexOf(p.id) < 0 ? "" : '<div class="ams-note heads">Your last slice was for the OrcaSlicer printer ' + preset + '. ' +
+          '<button class="sbtn" data-act="heads-bind" data-p="' + esc(p.id) + '">Fill These Toolheads From It</button></div>';
+      }
+      if (heads.printer !== p.id) return "";
+      const stop = '<button class="sbtn ghost" data-act="heads-unbind" data-p="' + esc(p.id) + '">Stop Filling From Slices</button>';
+      const what = function (r) { return r.kind === "mmu" ? "Gate " + r.n : "T" + r.n; };
+      if (heads.error) {
+        return '<div class="ams-note heads">' + (heads.error === "hh" ? "Happy Hare sets the gates on this printer, so Spoolio left them alone." :
+          heads.error === "unit" ? "Add a toolhead or MMU so Spoolio can fill it from your slices." :
+          "Couldn&#39;t reach your spool source, so the toolheads weren&#39;t filled from the slice.") + stop + '</div>';
+      }
+      const set = heads.rows.filter(function (r) { return r.state === "set" || r.state === "kept"; }).map(what);
+      const ask = heads.rows.filter(function (r) { return r.state === "pick"; }).map(function (r) { return what(r) + " (" + r.count + " spools match " + esc(r.name) + ")"; });
+      const none = heads.rows.filter(function (r) { return r.state === "none"; }).map(function (r) { return what(r) + " (" + esc(r.name) + ")"; });
+      return '<div class="ams-note heads">Filled from your slice at ' + esc(heads.time) + ' for ' + preset + '. ' +
+        (set.length ? set.join(", ") + (set.length === 1 ? " is" : " are") + " set. " : "") +
+        (ask.length ? "Pick the spool on " + ask.join(", ") + ". " : "") +
+        (none.length ? "No free spool matches " + none.join(", ") + ". " : "") + stop + '</div>';
+    }
+
     function manualPanel(p, byId) {
       let total = 0;
       let used = 0;
-      const kl = p.type === "klipper";
+      const kl = !!NET[p.type];
       const klv = kl && (liveData.links || {})[p.id] === "live" ? liveByLink(p.id) : null;
       const hh = klv ? liveMmu(klv, activeTray(klv)) : "";
       const units = p.units.map(function (u, ui) {
@@ -3803,7 +4104,7 @@ MAIN_PAGE = """
         (armed === pk ? "Click Again to Remove" : "Remove Printer") + '</button></div>';
       return '<div class="ams"><div class="ams-h">' + name + '<span class="sub">' + sub + '</span>' + bar + '</div>' +
         (linkOpen === p.id ? linkForm(p) : "") +
-        '<div class="ams-body">' + (live && !kl ? liveUnits(lvl) : units) +
+        '<div class="ams-body">' + (live && !kl ? liveUnits(lvl) : units) + headsNote(p) +
         (kl && live ? '<div class="ams-note">' + (hh && !total ? "The gates and their spools come from Happy Hare." :
         (hh ? "The MMU gates come from Happy Hare. " : "") + 'Assign the spool on each toolhead' + (hh ? " here." : " or MMU gate here.") +
         ' Spoolio uses them to book each tool&#39;s filament.') + '</div>' :
@@ -3822,7 +4123,7 @@ MAIN_PAGE = """
     function progTray(lv, t) {
       if (t.unit === "ext") return lv.ext ? { label: "External Spool", tray: lv.ext } : null;
       const u = lv.units.find(function (x) { return x.id === t.unit; });
-      if (lv.kind === "klipper") return klTray(lv, t);
+      if (lv.kind === "net") return klTray(lv, t);
       if (!u || !u.trays[t.slot]) return null;
       const label = u.kind === "ht" ? "AMS HT" : "AMS " + (lv.units.filter(function (x) { return x.kind === "ams"; }).indexOf(u) + 1) + " Slot " + (t.slot + 1);
       return { label: label, tray: u.trays[t.slot] };
@@ -4166,6 +4467,13 @@ MAIN_PAGE = """
       } else if (p && act === "clear") {
         p.units[ui].slots[si] = null;
         changed = true;
+      } else if (p && act === "heads-bind") {
+        orca.postMessage({ type: "heads_bind", id: p.id });
+        return;
+      } else if (p && act === "heads-unbind") {
+        p.orca = "";
+        if (heads && heads.printer === p.id) heads = null;
+        changed = true;
       } else if (p && act === "link-type") {
         p.draft = el.dataset.t;
         tests[p.id] = "";
@@ -4174,7 +4482,7 @@ MAIN_PAGE = """
         const get = function (f) { const i = form && form.querySelector('[data-f="' + f + '"]'); return i ? i.value.trim() : ""; };
         const box = form && form.querySelector(".ktest");
         if (box) box.innerHTML = tests[p.id] = "Testing...";
-        orca.postMessage({ type: "printer_test", id: p.id, host: get("ip"), code: get("code") });
+        orca.postMessage({ type: "printer_test", id: p.id, kind: form.dataset.t, host: get("ip"), code: get("code"), user: get("user") });
         return;
       } else if (p && act === "link") {
         delete p.draft;
@@ -4186,12 +4494,13 @@ MAIN_PAGE = """
         const form = amsList.querySelector(".linkform");
         const val = function (f) { const i = form && form.querySelector('[data-f="' + f + '"]'); return i ? i.value.trim() : ""; };
         const code = act === "link-save" ? val("code") : "";
-        const kt = form && form.dataset.t === "klipper";
+        const kt = form && NET[form.dataset.t] ? form.dataset.t : "";
         p.ip = act === "link-save" ? val("ip") : "";
         p.serial = act === "link-save" && !kt ? val("serial") : "";
         if (act === "link-remove") p.has_code = false;
         if (act === "link-save") {
-          p.type = kt ? "klipper" : "bambu";
+          p.type = kt || "bambu";
+          p.user = kt === "prusalink" ? val("user") || "maker" : "";
           delete p.draft;
           p.units = p.units.filter(function (u) { return kt ? GROW[u.kind] : !GROW[u.kind]; });
           if (kt && !p.units.length) p.units.push({ kind: "tool", slots: [null] });
@@ -4675,9 +4984,13 @@ MAIN_PAGE = """
         if (data.stats.period === stPeriod) { stData = data.stats; renderStats(); }
       } else if (data && data.type === "printer_test") {
         tests[data.id] = '<span class="' + (data.ok ? "ok" : "bad") + '">' + (data.ok ? "\u2713" : "\u2715") + '</span> ' + esc(data.text || "") +
-          (data.books ? '<span class="kchip">Moonraker Is Linked to Spoolman</span>' : "");
+          (data.books ? '<span class="kchip">' + (data.text.indexOf("OctoPrint") === 0 ? "Spoolman Plugin Found" : "Moonraker Is Linked to Spoolman") + '</span>' : "");
         const box = amsList.querySelector('.linkform .ktest');
         if (box && linkOpen === data.id) box.innerHTML = tests[data.id];
+      } else if (data && data.type === "heads") {
+        heads = data.heads;
+        if (Array.isArray(data.printers) && !picking && !renaming) cfg = data.printers;
+        renderPrinters();
       } else if (data && data.type === "live") {
         const key = JSON.stringify(data.live);
         liveData = data.live;
@@ -4926,7 +5239,7 @@ SETTINGS_PAGE = """
     <input id="plate-margin" type="number" min="0" max="50" step="5" value="__PLATE_MARGIN__">
   </div>
 <!--/check-->
-  <!--check-hint--><div class="hint">OrcaSlicer also has to run the check: switch on Spoolio Filament Check in your process settings, under <span style="white-space: nowrap">Others &gt; Slicing Pipeline Plugin</span>.</div><!--/check-hint-->
+  <!--check-hint--><div class="hint">OrcaSlicer also has to run the check: switch on Spoolio Slice Sync in your process settings, under <span style="white-space: nowrap">Others &gt; Slicing Pipeline Plugin</span>.</div><!--/check-hint-->
 
   <div class="divider spaced"></div>
 
@@ -6105,12 +6418,17 @@ if _PAGES:
                     self._push_data()
                     if msg_type == "ready" and _plate["payload"]:
                         send_plate(_plate["payload"])
+                    if msg_type == "ready":
+                        send_heads()
                 elif msg_type == "settings":
                     self._open_settings()
                 elif msg_type == "order":
                     open_search(data.get("query"))
                 elif msg_type == "printers":
                     save_printers(data.get("printers"))
+                elif msg_type == "heads_bind" and _sliced["slots"]:
+                    threading.Thread(target=run_heads, args=(_sliced["slots"], _sliced["preset"], str(data.get("id") or "")),
+                                     daemon=True).start()
                 elif msg_type == "live":
                     self.post_message({"type": "live", "live": live_poll(), "usage": usage_state()})
                 elif msg_type == "printer_code":
@@ -6304,11 +6622,11 @@ if _PAGES:
 
 if _SLICING:
 
-    class SpoolioFilamentCheck(orca.slicing.SlicingPipelineCapabilityBase):
-        """After each slice, checks the plate's filament against the spools in Spoolman."""
+    class SpoolioSliceSync(orca.slicing.SlicingPipelineCapabilityBase):
+        """After each slice: checks the plate's filament, plans the booking and fills non-Bambu toolheads."""
 
         def get_name(self):
-            return "Spoolio Filament Check"
+            return "Spoolio Slice Sync"
 
         def execute(self, ctx):
             try:
@@ -6321,6 +6639,8 @@ if _SLICING:
                 enabled, margin = plate_settings()
                 slots = plate_slots(ctx, parse_usage(read_tail(ctx.gcode_path)))
                 usage_plan(slots)
+                threading.Thread(target=run_heads, args=(slots, str(ctx.config_value("printer_settings_id") or "")),
+                                 daemon=True).start()
                 if enabled:
                     if any(slot["grams"] > 0 for slot in slots):
                         # Off the slicing thread: it may fetch the spool list, and UI calls from
@@ -6340,4 +6660,4 @@ class SpoolioPlugin(orca.base):
         else:
             orca.register_capability(SpoolioWindow)
         if _SLICING:
-            orca.register_capability(SpoolioFilamentCheck)
+            orca.register_capability(SpoolioSliceSync)
