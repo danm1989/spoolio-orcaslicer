@@ -38,12 +38,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import orca
-
-try:
-    import orca.pages  # noqa: F401
-    _PAGES = True
-except (ImportError, AttributeError):
-    _PAGES = False
+import orca.pages
 
 _SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
 
@@ -79,8 +74,6 @@ FONT_STACK = (
     'Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "Helvetica Neue", '
     'Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif'
 )
-MAIN_SIZE = (380, 600)
-SETTINGS_SIZE = (560, 820)
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 
@@ -132,13 +125,7 @@ def setup_log(path: Path | None = None) -> None:
 
 # Started at import so anything that goes wrong while the plugin loads is captured.
 setup_log()
-log.info(
-    "%s %s (%s build) imported; orca.pages %s",
-    PLUGIN_NAME,
-    PLUGIN_VERSION,
-    BUILD_TARGET,
-    "available" if _PAGES else "not available",
-)
+log.info("%s %s (%s build) imported", PLUGIN_NAME, PLUGIN_VERSION, BUILD_TARGET)
 
 
 _reported = {}
@@ -155,7 +142,11 @@ def _report(key: str, error: str | None, exc_info: bool = False) -> None:
         log.warning("%s failed: %s", key, error, exc_info=exc_info)
 
 
-def get_settings() -> dict:
+def _bg(fn, *args) -> None:
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+def cfg() -> dict:
     defaults = {
         "spoolman_url": "",
         "spool_source": "spoolman",
@@ -206,11 +197,11 @@ def parse_weights(value: object) -> str:
 
 
 def weight_mode() -> str:
-    return parse_weights(get_settings().get("weight_display"))
+    return parse_weights(cfg().get("weight_display"))
 
 
 def cart_on() -> bool:
-    return parse_flag(get_settings().get("show_cart"), default=False)
+    return parse_flag(cfg().get("show_cart"), default=False)
 
 
 def parse_columns(value: object) -> int:
@@ -218,7 +209,7 @@ def parse_columns(value: object) -> int:
 
 
 def spool_columns() -> int:
-    return parse_columns(get_settings().get("spool_columns"))
+    return parse_columns(cfg().get("spool_columns"))
 
 
 def parse_progress(value: object) -> dict:
@@ -228,7 +219,7 @@ def parse_progress(value: object) -> dict:
 
 
 def progress_settings() -> dict:
-    return parse_progress(get_settings().get("progress"))
+    return parse_progress(cfg().get("progress"))
 
 
 CURRENCIES = ("spoolman", "gbp", "eur", "usd")
@@ -240,13 +231,29 @@ def parse_stats(value: object) -> dict:
 
 
 def stats_settings() -> dict:
-    return parse_stats(get_settings().get("stats"))
+    return parse_stats(cfg().get("stats"))
 
 
 def plate_settings() -> tuple[bool, int]:
-    settings = get_settings()
+    settings = cfg()
     return (parse_flag(settings.get("plate_check")),
             parse_margin(settings.get("plate_margin_percent")))
+
+
+def ui_cfg() -> dict:
+    s = cfg()
+    return {
+        "source": parse_source(s.get("spool_source")),
+        "url": s.get("spoolman_url", ""),
+        "low_stock": parse_low(s.get("low_stock_grams")),
+        "plate_check": parse_flag(s.get("plate_check")),
+        "plate_margin": parse_margin(s.get("plate_margin_percent")),
+        "weight_display": parse_weights(s.get("weight_display")),
+        "show_cart": parse_flag(s.get("show_cart"), default=False),
+        "spool_columns": parse_columns(s.get("spool_columns")),
+        "progress": parse_progress(s.get("progress")),
+        "stats": parse_stats(s.get("stats")),
+    }
 
 
 def save_settings(settings: dict) -> bool:
@@ -326,7 +333,7 @@ def parse_source(value: object) -> str:
 
 
 def source() -> str:
-    return parse_source(get_settings().get("spool_source"))
+    return parse_source(cfg().get("spool_source"))
 
 
 def source_name() -> str:
@@ -334,7 +341,7 @@ def source_name() -> str:
 
 
 def spool_key() -> str:
-    return BAMBU_KEY if source() == "bambu" else get_settings().get("spoolman_url", "")
+    return BAMBU_KEY if source() == "bambu" else cfg().get("spoolman_url", "")
 
 
 def configured() -> bool:
@@ -627,7 +634,7 @@ def bambu_ping() -> dict:
 
 
 def load_spools() -> dict:
-    result = get_bambu_spools() if source() == "bambu" else get_spools(get_settings().get("spoolman_url", ""))
+    result = get_bambu_spools() if source() == "bambu" else get_spools(cfg().get("spoolman_url", ""))
     for sp in result.get("spools") or []:
         sp["rfid_tags"] = sorted(spool_tags(sp))
     return result
@@ -677,12 +684,12 @@ def parse_printers(value: object) -> list[dict]:
 
 
 def printers_cfg() -> list[dict]:
-    saved = get_settings().get("printers")
+    saved = cfg().get("printers")
     return parse_printers(saved.get(source())) if isinstance(saved, dict) else []
 
 
 def save_printers(value: object) -> None:
-    settings = get_settings()
+    settings = cfg()
     saved = settings.get("printers") if isinstance(settings.get("printers"), dict) else {}
     saved[source()] = parse_printers(value)
     settings["printers"] = saved
@@ -1580,7 +1587,7 @@ _usage_lock = threading.RLock()
 
 
 def usage_mode() -> str:
-    value = get_settings().get("book_usage")
+    value = cfg().get("book_usage")
     return value if value in USAGE_MODES else "ask"
 
 
@@ -2108,13 +2115,13 @@ def usage_event(kind: str, dev_id: str, data: dict) -> None:
     if kind in ("start", "save"):
         _store(lambda d: d["active"].__setitem__(dev_id, data))
     if kind in ("start", "fetch"):
-        threading.Thread(target=_job_fetch, args=(dev_id, data["id"]), daemon=True).start()
+        _bg(_job_fetch, dev_id, data["id"])
     elif kind == "last":
         _store(lambda d: d["last"].__setitem__(dev_id, data))
     elif kind == "end":
-        threading.Thread(target=_end, args=(dev_id, data), daemon=True).start()
+        _bg(_end, dev_id, data)
     elif kind == "missed":
-        threading.Thread(target=_missed, args=(dev_id, data), daemon=True).start()
+        _bg(_missed, dev_id, data)
 
 
 def _spool_label(spool: dict) -> str:
@@ -2134,7 +2141,7 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
     if not items:
         log.info("A print ended but its filament use is unknown")
         return
-    url = clean_url(get_settings().get("spoolman_url"))
+    url = clean_url(cfg().get("spoolman_url"))
     spools = (plate_spools(url) if url else None) or []
     by_id = {sp.get("id"): sp for sp in spools}
     share = run["pct"] / 100 if run["result"] == "cancelled" else 1.0
@@ -2176,7 +2183,7 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
 
 
 def spoolman_use(spool_id: int, grams: float) -> None:
-    url = f"{clean_url(get_settings().get('spoolman_url'))}/api/v1/spool/{int(spool_id)}/use"
+    url = f"{clean_url(cfg().get('spoolman_url'))}/api/v1/spool/{int(spool_id)}/use"
     request = urllib.request.Request(url, data=json.dumps({"use_weight": round(grams, 1)}).encode("utf-8"),
                                      method="PUT", headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=TIMEOUT):
@@ -2185,7 +2192,7 @@ def spoolman_use(spool_id: int, grams: float) -> None:
 
 
 def spoolman_unuse(spool_id: int, grams: float) -> None:
-    url = f"{clean_url(get_settings().get('spoolman_url'))}/api/v1/spool/{int(spool_id)}"
+    url = f"{clean_url(cfg().get('spoolman_url'))}/api/v1/spool/{int(spool_id)}"
     with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
         used = float(json.loads(resp.read().decode("utf-8")).get("used_weight") or 0)
     body = json.dumps({"used_weight": round(max(0.0, used - grams), 1)}).encode("utf-8")
@@ -2209,7 +2216,7 @@ def usage_book(entry_id: str, chosen: list | None) -> None:
     for item in chosen if isinstance(chosen, list) else []:
         if isinstance(item, dict):
             wanted[_int(item.get("slot"))] = item
-    url = clean_url(get_settings().get("spoolman_url"))
+    url = clean_url(cfg().get("spoolman_url"))
     by_id = {sp.get("id"): sp for sp in (plate_spools(url) if url else None) or []}
     with _usage_lock:
         data = usage_load()
@@ -2266,7 +2273,7 @@ def usage_undo(entry_id: str) -> None:
 def usage_action(data: dict) -> dict:
     kind = data.get("type")
     if kind == "usage_mode":
-        settings = get_settings()
+        settings = cfg()
         settings["book_usage"] = data.get("mode") if data.get("mode") in USAGE_MODES else "ask"
         save_settings(settings)
         _local_sync()
@@ -2359,10 +2366,10 @@ def spoolman_currency(url: str) -> str:
 
 
 def stats_data(period: object) -> dict:
-    cfg = stats_settings()
-    url = clean_url(get_settings().get("spoolman_url"))
-    code = spoolman_currency(url) if cfg["cur"] == "spoolman" and url else cfg["cur"].upper()
-    if cfg["cur"] == "spoolman" and not url:
+    st = stats_settings()
+    url = clean_url(cfg().get("spoolman_url"))
+    code = spoolman_currency(url) if st["cur"] == "spoolman" and url else st["cur"].upper()
+    if st["cur"] == "spoolman" and not url:
         code = "EUR"
     with _usage_lock:
         hist = hist_load()
@@ -2399,7 +2406,7 @@ def stats_data(period: object) -> dict:
                     k["g"] += r["grams"]
         weeks.append({"start": a, "now": a == week0,
                       "parts": sorted(parts.values(), key=lambda x: -x["g"])})
-    low = parse_low(get_settings().get("low_stock_grams"))
+    low = parse_low(cfg().get("low_stock_grams"))
     rate: dict = {}
     for e in hist:
         if (e.get("time") or 0) >= now - 28 * 86400:
@@ -5687,21 +5694,7 @@ def main_html() -> str:
     )
 
 
-def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
-                  plate_check: bool = True, plate_margin: int = DEFAULT_MARGIN,
-                  weight: str = "both", cart: bool = False, source: str = "spoolman",
-                  progress: dict | None = None, columns: int = 1, stats: dict | None = None) -> str:
-    """``spoolman_info`` describes the saved URL, not whatever is typed in the field."""
-    verified_url = clean_url(current_url) if spoolman_info.get("ok") else ""
-    if spoolman_info.get("ok"):
-        status_text = f"Connected - Spoolman v{spoolman_info['version']}"
-        status_class = "ok"
-    elif spoolman_info.get("pending"):
-        status_text = spoolman_info.get("error", "Checking connection...")
-        status_class = "pending"
-    else:
-        status_text = spoolman_info.get("error", "Not connected")
-        status_class = "error"
+def settings_html(c: dict) -> str:
     return _fill(
         SETTINGS_PAGE,
         LOGO=LOGO_IMG,
@@ -5710,22 +5703,21 @@ def settings_html(current_url: str, spoolman_info: dict, low_stock_grams: float,
         PLUGIN_NAME="Spoolio",
         VERSION=PLUGIN_VERSION,
         DEFAULT_URL=html.escape(DEFAULT_SPOOLMAN_URL),
-        URL=html.escape(current_url or DEFAULT_SPOOLMAN_URL),
-        LOW_STOCK=low_stock_grams,
-        PLATE_CHECKED="checked" if plate_check else "",
-        PLATE_MARGIN=plate_margin,
-        WEIGHT_MODE=json.dumps(parse_weights(weight)),
-        CART_CHECKED="checked" if cart else "",
-        COLUMNS=parse_columns(columns),
-        PROGRESS=json.dumps(parse_progress(progress)),
-        STATS=json.dumps(parse_stats(stats)),
+        URL=html.escape(c["url"] or DEFAULT_SPOOLMAN_URL),
+        LOW_STOCK=c["low_stock"],
+        PLATE_CHECKED="checked" if c["plate_check"] else "",
+        PLATE_MARGIN=c["plate_margin"],
+        WEIGHT_MODE=json.dumps(c["weight_display"]),
+        CART_CHECKED="checked" if c["show_cart"] else "",
+        COLUMNS=c["spool_columns"],
+        PROGRESS=json.dumps(c["progress"]),
+        STATS=json.dumps(c["stats"]),
         CUR_CODE=_cur["code"] or "EUR",
         LOG_PATH=html.escape(str(LOG_FILE)),
-        STATUS_TEXT=html.escape(status_text),
-        STATUS_CLASS=status_class,
-        # "</" is escaped so a URL can't close the script tag.
-        VERIFIED_URL=json.dumps(verified_url).replace("</", "<\\/"),
-        SOURCE=json.dumps(parse_source(source)),
+        STATUS_TEXT="Checking connection...",
+        STATUS_CLASS="pending",
+        VERIFIED_URL='""',
+        SOURCE=json.dumps(c["source"]),
         VERIFIED_BAMBU="false",
         BAMBU_ACCOUNT="",
         BAMBU_STATUS="",
@@ -6009,19 +6001,10 @@ TAB_BRIDGE = """
 """
 
 
-def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
-             plate_check: bool = True, plate_margin: int = DEFAULT_MARGIN,
-             weight: str = "both", cart: bool = False, source: str = "spoolman",
-             progress: dict | None = None, columns: int = 1, stats: dict | None = None) -> str:
-    """The spool list and Settings as two views of one page, under a shared header.
-
-    Built from the standalone pages, which SpoolioWindow still shows as separate windows.
-    """
+def tab_html(initial_view: str, c: dict) -> str:
+    """The spool list and Settings as two views of one page, under a shared header."""
     main_css, main_body, main_js = _split_page(main_html())
-    settings_css, settings_body, settings_js = _split_page(settings_html(
-        current_url, {"ok": False, "pending": True}, low_stock_grams, plate_check, plate_margin,
-        weight, cart, source, progress, columns, stats,
-    ))
+    settings_css, settings_body, settings_js = _split_page(settings_html(c))
     main_body, main_header = _take_header(main_body)
     tabs_at = main_body.index('<div id="tabs"')
     tabs_end = main_body.index("</div>", tabs_at) + len("</div>")
@@ -6090,28 +6073,108 @@ def tab_html(initial_view: str, current_url: str, low_stock_grams: float,
 """
 
 
-class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
+class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
+    """The Spoolio tab, with Settings as a second view inside it."""
+
     def __init__(self):
         super().__init__()
-        self._panel = None
-        self._settings_window = None
         self._verified_url = ""
         self._verified_bambu = False
         self._release_url = ""
         self._refreshing = False
         self._testing = False
         self._checking_update = False
+        _plate["page"] = self
 
     def get_name(self):
         return PLUGIN_NAME
 
+    def get_type(self):
+        return orca.PluginType.Pages
+
+    def get_icon(self):
+        return icon_path()
+
+    def get_ui(self):
+        try:
+            return tab_html("main" if configured() else "settings", ui_cfg())
+        except Exception:
+            log.exception("get_ui() raised")
+            raise
+
+    def on_message(self, arg0):
+        # The base class hints "arg0: str", but a parsed dict arrives; a string is still accepted.
+        try:
+            data = json.loads(arg0) if isinstance(arg0, str) else arg0
+            if not isinstance(data, dict):
+                return
+            if data.get("view") == "settings":
+                self._on_settings(data)
+                return
+            msg_type = data.get("type")
+            if msg_type in ("ready", "refresh"):
+                self._push_data()
+                if msg_type == "ready" and _plate["payload"]:
+                    send_plate(_plate["payload"])
+                if msg_type == "ready":
+                    send_heads()
+            elif msg_type == "settings":
+                self._open_settings()
+            elif msg_type == "order":
+                open_search(data.get("query"))
+            elif msg_type == "printers":
+                save_printers(data.get("printers"))
+            elif msg_type == "heads_bind" and _sliced["slots"]:
+                threading.Thread(target=run_heads, args=(_sliced["slots"], _sliced["preset"], str(data.get("id") or "")),
+                                 daemon=True).start()
+            elif msg_type == "live":
+                self.post_message({"type": "live", "live": live_poll(), "usage": usage_state()})
+            elif msg_type == "printer_code":
+                save_printer_code(data.get("id"), data.get("code"))
+            elif msg_type == "printer_test":
+                threading.Thread(target=lambda: self.post_message(printer_test(data)), daemon=True).start()
+            elif msg_type in ("usage_mode", "usage_book", "usage_undo"):
+                _bg(lambda: self.post_message({"type": "usage", "usage": usage_action(data)}))
+            elif msg_type == "stats":
+                _bg(lambda: self.post_message({"type": "stats", "stats": stats_data(data.get("period"))}))
+            elif msg_type == "plate_recheck":
+                _bg(recheck)
+            elif msg_type == "plate_dismiss":
+                _plate.update(payload=None, slots=[])
+        except Exception:
+            log.exception("on_message() raised (arg0=%r)", arg0)
+
     def _spoolman_url(self):
-        return get_settings().get("spoolman_url", "")
+        return cfg().get("spoolman_url", "")
+
+    def _push_data(self):
+        url = self._spoolman_url()
+        if source() == "spoolman" and not url:
+            self.post_message({
+                "type": "spools",
+                "ok": False,
+                "error": "No Spoolman URL configured yet - click Settings to set one.",
+            })
+            return
+        if self._refreshing:
+            return
+        self._refreshing = True
+        _local_sync()
+        low_stock_grams = parse_low(cfg().get("low_stock_grams"))
+
+        def worker():
+            result = load_spools()
+            self._refreshing = False
+            self.post_message({"type": "spools", "low_stock_grams": low_stock_grams,
+                               "weight_display": weight_mode(), "show_cart": cart_on(),
+                               "spool_columns": spool_columns(), **printer_state(), **result})
+
+        _bg(worker)
 
     def _save_settings(self, url, low_stock, plate_check=True,
                        plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
                        progress=None, columns=None, stats=None):
-        settings = get_settings()
+        settings = cfg()
         settings["spool_source"] = parse_source(src)
         if settings["spool_source"] == "spoolman":
             settings["spoolman_url"] = url
@@ -6139,35 +6202,21 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
         return False
 
     def _after_save(self):
-        self._open_panel()
         self._push_data()
 
     def _open_settings(self):
-        if self._settings_window is not None and self._settings_window.is_open():
-            return
-        saved_url = self._spoolman_url()
-        self._settings_window = orca.host.ui.create_window(
-            html=settings_html(
-                saved_url,
-                spoolman_info={"ok": False, "pending": True},
-                source=source(),
-                low_stock_grams=parse_low(get_settings().get("low_stock_grams")),
-                plate_check=plate_settings()[0],
-                plate_margin=plate_settings()[1],
-                weight=weight_mode(),
-                cart=cart_on(),
-                progress=progress_settings(),
-                columns=spool_columns(),
-                stats=stats_settings(),
-            ),
-            title=f"{PLUGIN_NAME} - Settings & About",
-            width=SETTINGS_SIZE[0],
-            height=SETTINGS_SIZE[1],
-            on_message=self._on_settings,
-            on_close=self._on_settings_close,
-        )
+        c = ui_cfg()
+        self.post_message({"type": "show_view", "view": "settings", **c,
+                           "cur_code": _cur["code"] or "EUR"})
+        self._check_connection(c["url"])
 
-    def _check_connection(self, url, window, src=None):
+    def _settings_post(self, data):
+        self.post_message({**data, "view": "settings"})
+
+    def _settings_close(self):
+        self.post_message({"type": "show_view", "view": "main"})
+
+    def _check_connection(self, url, src=None):
         if self._testing:
             return
         self._testing = True
@@ -6180,47 +6229,40 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                 self._verified_bambu = bool(info.get("ok"))
             elif info.get("ok"):
                 self._verified_url = clean_url(url)
-            if window.is_open():
-                window.post({"type": "test_result", "source": src, "url": url, **info})
+            self._settings_post({"type": "test_result", "source": src, "url": url, **info})
 
-        threading.Thread(target=worker, daemon=True).start()
+        _bg(worker)
 
-    def _bambu_sign_in(self, data, window):
+    def _bambu_sign_in(self, data):
         if data.get("action") == "sign_out":
             self._verified_bambu = False
 
         def worker():
             result = bambu_sign_in(data)
-            if window.is_open():
-                window.post({"type": "bambu_auth_result", **result})
+            self._settings_post({"type": "bambu_auth_result", **result})
 
-        threading.Thread(target=worker, daemon=True).start()
+        _bg(worker)
 
     def _on_settings(self, data):
-        msg_type = data.get("type") if isinstance(data, dict) else None
+        msg_type = data.get("type")
         if msg_type == "ready":
-            # Only check the connection once the page confirms its message
-            # listener is registered, so the result can never arrive too early.
-            if self._settings_window is not None:
-                self._check_connection(self._spoolman_url(), self._settings_window)
+            self._check_connection(self._spoolman_url())
         elif msg_type == "test":
             url = (data.get("url") or "").strip()
-            if self._settings_window is not None:
-                self._check_connection(url, self._settings_window, data.get("source"))
+            self._check_connection(url, data.get("source"))
         elif msg_type == "save":
-            # The page already gates Save; enforce it here too.
             url = (data.get("url") or "").strip()
             src = parse_source(data.get("source"))
-            verified = self._verified_bambu if src == "bambu" else clean_url(url) == self._verified_url
+            verified = (self._verified_bambu if src == "bambu"
+                        else clean_url(url) == self._verified_url)
             if not verified:
-                if self._settings_window is not None:
-                    self._settings_window.post({
-                        "type": "test_result",
-                        "source": src,
-                        "ok": False,
-                        "url": url,
-                        "error": "Test the connection successfully before saving.",
-                    })
+                self._settings_post({
+                    "type": "test_result",
+                    "source": src,
+                    "ok": False,
+                    "url": url,
+                    "error": "Test the connection successfully before saving.",
+                })
                 return
             saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
                                         data.get("plate_margin"), data.get("weight_display"),
@@ -6228,18 +6270,15 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                                         data.get("spool_columns"), data.get("stats"))
             if saved:
                 self._after_save()
-                if self._settings_window is not None:
-                    self._settings_window.close()
+                self._settings_close()
         elif msg_type == "bambu_auth":
-            if self._settings_window is not None:
-                self._bambu_sign_in(data, self._settings_window)
+            self._bambu_sign_in(data)
         elif msg_type == "feedback":
             open_url(FEEDBACK_URL)
         elif msg_type == "check_update":
-            if self._checking_update or self._settings_window is None:
+            if self._checking_update:
                 return
             self._checking_update = True
-            window = self._settings_window
 
             def worker():
                 result = get_release()
@@ -6247,397 +6286,25 @@ class SpoolioWindow(orca.script.ScriptPluginCapabilityBase):
                 if result["ok"]:
                     self._release_url = result["url"]
                     result["newer"] = is_newer(result["version"], PLUGIN_VERSION)
-                if window.is_open():
-                    window.post({"type": "update_result", **result})
+                self._settings_post({"type": "update_result", **result})
 
-            threading.Thread(target=worker, daemon=True).start()
+            _bg(worker)
         elif msg_type == "release" and self._release_url.startswith("https://"):
             open_url(self._release_url)
-        elif msg_type == "cancel" and self._settings_window is not None:
-            self._settings_window.close()
-
-    def _on_settings_close(self):
-        self._settings_window = None
-
-    def on_unload(self):
-        # Without this, open windows would outlive OrcaSlicer's shutdown.
-        log.info("Unloading")
-        if self._panel is not None and self._panel.is_open():
-            self._panel.close()
-        if self._settings_window is not None and self._settings_window.is_open():
-            self._settings_window.close()
-
-    def on_message(self, data):
-        msg_type = data.get("type") if isinstance(data, dict) else None
-        if msg_type in ("ready", "refresh"):
-            self._push_data()
-        elif msg_type == "settings":
-            self._open_settings()
-        elif msg_type == "order":
-            open_search(data.get("query"))
-        elif msg_type == "printers":
-            save_printers(data.get("printers"))
-        elif msg_type == "live":
-            self._panel.post({"type": "live", "live": live_poll(), "usage": usage_state()})
-        elif msg_type == "printer_code":
-            save_printer_code(data.get("id"), data.get("code"))
-        elif msg_type == "printer_test":
-            threading.Thread(target=lambda: self._panel.post(printer_test(data)), daemon=True).start()
-        elif msg_type in ("usage_mode", "usage_book", "usage_undo"):
-            threading.Thread(target=lambda: self._panel.post({"type": "usage", "usage": usage_action(data)}), daemon=True).start()
-        elif msg_type == "stats":
-            threading.Thread(target=lambda: self._panel.post({"type": "stats", "stats": stats_data(data.get("period"))}), daemon=True).start()
-
-    def _push_data(self):
-        if self._panel is None or not self._panel.is_open():
-            return
-        url = self._spoolman_url()
-        if source() == "spoolman" and not url:
-            self._panel.post({
-                "type": "spools",
-                "ok": False,
-                "error": "No Spoolman URL configured yet - click Settings to set one.",
-            })
-            return
-        if self._refreshing:
-            return
-        self._refreshing = True
-        _local_sync()
-        panel = self._panel
-        low_stock_grams = parse_low(get_settings().get("low_stock_grams"))
-
-        def worker():
-            result = load_spools()
-            self._refreshing = False
-            if panel.is_open():
-                panel.post({"type": "spools", "low_stock_grams": low_stock_grams,
-                            "weight_display": weight_mode(), "show_cart": cart_on(),
-                            "spool_columns": spool_columns(), **printer_state(), **result})
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_panel_close(self):
-        self._panel = None
-
-    def _open_panel(self):
-        if self._panel is not None and self._panel.is_open():
-            self._push_data()
-            return
-        self._panel = orca.host.ui.create_window(
-            html=main_html(),
-            title=PLUGIN_NAME,
-            width=MAIN_SIZE[0],
-            height=MAIN_SIZE[1],
-            on_message=self.on_message,
-            on_close=self._on_panel_close,
-        )
-
-    def _open(self):
-        if not configured():
-            self._open_settings()
-            return
-        self._open_panel()
+        elif msg_type == "cancel":
+            self._settings_close()
 
     def on_load(self):
         log.info(
-            "%s %s loaded (Python %s, %s)",
+            "%s %s loaded as a native tab (Python %s, %s)",
             PLUGIN_NAME,
             PLUGIN_VERSION,
             platform.python_version(),
             platform.platform(),
         )
-        self._open()
 
-    def execute(self):
-        self._open()
-        return orca.ExecutionResult.success(f"Opened {PLUGIN_NAME}")
-
-
-
-class _SettingsView:
-    """Stands in for a settings window when Settings is a view inside the tab.
-
-    Same post / is_open / close calls as a host window, so the settings code is shared.
-    """
-
-    def __init__(self, page):
-        self._page = page
-
-    def post(self, data):
-        self._page.post_message({**data, "view": "settings"})
-
-    def is_open(self):
-        return True
-
-    def close(self):
-        self._page.post_message({"type": "show_view", "view": "main"})
-
-
-if _PAGES:
-
-    class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
-        """The Spoolio tab, with Settings as a second view inside it.
-
-        Used instead of SpoolioWindow when orca.pages exists. Its settings methods duplicate
-        SpoolioWindow's rather than share a mixin, to avoid multiple inheritance with a
-        pybind11 base class.
-        """
-
-        def __init__(self):
-            super().__init__()
-            self._settings_window = _SettingsView(self)
-            self._verified_url = ""
-            self._verified_bambu = False
-            self._release_url = ""
-            self._refreshing = False
-            self._testing = False
-            self._checking_update = False
-            _plate["page"] = self
-
-        def get_name(self):
-            return PLUGIN_NAME
-
-        def get_type(self):
-            return orca.PluginType.Pages
-
-        def get_icon(self):
-            return icon_path()
-
-        def get_ui(self):
-            try:
-                url = self._spoolman_url()
-                return tab_html(
-                    source=source(),
-                    initial_view="main" if configured() else "settings",
-                    current_url=url,
-                    low_stock_grams=parse_low(get_settings().get("low_stock_grams")),
-                    plate_check=plate_settings()[0],
-                    plate_margin=plate_settings()[1],
-                    weight=weight_mode(),
-                    cart=cart_on(),
-                    progress=progress_settings(),
-                    columns=spool_columns(),
-                    stats=stats_settings(),
-                )
-            except Exception:
-                log.exception("get_ui() raised")
-                raise
-
-        def on_message(self, arg0):
-            # The base class hints "arg0: str", but a parsed dict arrives (as with
-            # create_window). A string is still accepted in case that changes.
-            try:
-                data = json.loads(arg0) if isinstance(arg0, str) else arg0
-                if not isinstance(data, dict):
-                    return
-                if data.get("view") == "settings":
-                    self._on_settings(data)
-                    return
-                msg_type = data.get("type")
-                if msg_type in ("ready", "refresh"):
-                    self._push_data()
-                    if msg_type == "ready" and _plate["payload"]:
-                        send_plate(_plate["payload"])
-                    if msg_type == "ready":
-                        send_heads()
-                elif msg_type == "settings":
-                    self._open_settings()
-                elif msg_type == "order":
-                    open_search(data.get("query"))
-                elif msg_type == "printers":
-                    save_printers(data.get("printers"))
-                elif msg_type == "heads_bind" and _sliced["slots"]:
-                    threading.Thread(target=run_heads, args=(_sliced["slots"], _sliced["preset"], str(data.get("id") or "")),
-                                     daemon=True).start()
-                elif msg_type == "live":
-                    self.post_message({"type": "live", "live": live_poll(), "usage": usage_state()})
-                elif msg_type == "printer_code":
-                    save_printer_code(data.get("id"), data.get("code"))
-                elif msg_type == "printer_test":
-                    threading.Thread(target=lambda: self.post_message(printer_test(data)), daemon=True).start()
-                elif msg_type in ("usage_mode", "usage_book", "usage_undo"):
-                    threading.Thread(target=lambda: self.post_message({"type": "usage", "usage": usage_action(data)}), daemon=True).start()
-                elif msg_type == "stats":
-                    threading.Thread(target=lambda: self.post_message({"type": "stats", "stats": stats_data(data.get("period"))}), daemon=True).start()
-                elif msg_type == "plate_recheck":
-                    threading.Thread(target=recheck, daemon=True).start()
-                elif msg_type == "plate_dismiss":
-                    _plate.update(payload=None, slots=[])
-            except Exception:
-                log.exception("on_message() raised (arg0=%r)", arg0)
-
-        def _spoolman_url(self):
-            return get_settings().get("spoolman_url", "")
-
-        def _push_data(self):
-            url = self._spoolman_url()
-            if source() == "spoolman" and not url:
-                self.post_message({
-                    "type": "spools",
-                    "ok": False,
-                    "error": "No Spoolman URL configured yet - click Settings to set one.",
-                })
-                return
-            if self._refreshing:
-                return
-            self._refreshing = True
-            _local_sync()
-            low_stock_grams = parse_low(get_settings().get("low_stock_grams"))
-
-            def worker():
-                result = load_spools()
-                self._refreshing = False
-                self.post_message({"type": "spools", "low_stock_grams": low_stock_grams,
-                                   "weight_display": weight_mode(), "show_cart": cart_on(),
-                                   "spool_columns": spool_columns(), **printer_state(), **result})
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        def _save_settings(self, url, low_stock, plate_check=True,
-                           plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
-                           progress=None, columns=None, stats=None):
-            settings = get_settings()
-            settings["spool_source"] = parse_source(src)
-            if settings["spool_source"] == "spoolman":
-                settings["spoolman_url"] = url
-            settings["low_stock_grams"] = parse_low(low_stock)
-            settings["plate_check"] = parse_flag(plate_check)
-            settings["plate_margin_percent"] = parse_margin(plate_margin)
-            settings["weight_display"] = parse_weights(weight)
-            settings["show_cart"] = parse_flag(cart, default=False)
-            if columns is not None:
-                settings["spool_columns"] = parse_columns(columns)
-            if progress is not None:
-                settings["progress"] = parse_progress(progress)
-            if stats is not None:
-                settings["stats"] = parse_stats(stats)
-            if save_settings(settings):
-                log.info("Settings saved (url=%s, low stock=%s g, filament check=%s, margin=%s%%)",
-                         url, settings["low_stock_grams"], settings["plate_check"],
-                         settings["plate_margin_percent"])
-                return True
-            orca.host.ui.message(
-                f"Could not write settings to {SETTINGS_FILE}. Check that this folder is writable.",
-                title=PLUGIN_NAME,
-                icon="error",
-            )
-            return False
-
-        def _after_save(self):
-            self._push_data()
-
-        def _open_settings(self):
-            saved_url = self._spoolman_url()
-            self.post_message({
-                "type": "show_view",
-                "view": "settings",
-                "source": source(),
-                "url": saved_url,
-                "low_stock": parse_low(get_settings().get("low_stock_grams")),
-                "plate_check": plate_settings()[0],
-                "plate_margin": plate_settings()[1],
-                "weight_display": weight_mode(),
-                "show_cart": cart_on(),
-                "spool_columns": spool_columns(),
-                "progress": progress_settings(),
-                "stats": stats_settings(),
-                "cur_code": _cur["code"] or "EUR",
-            })
-            self._check_connection(saved_url, self._settings_window)
-
-        def _check_connection(self, url, window, src=None):
-            if self._testing:
-                return
-            self._testing = True
-            src = parse_source(src or source())
-
-            def worker():
-                info = bambu_ping() if src == "bambu" else ping(url)
-                self._testing = False
-                if src == "bambu":
-                    self._verified_bambu = bool(info.get("ok"))
-                elif info.get("ok"):
-                    self._verified_url = clean_url(url)
-                if window.is_open():
-                    window.post({"type": "test_result", "source": src, "url": url, **info})
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        def _bambu_sign_in(self, data, window):
-            if data.get("action") == "sign_out":
-                self._verified_bambu = False
-
-            def worker():
-                result = bambu_sign_in(data)
-                if window.is_open():
-                    window.post({"type": "bambu_auth_result", **result})
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        def _on_settings(self, data):
-            msg_type = data.get("type")
-            if msg_type == "ready":
-                self._check_connection(self._spoolman_url(), self._settings_window)
-            elif msg_type == "test":
-                url = (data.get("url") or "").strip()
-                self._check_connection(url, self._settings_window, data.get("source"))
-            elif msg_type == "save":
-                url = (data.get("url") or "").strip()
-                src = parse_source(data.get("source"))
-                verified = (self._verified_bambu if src == "bambu"
-                            else clean_url(url) == self._verified_url)
-                if not verified:
-                    self._settings_window.post({
-                        "type": "test_result",
-                        "source": src,
-                        "ok": False,
-                        "url": url,
-                        "error": "Test the connection successfully before saving.",
-                    })
-                    return
-                saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
-                                            data.get("plate_margin"), data.get("weight_display"),
-                                            data.get("show_cart"), src, data.get("progress"),
-                                            data.get("spool_columns"), data.get("stats"))
-                if saved:
-                    self._after_save()
-                    self._settings_window.close()
-            elif msg_type == "bambu_auth":
-                if self._settings_window is not None:
-                    self._bambu_sign_in(data, self._settings_window)
-            elif msg_type == "feedback":
-                open_url(FEEDBACK_URL)
-            elif msg_type == "check_update":
-                if self._checking_update:
-                    return
-                self._checking_update = True
-                window = self._settings_window
-
-                def worker():
-                    result = get_release()
-                    self._checking_update = False
-                    if result["ok"]:
-                        self._release_url = result["url"]
-                        result["newer"] = is_newer(result["version"], PLUGIN_VERSION)
-                    window.post({"type": "update_result", **result})
-
-                threading.Thread(target=worker, daemon=True).start()
-            elif msg_type == "release" and self._release_url.startswith("https://"):
-                open_url(self._release_url)
-            elif msg_type == "cancel":
-                self._settings_window.close()
-
-        def on_load(self):
-            log.info(
-                "%s %s loaded as a native tab (Python %s, %s)",
-                PLUGIN_NAME,
-                PLUGIN_VERSION,
-                platform.python_version(),
-                platform.platform(),
-            )
-
-        def on_unload(self):
-            log.info("Unloading")
+    def on_unload(self):
+        log.info("Unloading")
 
 
 if _SLICING:
@@ -6652,7 +6319,7 @@ if _SLICING:
             try:
                 if ctx.step == getattr(orca.slicing.Step, "posSlice", None):
                     if _plate["payload"]:
-                        threading.Thread(target=clear_plate, daemon=True).start()
+                        _bg(clear_plate)
                     return orca.ExecutionResult.success()
                 if ctx.step != orca.slicing.Step.psGCodePostProcess:
                     return orca.ExecutionResult.success()
@@ -6665,8 +6332,7 @@ if _SLICING:
                     if any(slot["grams"] > 0 for slot in slots):
                         # Off the slicing thread: it may fetch the spool list, and UI calls from
                         # here can deadlock while the GUI waits for slicing to finish.
-                        threading.Thread(target=run_check, args=(slots, margin),
-                                         daemon=True).start()
+                        _bg(run_check, slots, margin)
             except Exception:
                 log.exception("Filament check failed")
             return orca.ExecutionResult.success()
@@ -6675,9 +6341,6 @@ if _SLICING:
 @orca.plugin
 class SpoolioPlugin(orca.base):
     def register_capabilities(self):
-        if _PAGES:
-            orca.register_capability(SpoolioPage)
-        else:
-            orca.register_capability(SpoolioWindow)
+        orca.register_capability(SpoolioPage)
         if _SLICING:
             orca.register_capability(SpoolioSliceSync)
