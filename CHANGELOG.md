@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.10.0] - 2026-11-12
+
+This is my biggest update yet! I'm excited to share that Spoolio is no longer just for Bambu printers. Klipper (Moonraker), PrusaLink and OctoPrint printers can now be linked from the Printer tab, with live print progress and filament usage booking to Spoolman, the same as Live Link does for Bambu. Spoolio can also fill in which spool is on each toolhead straight from your slice. Calibration print tools get their own category in Stats. Behind the scenes there's a round of reliability fixes, the biggest being that your settings, usage and stats history can no longer be wiped if OrcaSlicer closes mid-save.
+
+### Added
+- Pick Klipper (Moonraker) as the Printer Type under Live Link and enter the address you open Mainsail or Fluidd with (an API key is only needed if Moonraker asks for one). Spoolio shows live print progress and books the grams from the sliced file's metadata to Spoolman. Single and multi-toolhead printers are supported (up to 8 toolheads), as well as a hand-set MMU of up to 16 gates. If you run Happy Hare, Spoolio reads the gates and their colours straight from the printer instead.
+
+- PrusaLink and OctoPrint printers. Both can now be linked the same way. PrusaLink uses the username and password from the printer under Settings > Network > PrusaLink, and OctoPrint uses an application key made under Settings > Application Keys. Neither reports which toolhead is printing, so you assign a spool to each toolhead on the Printer tab.
+
+- After you slice for a Klipper, PrusaLink or OctoPrint printer, Spoolio matches each sliced filament to your spools and fills in the toolheads (or MMU gates) for you. If there's one match it's set, if there are several you're asked to pick, and a spool is moved off any other slot it was on. With one of these printers linked this happens automatically; with more than one, the Printer tab asks which OrcaSlicer printer belongs to which, and you can stop it per printer under Live Link. Bambu printers and Happy Hare gates are left alone, since they already report their own.
+
+- Calibration prints (flow rate, pressure advance, temperature and retraction towers, max volumetric speed, VFA and input shaping tests) are recognised from the print or object name and counted as their own Calibration slice in Usage Ratios, with a Calibration chip in the print history. Previously the prime tower and flushes on these small prints were counted as purge, which could put them at the top of Most Wasteful Prints. They no longer count towards Wasted Filament and whilst 'technically' they are, it's just reported different.
+
+### Changed
+- Spoolio is now licensed under the PolyForm Shield License 1.0.0. You can still use, change and share it, just not use it's code base to build an identical product. Sadly I feel forced to have done this to protect the work I put into this release as well as future releases and overall vision of how Spoolio develops over time. It will continue to be open source and available for the community...you can call me petty if you wish. Spoolio 0.9.6 and earlier releases stay under GPLv3. Contributions now need the agreement in CONTRIBUTING.md.
+
+- For Klipper, PrusaLink and OctoPrint prints you're always asked before booking. Nothing is booked automatically for these printers, even with Book Automatically on.
+
+- The slicing pipeline step has been renamed from "Spoolio Filament Check" to "Spoolio Slice Sync", as it now does more than just check your filaments. **You may need to switch it back on** in your process settings, under Others > Slicing Pipeline Plugin.
+
+- Bambu printers now show "Live via LAN Mode" instead of "Live", to make clear where the live data comes from now that other printer types are linked differently.
+
+- Klipper, PrusaLink and OctoPrint printers are checked every 3 seconds while printing, and every 15 seconds when idle. A new print can take up to 15 seconds to appear in Print Progress, but booking isn't affected.
+
+- The Printer tab only redraws when something you can see on it changes. Previously it rebuilt itself every 5 seconds, which could make open menus, hover or scroll position jump.
+
+- The spool list only redraws when your spools have actually changed, and the background refresh is paused while Settings is open.
+
+### Fixed
+- Settings, filament usage, stats history and printer codes are now saved safely. If OrcaSlicer closed or crashed part way through a save, the file could be left half written, and the next save would then wipe your stats history or put your settings back to the defaults. If a file still can't be read, Spoolio now keeps it as a `.bad` copy instead of overwriting it, allowing you to restore your print history (requires manual merge).
+
+- OrcaSlicer no longer freezes while booking or undoing a print when Spoolman is slow or offline.
+
+- The spool list could stop refreshing until OrcaSlicer was restarted if Spoolman replied with an error. Errors from background tasks are now written to the Spoolio log too.
+
+- A printer could sometimes end up with two live connections at once, which on Bambu printers could knock each other off.
+
+- Spoolman is no longer asked for the spool list two or three times at once after a slice, and printer settings are only saved after a slice if something actually changed.
+
+### Removed
+- The separate-window fallback for older OrcaSlicer versions. Plugins only load on releases that have plugin tabs, so it was never used.
+
+### Known limitations
+- Klipper, PrusaLink and OctoPrint support hasn't been tested on real hardware yet, and I just built the functionality from their respective Developer Wiki's. I don't have access to these printers but if you do, I'd love to hear how it goes.
+
+- If Moonraker is linked to Spoolman, or an OctoPrint Spoolman plugin is installed, the printer may already book its own usage. Spoolio warns you about this, so check Spoolman before booking those prints in Spoolio.
+
+- PrusaLink printers with more than one toolhead don't report which one is printing, so no toolhead is highlighted on the Printer tab.
+
 ## [0.9.6] - 2026-11-10
 
 ### Added
