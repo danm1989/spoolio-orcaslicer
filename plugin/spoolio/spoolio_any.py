@@ -1122,10 +1122,21 @@ def _cert_serial(sock) -> str:
     return found
 
 
+_tls_ctx: list = []
+
+
+def _tls() -> ssl.SSLContext:
+    # Built once; printers use self-signed certificates, so nothing is verified.
+    if not _tls_ctx:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        _tls_ctx.append(ctx)
+    return _tls_ctx[0]
+
+
 def _local_session(pid: str, link: dict, stop: threading.Event) -> None:
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
+    context = _tls()
     with socket.create_connection((link["ip"], LOCAL_PORT), timeout=8) as raw:
         with context.wrap_socket(raw, server_hostname=link["ip"]) as sock:
             serial = link["serial"]
@@ -1219,7 +1230,8 @@ def live_poll() -> dict:
     return live_snapshot()
 
 
-MR_POLL = 3.0
+NET_POLL = 3.0
+NET_IDLE = 15.0
 MR_SLOW = 30.0
 MR_OBJECTS = "print_stats&virtual_sdcard&toolhead&mmu"
 MR_STATES = {"standby": "IDLE", "printing": "RUNNING", "paused": "PAUSE", "complete": "FINISH",
@@ -1236,11 +1248,8 @@ def mr_get(link: dict, path: str) -> dict:
     """One Moonraker GET; returns its result."""
     head = {"X-Api-Key": link["code"]} if link.get("code") else {}
     req = urllib.request.Request(mr_base(link["ip"]) + path, headers=head)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=_tls()) as resp:
             doc = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
@@ -1332,6 +1341,8 @@ def net_put(pid: str, link: dict, gs: str, pct: int, name: str, file: str, left:
         state.update(time=time.time(), gates=gates, active=active, books=books)
         prog = state.setdefault("prog", {})
         was = prog.get("gcode_state")
+        if gs != was:
+            state["changed"] = time.monotonic()
         prog.update(gcode_state=gs, mc_percent=pct, layer_num=layer, total_layer_num=layers, subtask_name=name,
                     gcode_file=file, mc_remaining_time=round(max(0.0, left) / 60) if left is not None else None,
                     tool=tool, gate=gate, stage=stage)
@@ -1345,6 +1356,15 @@ def net_put(pid: str, link: dict, gs: str, pct: int, name: str, file: str, left:
         events = usage_track(pid, state, True)
     for event in events:
         usage_event(*event)
+
+
+def _net_gap(pid: str) -> float:
+    # Fast while printing, just after a change, or while the Printer tab is open.
+    now = time.monotonic()
+    with _live_lock:
+        st = _live["printers"].get(pid) or {}
+        busy = (st.get("prog") or {}).get("gcode_state") in LIVE_STATES or now - st.get("changed", 0.0) < 60
+    return NET_POLL if busy or now - _live["seen"] < 10 else NET_IDLE
 
 
 def mr_session(pid: str, link: dict, stop: threading.Event) -> None:
@@ -1374,7 +1394,7 @@ def mr_session(pid: str, link: dict, stop: threading.Event) -> None:
         extra["meta"] = meta.get(file) or {}
         _live["links"][pid] = "live"
         mr_apply(pid, link, status, extra)
-        stop.wait(MR_POLL)
+        stop.wait(_net_gap(pid))
 
 
 def mr_items(meta: dict) -> list[dict] | None:
@@ -1451,7 +1471,6 @@ def mr_test(host: str, code: str, user: str = "") -> dict:
     return {"ok": True, "text": " · ".join(parts), "books": bool(sm.get("spoolman_connected"))}
 
 
-NET_POLL = 3.0
 PL_STATES = {"PRINTING": "RUNNING", "PAUSED": "PAUSE", "ATTENTION": "PAUSE", "FINISHED": "FINISH",
              "STOPPED": "FAILED", "ERROR": "FAILED"}
 OP_STATES = {"printing": "RUNNING", "printing from sd": "RUNNING", "starting": "RUNNING", "resuming": "RUNNING",
@@ -1459,22 +1478,26 @@ OP_STATES = {"printing": "RUNNING", "printing from sd": "RUNNING", "starting": "
 GCODE_TAIL = 262144
 
 
+_openers: list = []
+
+
 def net_open(link: dict, path: str, head: dict | None = None):
     """One GET to PrusaLink or OctoPrint; digest sign-in when a user is set, else the API key."""
     url = mr_base(link["ip"]) + path
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    handlers: list = [urllib.request.HTTPSHandler(context=ctx)]
     head = dict(head or {})
     if link.get("user"):
         mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
         mgr.add_password(None, url, link["user"], link.get("code") or "")
-        handlers.append(urllib.request.HTTPDigestAuthHandler(mgr))
-    elif link.get("code"):
-        head["X-Api-Key"] = link["code"]
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_tls()),
+                                             urllib.request.HTTPDigestAuthHandler(mgr))
+    else:
+        if link.get("code"):
+            head["X-Api-Key"] = link["code"]
+        if not _openers:
+            _openers.append(urllib.request.build_opener(urllib.request.HTTPSHandler(context=_tls())))
+        opener = _openers[0]
     try:
-        return urllib.request.build_opener(*handlers).open(urllib.request.Request(url, headers=head), timeout=TIMEOUT)
+        return opener.open(urllib.request.Request(url, headers=head), timeout=TIMEOUT)
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             raise AuthError("The printer refused the password or API key") from exc
@@ -1523,7 +1546,7 @@ def pl_session(pid: str, link: dict, stop: threading.Event) -> None:
         _live["links"][pid] = "live"
         net_put(pid, link, gs, pct, Path(str(f.get("display_name") or f.get("name") or "")).stem, file,
                 _num(jb.get("time_remaining")), str(job.get("id") or ""), tool=0 if _heads(pid) == 1 else -1)
-        stop.wait(NET_POLL)
+        stop.wait(_net_gap(pid))
 
 
 def pl_fetch_job(link: dict, job: dict) -> list[dict] | None:
@@ -1592,7 +1615,7 @@ def op_session(pid: str, link: dict, stop: threading.Event) -> None:
         _live["links"][pid] = "live"
         net_put(pid, link, gs, pct, Path(file).stem, file, _num(pg.get("printTimeLeft")), job_id,
                 tool=0 if _heads(pid) == 1 else -1)
-        stop.wait(NET_POLL)
+        stop.wait(_net_gap(pid))
 
 
 def op_fetch_job(link: dict, job: dict) -> list[dict] | None:
@@ -1907,10 +1930,7 @@ class _Ftps(ftplib.FTP_TLS):
 
 
 def _ftp_open(link: dict) -> _Ftps:
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    ftp = _Ftps(context=context, timeout=15)
+    ftp = _Ftps(context=_tls(), timeout=15)
     ftp.connect(link["ip"], FTP_PORT, 15)
     ftp.login("bblp", link["code"])
     ftp.prot_p()
@@ -2890,13 +2910,17 @@ def push_notice(kind: str, text: str) -> bool:
     return False
 
 
+_fetch_lock = threading.Lock()
+
+
 def plate_spools(url: str) -> list[dict] | None:
     """The spool list, from the cache when it is fresh; None if Spoolman can't be reached."""
-    age = time.monotonic() - _spool_cache["time"]
-    if _spool_cache["url"] == url and age < CACHE_SECS:
-        return _spool_cache["spools"]
-    result = load_spools()
-    return result["spools"] if result["ok"] else None
+    with _fetch_lock:
+        age = time.monotonic() - _spool_cache["time"]
+        if _spool_cache["url"] == url and age < CACHE_SECS:
+            return _spool_cache["spools"]
+        result = load_spools()
+        return result["spools"] if result["ok"] else None
 
 
 def plate_rows(results: list[dict]) -> list[dict]:
@@ -2992,6 +3016,7 @@ def heads_fill(slots: list[dict], preset: str, pid: str = "") -> dict | None:
     """Put the sliced filaments on the toolheads, or MMU gates, of the non-Bambu printer they are for."""
     _sliced.update(preset=preset, slots=slots)
     cfg = printers_cfg()
+    was = json.dumps(cfg)
     net = [p for p in cfg if p["type"] in NET and p["units"]]
     if not net or not preset or not slots or slots[0].get("ams"):
         return None
@@ -3011,7 +3036,8 @@ def heads_fill(slots: list[dict], preset: str, pid: str = "") -> dict | None:
     out = {"preset": preset, "printer": p["id"], "time": time.strftime("%H:%M"), "rows": []}
     spools = plate_spools(spool_key()) if spool_key() else None
     if unit is None or spools is None:
-        save_printers(cfg)
+        if json.dumps(cfg) != was:
+            save_printers(cfg)
         return dict(out, error="hh" if hh else "unit" if unit is None else "spools")
     placed: set[str] = set()
     for i, slot in enumerate(slots[:len(unit["slots"])]):
@@ -3027,7 +3053,8 @@ def heads_fill(slots: list[dict], preset: str, pid: str = "") -> dict | None:
             placed.add(unit["slots"][i])
         out["rows"].append({"n": i, "kind": unit["kind"], "state": state, "count": len(ids), "colour": slot["colour"],
                             "name": slot["preset"].split("@")[0].strip() or slot["material"]})
-    save_printers(cfg)
+    if json.dumps(cfg) != was:
+        save_printers(cfg)
     log.info("Filled %s from the slice: %s", unit["kind"], ", ".join(f"{r['n']} {r['state']}" for r in out["rows"]))
     return out
 
@@ -3693,6 +3720,7 @@ MAIN_PAGE = """
     }
 
     function savePrinters() {
+      lastSpools = "";
       orca.postMessage({ type: "printers", printers: cfg });
     }
 
@@ -5046,7 +5074,11 @@ MAIN_PAGE = """
       }
     }
 
+    let lastSpools = "";
     function render(payload) {
+      const key = payload.ok ? JSON.stringify(payload) : "";
+      if (key && key === lastSpools) return;
+      lastSpools = key;
       if (!payload.ok) {
         statusEl.textContent = payload.error || "Unknown error";
         statusEl.className = "error";
@@ -5095,7 +5127,9 @@ MAIN_PAGE = """
         if (Array.isArray(data.printers) && !picking && !renaming) cfg = data.printers;
         renderPrinters();
       } else if (data && data.type === "live") {
-        const key = JSON.stringify(data.live);
+        const key = JSON.stringify(data.live, function (k, v) {
+          return k === "age" ? v > 180 : k === "job" && v ? [v.state, v.tray] : v;
+        });
         liveData = data.live;
         if (data.usage) setUsage(data.usage);
         if (key !== liveKey && !picking && !renaming && !linkOpen) { liveKey = key; renderPrinters(); }
@@ -5140,9 +5174,17 @@ MAIN_PAGE = """
     // Ask for data on load rather than relying on a push landing in time.
     orca.postMessage({ type: "ready" });
 
+    let missed = false;
+    function away() {
+      return document.hidden || !!document.querySelector("#view-main.view-hidden");
+    }
     setInterval(function () {
+      if (away()) { missed = true; return; }
       orca.postMessage({ type: "refresh" });
     }, __REFRESH_MS__);
+    setInterval(function () {
+      if (missed && !away()) { missed = false; orca.postMessage({ type: "refresh" }); }
+    }, 5000);
   </script>
 </body>
 </html>
