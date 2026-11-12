@@ -143,7 +143,49 @@ def _report(key: str, error: str | None, exc_info: bool = False) -> None:
 
 
 def _bg(fn, *args) -> None:
-    threading.Thread(target=fn, args=args, daemon=True).start()
+    def run():
+        try:
+            fn(*args)
+        except Exception:
+            log.exception("Background task %s failed", getattr(fn, "__name__", "?"))
+    threading.Thread(target=run, daemon=True).start()
+
+
+_cfg_lock = threading.RLock()
+
+
+def _write(path: Path, text: str, private: bool = False) -> None:
+    # Written beside the file, then swapped in, so a crash can't leave it half-written.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o666)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    if private:
+        os.chmod(tmp, 0o600)
+    for i in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == 4:
+                raise
+            time.sleep(0.1)
+
+
+def _read(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        bad = path.with_name(path.name + ".bad")
+        log.warning("%s is unreadable, moved to %s", path, bad.name)
+        try:
+            os.replace(path, bad)
+        except OSError:
+            pass
+        raise
 
 
 def cfg() -> dict:
@@ -161,7 +203,7 @@ def cfg() -> dict:
     }
     for path in (SETTINGS_FILE, OLD_SETTINGS):
         try:
-            return {**defaults, **json.loads(path.read_text(encoding="utf-8"))}
+            return {**defaults, **_read(path)}
         except (OSError, ValueError):
             continue
     return defaults
@@ -258,12 +300,18 @@ def ui_cfg() -> dict:
 
 def save_settings(settings: dict) -> bool:
     try:
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        _write(SETTINGS_FILE, json.dumps(settings, indent=2))
         return True
     except OSError:
         log.exception("Could not write %s", SETTINGS_FILE)
         return False
+
+
+def cfg_edit(fn) -> bool:
+    with _cfg_lock:
+        s = cfg()
+        fn(s)
+        return save_settings(s)
 
 
 def get_spools(spoolman_url: str) -> dict:
@@ -279,6 +327,10 @@ def get_spools(spoolman_url: str) -> dict:
     except Exception as exc:
         _report("Spool list", str(exc), exc_info=True)
         return {"ok": False, "error": str(exc)}
+    if not isinstance(data, list) or not all(isinstance(sp, dict) for sp in data):
+        error = f"Spoolman at {spoolman_url} sent a spool list Spoolio doesn't understand"
+        _report("Spool list", error)
+        return {"ok": False, "error": error}
     _report("Spool list", None)
     _spool_cache.update(url=spoolman_url, time=time.monotonic(), spools=data)
     return {"ok": True, "spools": data}
@@ -433,12 +485,7 @@ def _after_login(region: str, account: str, reply: dict, cookies: list[str]) -> 
             token = cookie[6:].split(";")[0]
     if token:
         _pending.clear()
-        AUTH_FILE.write_text(json.dumps({"access_token": token, "region": region, "account": account}),
-                             encoding="utf-8")
-        try:
-            os.chmod(AUTH_FILE, 0o600)
-        except OSError:
-            pass
+        _write(AUTH_FILE, json.dumps({"access_token": token, "region": region, "account": account}), private=True)
         _spool_cache.update(url="", time=0.0, spools=[])
         log.info("Signed in to Bambu Cloud (%s)", region)
         return {"ok": True, "step": "done"}
@@ -689,11 +736,11 @@ def printers_cfg() -> list[dict]:
 
 
 def save_printers(value: object) -> None:
-    settings = cfg()
-    saved = settings.get("printers") if isinstance(settings.get("printers"), dict) else {}
-    saved[source()] = parse_printers(value)
-    settings["printers"] = saved
-    save_settings(settings)
+    def put(s):
+        saved = s.get("printers") if isinstance(s.get("printers"), dict) else {}
+        saved[source()] = parse_printers(value)
+        s["printers"] = saved
+    cfg_edit(put)
     prune_codes()
     _local_sync()
 
@@ -964,7 +1011,7 @@ def _code_key(pid: str) -> str:
 
 def read_codes() -> dict:
     try:
-        data = json.loads(CODES_FILE.read_text(encoding="utf-8"))
+        data = _read(CODES_FILE)
     except FileNotFoundError:
         return {}
     except (OSError, ValueError):
@@ -975,8 +1022,7 @@ def read_codes() -> dict:
 
 def write_codes(codes: dict) -> None:
     try:
-        CODES_FILE.write_text(json.dumps(codes), encoding="utf-8")
-        os.chmod(CODES_FILE, 0o600)
+        _write(CODES_FILE, json.dumps(codes), private=True)
     except OSError:
         log.exception("Could not write %s", CODES_FILE)
 
@@ -986,21 +1032,23 @@ def save_printer_code(pid: object, code: object) -> None:
     pid = str(pid or "")[:32]
     if pid not in {p["id"] for p in printers_cfg()}:
         return
-    codes = read_codes()
     code = re.sub(r"\s", "", str(code or ""))[:64]
-    if code:
-        codes[_code_key(pid)] = code
-    else:
-        codes.pop(_code_key(pid), None)
-    write_codes(codes)
+    with _cfg_lock:
+        codes = read_codes()
+        if code:
+            codes[_code_key(pid)] = code
+        else:
+            codes.pop(_code_key(pid), None)
+        write_codes(codes)
 
 
 def prune_codes() -> None:
     mine = {_code_key(p["id"]) for p in printers_cfg() if p.get("ip")}
-    codes = read_codes()
-    kept = {k: v for k, v in codes.items() if not k.startswith(f"{source()}:") or k in mine}
-    if kept != codes:
-        write_codes(kept)
+    with _cfg_lock:
+        codes = read_codes()
+        kept = {k: v for k, v in codes.items() if not k.startswith(f"{source()}:") or k in mine}
+        if kept != codes:
+            write_codes(kept)
 
 
 class AuthError(Exception):
@@ -1131,33 +1179,37 @@ def _local_run(pid: str, link: dict, stop: threading.Event) -> None:
     _live["links"].pop(pid, None)
 
 
+_sync_lock = threading.RLock()
+
+
 def _local_sync() -> bool:
     """Match the local connections to the saved printers."""
-    codes = read_codes()
-    wanted = {}
-    for printer in printers_cfg():
-        code = codes.get(_code_key(printer["id"]), "")
-        if printer.get("ip") and (code or printer["type"] == "klipper"):
-            wanted[printer["id"]] = {"ip": printer["ip"], "serial": printer["serial"], "code": code,
-                                     "name": printer["name"], "type": printer["type"], "user": printer["user"]}
-    for pid in list(_local):
-        entry = _local[pid]
-        if wanted.get(pid) != entry["link"]:
-            entry["stop"].set()
-            del _local[pid]
-            _live["links"].pop(pid, None)
-            with _live_lock:
-                _live["printers"].pop(pid, None)
-    for pid, link in wanted.items():
-        entry = _local.get(pid)
-        if entry and (entry["thread"].is_alive() or _live["links"].get(pid) in ("auth", "serial")):
-            continue
-        stop = threading.Event()
-        thread = threading.Thread(target=_local_run, args=(pid, link, stop), daemon=True)
-        _local[pid] = {"link": link, "stop": stop, "thread": thread}
-        thread.start()
-    _live["keep"] = bool(wanted) and usage_mode() != "off" and source() == "spoolman"
-    return bool(wanted)
+    with _sync_lock:
+        codes = read_codes()
+        wanted = {}
+        for printer in printers_cfg():
+            code = codes.get(_code_key(printer["id"]), "")
+            if printer.get("ip") and (code or printer["type"] == "klipper"):
+                wanted[printer["id"]] = {"ip": printer["ip"], "serial": printer["serial"], "code": code,
+                                         "name": printer["name"], "type": printer["type"], "user": printer["user"]}
+        for pid in list(_local):
+            entry = _local[pid]
+            if wanted.get(pid) != entry["link"]:
+                entry["stop"].set()
+                del _local[pid]
+                _live["links"].pop(pid, None)
+                with _live_lock:
+                    _live["printers"].pop(pid, None)
+        for pid, link in wanted.items():
+            entry = _local.get(pid)
+            if entry and (entry["thread"].is_alive() or _live["links"].get(pid) in ("auth", "serial")):
+                continue
+            stop = threading.Event()
+            thread = threading.Thread(target=_local_run, args=(pid, link, stop), daemon=True)
+            _local[pid] = {"link": link, "stop": stop, "thread": thread}
+            thread.start()
+        _live["keep"] = bool(wanted) and usage_mode() != "off" and source() == "spoolman"
+        return bool(wanted)
 
 
 def live_poll() -> dict:
@@ -1593,7 +1645,7 @@ def usage_mode() -> str:
 
 def usage_load() -> dict:
     try:
-        data = json.loads(USAGE_FILE.read_text(encoding="utf-8"))
+        data = _read(USAGE_FILE)
     except FileNotFoundError:
         data = {}
     except (OSError, ValueError):
@@ -1608,15 +1660,14 @@ def usage_load() -> dict:
 
 def usage_save(data: dict) -> None:
     try:
-        USAGE_FILE.write_text(json.dumps(data), encoding="utf-8")
+        _write(USAGE_FILE, json.dumps(data))
     except OSError:
         log.exception("Could not write %s", USAGE_FILE)
 
 
 def usage_state() -> dict:
     enabled = source() == "spoolman"
-    with _usage_lock:
-        data = usage_load()
+    data = usage_load()
     return {"enabled": enabled, "mode": usage_mode(), "prints": data["prints"] if enabled else []}
 
 
@@ -2210,6 +2261,34 @@ def _spoolman_error(exc: Exception) -> str:
     return str(exc)
 
 
+_booking: set = set()
+
+
+def _claim(entry_id: str, ok) -> dict | None:
+    # Marked busy so a second click can't book it twice.
+    with _usage_lock:
+        entry = next((e for e in usage_load()["prints"] if e.get("id") == entry_id), None)
+        if entry is None or entry_id in _booking or not ok(entry):
+            return None
+        _booking.add(entry_id)
+        return entry
+
+
+def _settle(entry_id: str, done: dict, by_id: dict, final) -> None:
+    with _usage_lock:
+        _booking.discard(entry_id)
+        data = usage_load()
+        entry = next((e for e in data["prints"] if e.get("id") == entry_id), None)
+        if entry is None:
+            log.warning("A print left the booking list while Spoolman was being updated")
+            return
+        for row in entry["rows"]:
+            row.update(done.get(row["slot"], {}))
+        final(entry)
+        usage_save(data)
+        hist_note(entry, by_id)
+
+
 def usage_book(entry_id: str, chosen: list | None) -> None:
     """Book the open rows to their spools; chosen holds manual picks."""
     wanted = {}
@@ -2218,11 +2297,11 @@ def usage_book(entry_id: str, chosen: list | None) -> None:
             wanted[_int(item.get("slot"))] = item
     url = clean_url(cfg().get("spoolman_url"))
     by_id = {sp.get("id"): sp for sp in (plate_spools(url) if url else None) or []}
-    with _usage_lock:
-        data = usage_load()
-        entry = next((e for e in data["prints"] if e.get("id") == entry_id), None)
-        if entry is None:
-            return
+    entry = _claim(entry_id, lambda e: True)
+    if entry is None:
+        return
+    done = {}
+    try:
         for row in entry["rows"]:
             if row["state"] == "booked":
                 continue
@@ -2237,45 +2316,42 @@ def usage_book(entry_id: str, chosen: list | None) -> None:
             try:
                 spoolman_use(spool, grams)
             except Exception as exc:
-                row.update(state="error", error=_spoolman_error(exc))
+                done[row["slot"]] = {"state": "error", "error": _spoolman_error(exc)}
                 continue
             label = _spool_label(by_id[spool]) if spool in by_id else row.get("label") or f"spool {spool}"
-            row.update(state="booked", error="", spool=spool, grams=round(grams, 1), label=label)
+            done[row["slot"]] = {"state": "booked", "error": "", "spool": spool, "grams": round(grams, 1), "label": label}
             log.info("Booked %.1f g to Spoolman spool %s", grams, spool)
-        entry["state"] = "booked" if all(row["state"] == "booked" for row in entry["rows"]) else "pending"
-        usage_save(data)
-        hist_note(entry, by_id)
+    finally:
+        _settle(entry_id, done, by_id, lambda e: e.update(
+            state="booked" if all(r["state"] == "booked" for r in e["rows"]) else "pending"))
 
 
 def usage_undo(entry_id: str) -> None:
     """Add a booked print's grams back to its spools."""
-    with _usage_lock:
-        data = usage_load()
-        entry = next((e for e in data["prints"] if e.get("id") == entry_id), None)
-        if entry is None or entry.get("state") != "booked":
-            return
+    entry = _claim(entry_id, lambda e: e.get("state") == "booked")
+    if entry is None:
+        return
+    done = {}
+    try:
         for row in entry["rows"]:
             if row["state"] != "booked":
                 continue
             try:
                 spoolman_unuse(row["spool"], row["grams"])
             except Exception as exc:
-                row["error"] = _spoolman_error(exc)
+                done[row["slot"]] = {"error": _spoolman_error(exc)}
                 continue
-            row.update(state="undone", error="")
+            done[row["slot"]] = {"state": "undone", "error": ""}
             log.info("Added %.1f g back to Spoolman spool %s", row["grams"], row["spool"])
-        if not any(row["state"] == "booked" for row in entry["rows"]):
-            entry["state"] = "undone"
-        usage_save(data)
-        hist_note(entry, {})
+    finally:
+        _settle(entry_id, done, {}, lambda e: None if any(r["state"] == "booked" for r in e["rows"])
+                else e.update(state="undone"))
 
 
 def usage_action(data: dict) -> dict:
     kind = data.get("type")
     if kind == "usage_mode":
-        settings = cfg()
-        settings["book_usage"] = data.get("mode") if data.get("mode") in USAGE_MODES else "ask"
-        save_settings(settings)
+        cfg_edit(lambda s: s.__setitem__("book_usage", data.get("mode") if data.get("mode") in USAGE_MODES else "ask"))
         _local_sync()
     elif kind == "usage_book":
         usage_book(str(data.get("run") or ""), data.get("rows"))
@@ -2292,7 +2368,7 @@ _cur = {"url": "", "code": "", "time": 0.0}
 
 def hist_load() -> list[dict]:
     try:
-        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        data = _read(HISTORY_FILE)
     except FileNotFoundError:
         return []
     except (OSError, ValueError):
@@ -2343,7 +2419,7 @@ def hist_note(entry: dict, by_id: dict) -> None:
     elif old is None:
         return
     try:
-        HISTORY_FILE.write_text(json.dumps(hist), encoding="utf-8")
+        _write(HISTORY_FILE, json.dumps(hist))
     except OSError:
         log.exception("Could not write %s", HISTORY_FILE)
 
@@ -6125,14 +6201,13 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
             elif msg_type == "printers":
                 save_printers(data.get("printers"))
             elif msg_type == "heads_bind" and _sliced["slots"]:
-                threading.Thread(target=run_heads, args=(_sliced["slots"], _sliced["preset"], str(data.get("id") or "")),
-                                 daemon=True).start()
+                _bg(run_heads, _sliced["slots"], _sliced["preset"], str(data.get("id") or ""))
             elif msg_type == "live":
                 self.post_message({"type": "live", "live": live_poll(), "usage": usage_state()})
             elif msg_type == "printer_code":
                 save_printer_code(data.get("id"), data.get("code"))
             elif msg_type == "printer_test":
-                threading.Thread(target=lambda: self.post_message(printer_test(data)), daemon=True).start()
+                _bg(lambda: self.post_message(printer_test(data)))
             elif msg_type in ("usage_mode", "usage_book", "usage_undo"):
                 _bg(lambda: self.post_message({"type": "usage", "usage": usage_action(data)}))
             elif msg_type == "stats":
@@ -6163,8 +6238,13 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
         low_stock_grams = parse_low(cfg().get("low_stock_grams"))
 
         def worker():
-            result = load_spools()
-            self._refreshing = False
+            try:
+                result = load_spools()
+            except Exception as exc:
+                log.exception("Spool refresh failed")
+                result = {"ok": False, "error": str(exc)}
+            finally:
+                self._refreshing = False
             self.post_message({"type": "spools", "low_stock_grams": low_stock_grams,
                                "weight_display": weight_mode(), "show_cart": cart_on(),
                                "spool_columns": spool_columns(), **printer_state(), **result})
@@ -6174,22 +6254,26 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
     def _save_settings(self, url, low_stock, plate_check=True,
                        plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
                        progress=None, columns=None, stats=None):
-        settings = cfg()
-        settings["spool_source"] = parse_source(src)
-        if settings["spool_source"] == "spoolman":
-            settings["spoolman_url"] = url
-        settings["low_stock_grams"] = parse_low(low_stock)
-        settings["plate_check"] = parse_flag(plate_check)
-        settings["plate_margin_percent"] = parse_margin(plate_margin)
-        settings["weight_display"] = parse_weights(weight)
-        settings["show_cart"] = parse_flag(cart, default=False)
-        if columns is not None:
-            settings["spool_columns"] = parse_columns(columns)
-        if progress is not None:
-            settings["progress"] = parse_progress(progress)
-        if stats is not None:
-            settings["stats"] = parse_stats(stats)
-        if save_settings(settings):
+        settings = {}
+
+        def put(s):
+            s["spool_source"] = parse_source(src)
+            if s["spool_source"] == "spoolman":
+                s["spoolman_url"] = url
+            s["low_stock_grams"] = parse_low(low_stock)
+            s["plate_check"] = parse_flag(plate_check)
+            s["plate_margin_percent"] = parse_margin(plate_margin)
+            s["weight_display"] = parse_weights(weight)
+            s["show_cart"] = parse_flag(cart, default=False)
+            if columns is not None:
+                s["spool_columns"] = parse_columns(columns)
+            if progress is not None:
+                s["progress"] = parse_progress(progress)
+            if stats is not None:
+                s["stats"] = parse_stats(stats)
+            settings.update(s)
+
+        if cfg_edit(put):
             log.info("Settings saved (url=%s, low stock=%s g, filament check=%s, margin=%s%%)",
                      url, settings["low_stock_grams"], settings["plate_check"],
                      settings["plate_margin_percent"])
@@ -6326,8 +6410,7 @@ if _SLICING:
                 enabled, margin = plate_settings()
                 slots = plate_slots(ctx, parse_usage(read_tail(ctx.gcode_path)))
                 usage_plan(slots)
-                threading.Thread(target=run_heads, args=(slots, str(ctx.config_value("printer_settings_id") or "")),
-                                 daemon=True).start()
+                _bg(run_heads, slots, str(ctx.config_value("printer_settings_id") or ""))
                 if enabled:
                     if any(slot["grams"] > 0 for slot in slots):
                         # Off the slicing thread: it may fetch the spool list, and UI calls from
