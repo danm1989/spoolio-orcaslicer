@@ -6,7 +6,7 @@
 # name = "Spoolio"
 # description = "A Bambu Lab inspired inventory management overview for OrcaSlicer"
 # author = "Dan J Moore"
-# version = "0.10.0"
+# version = "0.10.1"
 # ///
 
 # Spoolio - filament management for OrcaSlicer
@@ -43,7 +43,7 @@ import orca.pages
 _SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
 
 PLUGIN_NAME = "Spoolio"
-PLUGIN_VERSION = "0.10.0"
+PLUGIN_VERSION = "0.10.1"
 # Stamped per operating system by scripts/build.py.
 BUILD_TARGET = "any"
 
@@ -2003,6 +2003,7 @@ def parse_slice(data: bytes, file: str = "") -> list[dict] | None:
 
 WASTE_SUPPORT = ("support",)
 WASTE_PURGE = ("prime tower", "wipe tower", "flush", "purge")
+FLUSH_RE = re.compile(r";\s*v?flush_(start|end)")
 
 
 def parse_waste(lines) -> dict[int, tuple[float, float]]:
@@ -2017,10 +2018,10 @@ def parse_waste(lines) -> dict[int, tuple[float, float]]:
                 name = low.split(":", 1)[1].strip()
                 kind = ("support" if any(w in name for w in WASTE_SUPPORT)
                         else "purge" if any(w in name for w in WASTE_PURGE) else "model")
-            elif "flush_start" in low:
-                flush = True
-            elif "flush_end" in low:
-                flush = False
+            else:
+                m = FLUSH_RE.fullmatch(low.strip())
+                if m:
+                    flush = m.group(1) == "start"
             continue
         cmd = line.split(";", 1)[0].strip()
         if not cmd:

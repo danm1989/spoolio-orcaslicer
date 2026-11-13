@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.10.1] - 2026-11-13
+
+### Fixed
+- Single-colour prints could be counted entirely as purge in Stats, putting them in Wasted Filament and Most Wasteful Prints. Spoolio was mistaking a flush marker inside the printer's settings, which OrcaSlicer writes at the top of the G-code, for a real filament flush. Only real flushes are counted as purge now.
+
 ## [0.10.0] - 2026-11-12
 
 This is my biggest update yet! I'm excited to share that Spoolio is no longer just for Bambu printers. Klipper (Moonraker), PrusaLink and OctoPrint printers can now be linked from the Printer tab, with live print progress and filament usage booking to Spoolman, the same as Live Link does for Bambu. Spoolio can also fill in which spool is on each toolhead straight from your slice. Calibration print tools get their own category in Stats. Behind the scenes there's a round of reliability fixes, the biggest being that your settings, usage and stats history can no longer be wiped if OrcaSlicer closes mid-save.
