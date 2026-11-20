@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.6] - 2026-11-20
+
+### Fixed
+- Fixed an issue where signing in to Bambu Cloud could get stuck on "Signing in..." when Bambu asked for an email verification code. The code was still emailed, but there was nowhere to enter it. Spoolio now always shows the code box, and waits longer for Bambu to send the code, and shows an error rather than freezing if Bambu doesn't answer.
+
+- You can now press Enter to submit the verification code, and spaces in the code are ignored.
+
 ## [0.11.5] - 2026-11-20
 
 ### Fixed
