@@ -16,6 +16,7 @@
 import base64
 import ftplib
 import html
+import http.client
 import json
 import logging
 import os
@@ -411,6 +412,7 @@ BAMBU_PATH = "/v1/design-user-service/my/filament/v2"
 BAMBU_PAGE = 100
 BAMBU_PAGES = 50
 BAMBU_TIMEOUT = 10
+BAMBU_CODE_TIMEOUT = 30
 BAMBU_KEY = "bambu"
 BAMBU_UA = f"BBL-Slicer/v02.08.01.51 (OrcaSlicer; {PLUGIN_NAME}/{PLUGIN_VERSION})"
 AUTH_FILE = DATA_DIR / "bambu_auth.json"
@@ -495,13 +497,14 @@ def _bambu_message(code: int, raw: str) -> str:
     return "Bambu blocked the request (HTTP 403)" if code == 403 else f"Bambu Cloud returned an error (HTTP {code})"
 
 
-def _bambu_post(region: str, path: str, body: dict, host: str = "") -> tuple[dict, list[str]]:
+def _bambu_post(region: str, path: str, body: dict, host: str = "",
+                timeout: float = BAMBU_TIMEOUT) -> tuple[dict, list[str]]:
     request = urllib.request.Request(
         (host or BAMBU_HOSTS[region]) + path, data=json.dumps(body).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json", "Accept": "application/json",
                  "User-Agent": BAMBU_UA})
     try:
-        with urllib.request.urlopen(request, timeout=BAMBU_TIMEOUT) as resp:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
             raw, cookies = resp.read().decode("utf-8", "replace"), resp.headers.get_all("Set-Cookie") or []
     except urllib.error.HTTPError as exc:
         raw = exc.read(2000).decode("utf-8", "replace")
@@ -509,6 +512,12 @@ def _bambu_post(region: str, path: str, body: dict, host: str = "") -> tuple[dic
         raise BambuError(_bambu_message(exc.code, raw)) from None
     except urllib.error.URLError as exc:
         raise BambuError(f"Could not reach Bambu Cloud ({exc.reason})") from None
+    except TimeoutError:
+        log.warning("Bambu Cloud %s timed out", path)
+        raise BambuError("Bambu Cloud didn't answer in time") from None
+    except (OSError, http.client.HTTPException) as exc:
+        log.warning("Bambu Cloud %s failed: %r", path, exc)
+        raise BambuError(f"Could not reach Bambu Cloud ({exc})") from None
     try:
         data = json.loads(raw) if raw.strip() else {}
     except ValueError:
@@ -517,7 +526,7 @@ def _bambu_post(region: str, path: str, body: dict, host: str = "") -> tuple[dic
 
 
 def _send_code(region: str, account: str) -> None:
-    _bambu_post(region, CODE_PATH, {"email": account, "type": "codeLogin"})
+    _bambu_post(region, CODE_PATH, {"email": account, "type": "codeLogin"}, timeout=BAMBU_CODE_TIMEOUT)
 
 
 def _after_login(region: str, account: str, reply: dict, cookies: list[str]) -> dict:
@@ -533,7 +542,11 @@ def _after_login(region: str, account: str, reply: dict, cookies: list[str]) -> 
         return {"ok": True, "step": "done"}
     _pending.update(region=region, account=account)
     if reply.get("loginType") == "verifyCode":
-        _send_code(region, account)
+        try:
+            _send_code(region, account)
+        except BambuError as exc:
+            log.warning("Could not ask Bambu Cloud for a code: %s", exc)
+            return {"ok": True, "step": "code", "warn": str(exc)}
         return {"ok": True, "step": "code"}
     if reply.get("loginType") == "tfa" or reply.get("tfaKey"):
         _pending["tfa_key"] = str(reply.get("tfaKey") or "")
@@ -564,7 +577,7 @@ def bambu_sign_in(data: dict) -> dict:
         if action == "resend":
             _send_code(region, account)
             return {"ok": True, "step": "code"}
-        code = str(data.get("code") or "").strip()
+        code = re.sub(r"\s", "", str(data.get("code") or ""))
         if not code:
             raise BambuError("Enter your Bambu Lab verification code")
         if action == "tfa":
@@ -576,6 +589,9 @@ def bambu_sign_in(data: dict) -> dict:
         return _after_login(region, account, reply, cookies)
     except BambuError as exc:
         return {"ok": False, "error": str(exc)}
+    except Exception:
+        log.exception("Bambu sign-in failed")
+        return {"ok": False, "error": "Sign in failed. The Spoolio log has the details"}
 
 
 def _bambu_page(auth: dict, offset: int) -> dict:
@@ -6597,6 +6613,9 @@ SETTINGS_PAGE = """
     document.getElementById("bambu-verify").addEventListener("click", function () {
       bambuSend(bambuStep, { code: document.getElementById("bambu-code-input").value });
     });
+    document.getElementById("bambu-code-input").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") document.getElementById("bambu-verify").click();
+    });
     document.getElementById("bambu-resend").addEventListener("click", function (e) {
       e.preventDefault();
       bambuSend("resend");
@@ -6739,7 +6758,9 @@ SETTINGS_PAGE = """
           document.getElementById("bambu-code-label").textContent = "Enter your Bambu Lab verification code";
           document.getElementById("bambu-resend").parentNode.classList.toggle("src-hidden", data.step === "tfa");
           bambuPane("code");
-          setBambu("Enter your Bambu Lab verification code", "pending");
+          document.getElementById("bambu-code-input").focus();
+          setBambu(data.warn ? "Bambu didn't confirm it sent a code (" + data.warn + "). Check your email, or use Send a New Code"
+                   : data.step === "tfa" ? "Enter the code from your authenticator app" : "Enter the code Bambu Lab emailed you", data.warn ? "error" : "pending");
         }
         return;
       }
