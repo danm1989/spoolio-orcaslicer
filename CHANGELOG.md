@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.5] - 2026-11-20
+
+### Fixed
+- Fixed an issue where OrcaSlicer would refuse to load Spoolio's filament presets, saying one of them was invalid. OrcaSlicer needs every preset to carry a version number, and Spoolio's didn't. They now include one. Thanks to bastian9355 for spotting this.
+
+- Fixed spool colours not showing on Spoolio's filament presets in OrcaSlicer. The colour was saved under a setting OrcaSlicer ignores for filament presets, so it now goes in the preset's default colour instead.
+
 ## [0.11.4] - 2026-11-18
 
 ### Fixed
