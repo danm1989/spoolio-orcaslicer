@@ -2805,12 +2805,13 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
             base = _base(bases, f, nz, c["bases"].get(str(f.get("material") or "").upper(), "") if c["base"] == "pick" else "")
             if not base:
                 continue
-            d = {"type": "filament", "name": name, "from": "User", "instantiation": "true", "inherits": base,
+            d = {"type": "filament", "name": name, "from": "User", "version": PLUGIN_VERSION, "instantiation": "true",
+                 "inherits": base,
                  "filament_settings_id": [name], "compatible_printers": nz, "compatible_printers_condition": ""}
             tk = c["take"]
             hx = _first_hex(f)
             if hx and tk["colour"]:
-                d["filament_colour"] = ["#" + hx.upper()]
+                d["default_filament_colour"] = ["#" + hx.upper()]
             ven = (f.get("vendor") or {}).get("name")
             if ven:
                 d["filament_vendor"] = [ven]
@@ -2941,7 +2942,7 @@ def presets_info(want: object = None) -> dict:
             sp = dict(e["spool"], rfid_tags=sorted(spool_tags(e["spool"])))
             j = e["json"]
             sign = CUR_SIGNS.get(_cur["code"], _cur["code"] + " " if _cur["code"] else "€")
-            rows = [["Colour", (j.get("filament_colour") or ["From Base Preset"])[0]],
+            rows = [["Colour", (j.get("default_filament_colour") or ["From Base Preset"])[0]],
                     ["Type and Vendor", ", ".join(x for x in (str(e["spool"]["filament"].get("material") or ""),
                                                               (j.get("filament_vendor") or [""])[0]) if x) or "-"],
                     ["Nozzle Temperature", f"{j['nozzle_temperature'][0]} °C" if "nozzle_temperature" in j else "From Base Preset"],
@@ -2958,8 +2959,8 @@ def presets_info(want: object = None) -> dict:
                     rows.append([t[2], txt if v else "From Base Preset"])
             rows.append(["Based On", j["inherits"]])
             out["sample"] = {"spool": sp, "name": j["name"], "printer": first["name"], "base": j["inherits"],
-                             "colour": (j.get("filament_colour") or [""])[0], "rows": rows,
-                             "list": [{"n": x["json"]["name"], "c": (x["json"].get("filament_colour") or [""])[0]}
+                             "colour": (j.get("default_filament_colour") or [""])[0], "rows": rows,
+                             "list": [{"n": x["json"]["name"], "c": (x["json"].get("default_filament_colour") or [""])[0]}
                                       for x in es[:6]], "more": max(0, len(es) - 6)}
     return out
 
