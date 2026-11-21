@@ -5340,9 +5340,13 @@ MAIN_PAGE = """
       if (liveOn && (usage.enabled || canEdit) && tab !== "printer") orca.postMessage({ type: "live" });
     }, 30000);
 
+    let lastView = "";
     function updateTabs() {
       const stOn = stats.on && usage.enabled;
       const view = tab === "stats" ? (stOn ? "stats" : "spools") : showTab && tab === "printer" ? "printer" : "spools";
+      const order = ["spools", "printer", "stats"];
+      if (lastView && view !== lastView) pgIn(document.getElementById("page-" + view), order.indexOf(view) < order.indexOf(lastView));
+      lastView = view;
       const onPrinter = view === "printer";
       tabsEl.hidden = !showTab && !stOn;
       printerBtn.hidden = !showTab;
@@ -5358,6 +5362,7 @@ MAIN_PAGE = """
       tabsEl.querySelectorAll("button").forEach(function (b) {
         b.classList.toggle("on", b.dataset.tab === view);
       });
+      if (window.glide) requestAnimationFrame(function () { glide(tabsEl); });
     }
 
     function askStats() {
@@ -6896,6 +6901,8 @@ def _scope_css(css: str, root: str) -> str:
     # prefixed with its view's id to stop them leaking into the other view.
     def scope(selector: str) -> str:
         selector = selector.strip()
+        if re.fullmatch(r"from|to|[\d.]+%", selector):
+            return selector
         if selector == "*":
             return f"{root}, {root} *"
         if selector in ("html", "body"):
@@ -7089,9 +7096,39 @@ TAB_BRIDGE = """
   }
   window.__spoolio = { main: bridge(null), settings: bridge("settings") };
 
+  var pgT = new WeakMap();
+  window.pgIn = function (el, back) {
+    if (!el) return;
+    clearTimeout(pgT.get(el));
+    el.classList.remove("pg-r", "pg-l");
+    Array.prototype.forEach.call(el.children, function (c, i) { c.classList.add("pg-s"); c.style.setProperty("--i", Math.min(i, 10)); });
+    void el.offsetWidth;
+    el.classList.add(back ? "pg-l" : "pg-r");
+    pgT.set(el, setTimeout(function () { el.classList.remove("pg-r", "pg-l"); }, 900));
+  };
+
+  window.glide = function (bar) {
+    if (!bar || !bar.offsetWidth) return;
+    var on = bar.querySelector("button.on:not([hidden])"), ind = bar.querySelector(".ind");
+    if (!ind) {
+      ind = document.createElement("span");
+      ind.className = "ind";
+      bar.insertBefore(ind, bar.firstChild);
+      if (window.ResizeObserver) new ResizeObserver(function () { glide(bar); }).observe(bar);
+    }
+    bar.classList.add("glide");
+    ind.hidden = !on;
+    if (!on) return;
+    ind.style.left = on.offsetLeft + "px";
+    ind.style.width = on.offsetWidth + "px";
+    if (!bar.classList.contains("glide-on")) { void ind.offsetWidth; bar.classList.add("glide-on"); }
+  };
+
   handlers.push(function (data) {
     if (!data || data.type !== "show_view") return;
     var settings = data.view === "settings";
+    if (settings === document.getElementById("view-settings").classList.contains("view-hidden"))
+      pgIn(document.getElementById(settings ? "view-settings" : "view-main"), !settings);
     document.getElementById("view-main").classList.toggle("view-hidden", settings);
     document.getElementById("view-settings").classList.toggle("view-hidden", !settings);
     document.getElementById("actions-main").classList.toggle("view-hidden", settings);
@@ -7850,6 +7887,19 @@ LOOK_CSS = """
   html.sw-square #view-main .spool-swatch, html.sw-square #pc .spool-swatch, .tp-sw.square { border-radius: 22% !important; }
   html.sw-pill #view-main .spool-swatch, html.sw-pill #pc .spool-swatch, .tp-sw.pill { width: 10px !important; border-radius: 5px !important; margin: 0 13px; }
   html.hd-tag #view-main #list .spool-tag, html.hd-rfid #view-main #list .spool-rfid, html.hd-cart #view-main #list .spool-cart { display: none !important; }
+  .pg-r { animation: pg-r .34s cubic-bezier(.2, .7, .2, 1) backwards; }
+  .pg-l { animation: pg-l .34s cubic-bezier(.2, .7, .2, 1) backwards; }
+  .pg-r > .pg-s, .pg-l > .pg-s { animation: pg-up .38s cubic-bezier(.2, .7, .2, 1) backwards; animation-delay: calc(var(--i, 0) * 35ms + 60ms); }
+  @keyframes pg-r { from { opacity: 0; transform: translateX(18px); } }
+  @keyframes pg-l { from { opacity: 0; transform: translateX(-18px); } }
+  @keyframes pg-up { from { opacity: 0; transform: translateY(8px); } }
+  .tabs.glide { position: relative; }
+  .tabs.glide .ind { position: absolute; top: 0; bottom: 0; left: 0; width: 0; z-index: 0; background: var(--orca-accent); pointer-events: none; }
+  .tabs.glide-on .ind { transition: left .32s cubic-bezier(.3, .7, .2, 1), width .32s cubic-bezier(.3, .7, .2, 1); }
+  .tabs.glide button { position: relative; z-index: 1; transition: color .2s; }
+  #app-header .tabs.glide button.on, #app-header .tabs.glide button.on:hover, #app-header .tabs.glide button.on:focus,
+  #app-header .tabs.glide button.on:active, .tabs.glide button.on { background: transparent !important; }
+  @media (prefers-reduced-motion: reduce) { .pg-r, .pg-l, .pg-s { animation: none !important; } .tabs.glide .ind { transition: none !important; } }
   html.rm *, html.rm *::before, html.rm *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
   html.cb #view-main .spool-weight.low { color: #e69f00 !important; }
   html.cb #view-main .spool-weight.low::before { content: "▼"; font-size: 9px; margin-right: -2px; }
@@ -8145,12 +8195,18 @@ LOOK_JS = r"""
   }
   function tab(t) {
     $$("#tabs-set button").forEach(function (b) { b.classList.toggle("on", b.dataset.st === t); });
+    if (window.glide) glide($("#tabs-set .tabs"));
     $("#view-settings").classList.toggle("ap-on", t === "appearance");
     window.scrollTo(0, 0);
   }
   window.__spoolioLook = function () { return cp(cur); };
   pane();
-  $("#tabs-set").addEventListener("click", function (e) { var b = e.target.closest("button"); if (b) tab(b.dataset.st); });
+  $("#tabs-set").addEventListener("click", function (e) {
+    var b = e.target.closest("button");
+    if (!b) return;
+    if (!b.classList.contains("on")) pgIn($("#view-settings"), b.dataset.st === "general");
+    tab(b.dataset.st);
+  });
   var vs = $("#view-settings");
   vs.addEventListener("click", function (e) {
     var x, id = e.target.id;
