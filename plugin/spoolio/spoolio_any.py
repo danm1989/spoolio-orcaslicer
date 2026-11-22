@@ -2585,6 +2585,7 @@ def parse_presets(value: object) -> dict:
             "use": {str(k)[:16]: [str(i)[:32] for i in x[:8]] for k, x in list(us.items())[-500:]
                     if isinstance(x, list) and x},
             "take": {k: parse_flag(tk.get(k)) for k in TAKE},
+            "extra_map": parse_flag(v.get("extra_map"), default=True),
             "tune": {"on": parse_flag(tn.get("on"), default=False),
                      "keys": {t[0]: parse_flag(tnk.get(t[0]), default=False) for t in TUNE}}}
 
@@ -2841,10 +2842,10 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
             cost = _kg_cost(sp, f) if tk["cost"] else None
             if cost:
                 d["filament_cost"] = [str(cost)]
+            bp = pb.filaments.find_preset(base) if (c["tune"]["on"] or c["extra_map"]) else None
             exp, lvl, tv = {}, {}, {}
             if c["tune"]["on"]:
                 tv, lvl = tune_of(sp, c["per"])
-                bp = pb.filaments.find_preset(base)
                 for t in TUNE:
                     if not c["tune"]["keys"][t[0]]:
                         continue
@@ -2854,8 +2855,9 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
                         if t[0] == "pa":
                             d["enable_pressure_advance"] = ["1"]
                     exp[t[0]] = v if v is not None else (_n1(bp.config_value(t[3])) if bp else None)
+            extra_applied = _apply_orca_extras(d, sp, f, c["per"], bp) if c["extra_map"] else {}
             out.append({"file": _pfile(name), "json": d, "spool": sp, "printer": p, "cost": cost, "exp": exp,
-                        "lvl": lvl, "tv": tv})
+                        "lvl": lvl, "tv": tv, "extra": extra_applied})
     return out
 
 
@@ -2961,8 +2963,8 @@ def presets_info(want: object = None) -> dict:
             rows = [["Colour", (j.get("default_filament_colour") or ["From Base Preset"])[0]],
                     ["Type and Vendor", ", ".join(x for x in (str(e["spool"]["filament"].get("material") or ""),
                                                               (j.get("filament_vendor") or [""])[0]) if x) or "-"],
-                    ["Nozzle Temperature", f"{j['nozzle_temperature'][0]} °C" if "nozzle_temperature" in j else "From Base Preset"],
-                    ["Bed Temperature", f"{j['hot_plate_temp'][0]} °C" if "hot_plate_temp" in j else "From Base Preset"],
+                    ["Nozzle Temperature", _temp_row(j, "nozzle_temperature", "nozzle_temperature_initial_layer")],
+                    ["Bed Temperature", _bed_temp_row(j)],
                     ["Density and Diameter", ", ".join(x for x in (
                         f"{j['filament_density'][0]} g/cm³" if "filament_density" in j else "",
                         f"{j['filament_diameter'][0]} mm" if "filament_diameter" in j else "") if x) or "From Base Preset"],
@@ -2973,6 +2975,11 @@ def presets_info(want: object = None) -> dict:
                     by = t[0] == "pa" and first["name"] in e["tv"].get("by", {})
                     txt = f"{v} {t[4]}".strip() + (f" ({first['name']})" if by else "")
                     rows.append([t[2], txt if v else "From Base Preset"])
+            for k, vals in (e.get("extra") or {}).items():
+                if k in TEMP_PREVIEW_KEYS:
+                    continue
+                txt = ", ".join(vals)
+                rows.append([k, txt if len(txt) <= 60 else txt[:57] + "..."])
             rows.append(["Based On", j["inherits"]])
             out["sample"] = {"spool": sp, "name": j["name"], "printer": first["name"], "base": j["inherits"],
                              "colour": (j.get("default_filament_colour") or [""])[0], "rows": rows,
@@ -2989,7 +2996,103 @@ TUNE = (("flow", "flow_ratio", "Flow Ratio", "filament_flow_ratio", ""),
 TUNE_KEYS = {t[1] for t in TUNE}
 PA_BY = "pressure_advance_printers"
 TAKE = ("colour", "temps", "dens", "cost")
+PRESET_RESERVED_KEYS = (
+    {"type", "name", "from", "version", "instantiation", "inherits",
+     "filament_settings_id", "compatible_printers", "compatible_printers_condition", "tag"}
+    | TUNE_KEYS | {PA_BY}
+)
+TEMP_PREVIEW_KEYS = {
+    "nozzle_temperature", "nozzle_temperature_initial_layer",
+    "hot_plate_temp", "hot_plate_temp_initial_layer",
+    "textured_plate_temp", "textured_plate_temp_initial_layer",
+}
 _tune_q: dict = {}
+
+
+def _temp_row(j: dict, main_key: str, init_key: str) -> str:
+    main = (j.get(main_key) or [None])[0]
+    init = (j.get(init_key) or [None])[0]
+    if main and init and init != main:
+        return f"{main} °C (1st layer {init} °C)"
+    if main:
+        return f"{main} °C"
+    if init:
+        return f"1st layer {init} °C"
+    return "From Base Preset"
+
+
+def _bed_temp_row(j: dict) -> str:
+    main = (j.get("hot_plate_temp") or j.get("textured_plate_temp") or [None])[0]
+    init = next((v for k in ("textured_plate_temp_initial_layer", "hot_plate_temp_initial_layer")
+                 if (v := (j.get(k) or [None])[0]) and v != main), None)
+    if main and init:
+        return f"{main} °C (1st layer {init} °C)"
+    if main:
+        return f"{main} °C"
+    init_only = (j.get("hot_plate_temp_initial_layer")
+                 or j.get("textured_plate_temp_initial_layer") or [None])[0]
+    return f"1st layer {init_only} °C" if init_only else "From Base Preset"
+
+
+def _extra_orca_val(raw: object) -> list[str] | None:
+    """Decode a Spoolman extra value into OrcaSlicer's string-list preset format."""
+    if raw is None or raw == "":
+        return None
+    val = raw
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            val = json.loads(s)
+        except ValueError:
+            val = s
+    if val is None or val == "":
+        return None
+    if isinstance(val, bool):
+        return ["1" if val else "0"]
+    if isinstance(val, (int, float)):
+        n = int(val) if isinstance(val, float) and val == int(val) else val
+        return [str(n)]
+    if isinstance(val, list):
+        items = [str(x) for x in val if x is not None and str(x) != ""]
+        return items or None
+    if isinstance(val, dict):
+        return None
+    return [str(val)]
+
+
+def _has_orca_key(bp, key: str) -> bool:
+    """True when key is an OrcaSlicer filament preset setting (including inherited keys)."""
+    if not bp or not key or key in PRESET_RESERVED_KEYS:
+        return False
+    for get in (lambda: bp.full_config_value(key), lambda: bp.config_value(key)):
+        try:
+            if get() is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _apply_orca_extras(d: dict, sp: dict, f: dict, per: str, bp) -> dict[str, list[str]]:
+    """Apply Spoolman extra fields whose keys match OrcaSlicer filament preset keys."""
+    ex: dict = {}
+    if isinstance(f.get("extra"), dict):
+        ex.update(f["extra"])
+    if per == "spool" and isinstance(sp.get("extra"), dict):
+        for k, v in sp["extra"].items():
+            if v not in (None, ""):
+                ex[k] = v
+    applied: dict[str, list[str]] = {}
+    for k in sorted(ex):
+        if not _has_orca_key(bp, k):
+            continue
+        val = _extra_orca_val(ex[k])
+        if val is not None:
+            d[k] = val
+            applied[k] = val
+    return applied
 
 
 def _xv(ex: object, key: str):
@@ -8210,6 +8313,8 @@ PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</sp
     <div class="hint">Anything not taken from Spoolman comes from the printer's own preset for that material, or Generic if it has none.</div>
     <div class="field-label">Take these from Spoolman:</div>
     <div class="pm-ck"><label class="check-row"><input type="checkbox" data-take="colour">Colour</label><label class="check-row"><input type="checkbox" data-take="temps">Nozzle and Bed Temperatures</label><label class="check-row"><input type="checkbox" data-take="dens">Density and Diameter</label><label class="check-row"><input type="checkbox" data-take="cost">Cost</label></div>
+    <label class="check-row pm-tn"><input id="pm-extra" type="checkbox">Map Matching Spoolman Extra Fields</label>
+    <div class="hint">Any filament extra field (or spool extra field when one preset per spool is chosen) whose key matches an OrcaSlicer filament setting overrides the base and assumed values.</div>
     <label class="check-row pm-tn"><input id="pm-tune" type="checkbox">Use Advanced Tuning From Spoolman</label>
     <div class="hint">Adds a Tuning step to Edit Spool for your calibrated values, and offers to update Spoolman whenever it detects a change from the preset.</div>
     <div class="pm-ck" id="pm-tks"><label class="check-row"><input type="checkbox" data-tk="flow">Flow Ratio</label><label class="check-row"><input type="checkbox" data-tk="pa">Pressure Advance</label><label class="check-row"><input type="checkbox" data-tk="mvs">Max Volumetric Speed</label><label class="check-row"><input type="checkbox" data-tk="rlen">Retraction Length</label><label class="check-row"><input type="checkbox" data-tk="rspd">Retraction Speed</label></div>
@@ -8277,7 +8382,7 @@ PRESET_JS = r"""
     document.querySelectorAll("#pm-card [data-take]").forEach(function (x) { tk[x.dataset.take] = x.checked; });
     document.querySelectorAll("#pm-card [data-tk]").forEach(function (x) { tn[x.dataset.tk] = x.checked; });
     return { on: $("pm-on").checked, per: radio("pm-per") || "filament", base: radio("pm-base") || "auto", printers: pr, bases: bs,
-      take: tk, tune: { on: $("pm-tune").checked, keys: tn } };
+      take: tk, extra_map: $("pm-extra").checked, tune: { on: $("pm-tune").checked, keys: tn } };
   }
   function spoolman() { var x = document.querySelector('input[name="spool-source"]:checked'); return !x || x.value === "spoolman"; }
   function look() {
@@ -8321,7 +8426,7 @@ PRESET_JS = r"""
   function draw(d, full) {
     I = d; C = d.cfg;
     if (full) {
-      $("pm-on").checked = C.on; setRadio("pm-per", C.per); setRadio("pm-base", C.base); $("pm-tune").checked = C.tune.on;
+      $("pm-on").checked = C.on; setRadio("pm-per", C.per); setRadio("pm-base", C.base); $("pm-extra").checked = C.extra_map !== false; $("pm-tune").checked = C.tune.on;
       document.querySelectorAll("#pm-card [data-take]").forEach(function (x) { x.checked = C.take[x.dataset.take] !== false; });
       document.querySelectorAll("#pm-card [data-tk]").forEach(function (x) { x.checked = !!C.tune.keys[x.dataset.tk]; });
     }
