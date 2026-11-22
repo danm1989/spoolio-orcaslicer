@@ -1291,7 +1291,7 @@ def live_poll() -> dict:
 NET_POLL = 3.0
 NET_IDLE = 15.0
 MR_SLOW = 30.0
-MR_OBJECTS = "print_stats&virtual_sdcard&toolhead&mmu"
+MR_OBJECTS = "print_stats&virtual_sdcard&toolhead&mmu&print_task_config"
 MR_STATES = {"standby": "IDLE", "printing": "RUNNING", "paused": "PAUSE", "complete": "FINISH",
              "cancelled": "FAILED", "error": "FAILED"}
 MR_ERRORS = (urllib.error.URLError, OSError, ValueError)
@@ -1373,6 +1373,8 @@ def mr_apply(pid: str, link: dict, status: dict, extra: dict) -> None:
     vs = status.get("virtual_sdcard") if isinstance(status.get("virtual_sdcard"), dict) else {}
     th = status.get("toolhead") if isinstance(status.get("toolhead"), dict) else {}
     mmu = status.get("mmu") if isinstance(status.get("mmu"), dict) else None
+    ptc = status.get("print_task_config") if isinstance(status.get("print_task_config"), dict) else {}
+    xmap = ptc.get("extruder_map_table")
     file = str(ps.get("filename") or "")
     pct = max(0, min(100, round((_num(vs.get("progress")) or 0) * 100)))
     info = ps.get("info") if isinstance(ps.get("info"), dict) else {}
@@ -1386,17 +1388,18 @@ def mr_apply(pid: str, link: dict, status: dict, extra: dict) -> None:
             books=bool(extra.get("sm") and (extra.get("spool") or hh in ("push", "pull"))),
             layer=info.get("current_layer"), layers=info.get("total_layer"),
             tool=_int((mmu or {}).get("tool")) if mmu else _mr_tool(th.get("extruder")),
-            gate=_int(mmu.get("gate")) if mmu else -1, stage=action if action and action.lower() != "idle" else None)
+            gate=_int(mmu.get("gate")) if mmu else -1, stage=action if action and action.lower() != "idle" else None,
+            xmap=[_int(h) for h in xmap] if isinstance(xmap, list) and xmap else None)
 
 
 def net_put(pid: str, link: dict, gs: str, pct: int, name: str, file: str, left: float | None, job: str,
             gates: list | None = None, active: int | None = None, books: bool = False, layer=None, layers=None,
-            tool: int = -1, gate: int = -1, stage: str | None = None) -> None:
+            tool: int = -1, gate: int = -1, stage: str | None = None, xmap: list | None = None) -> None:
     """Merge one status from a non-Bambu printer into the live state."""
     with _live_lock:
         state = _live["printers"].setdefault(pid, {"name": link["name"], "units": {}, "ext": {}, "time": 0.0,
                                                   "link": pid, "kind": "net"})
-        state.update(time=time.time(), gates=gates, active=active, books=books)
+        state.update(time=time.time(), gates=gates, active=active, books=books, xmap=xmap)
         prog = state.setdefault("prog", {})
         was = prog.get("gcode_state")
         if gs != was:
@@ -1491,7 +1494,9 @@ def _mr_loaded(state: dict) -> list[dict]:
         return [{"key": i, "spool_id": _int(s) if s else None, "tools": [i]} for i, s in enumerate(units["mmu"])]
     heads = units.get("tool") or [None]
     act = state.get("active")
-    return [{"key": 100 + i, "head": True, "tools": [i],
+    # Snapmaker U1: filament n prints from the head in extruder_map_table[n - 1].
+    xmap = state.get("xmap")
+    return [{"key": 100 + i, "head": True, "tools": [t for t, h in enumerate(xmap) if h == i] if xmap else [i],
              "spool_id": _int(s) if s else (act if len(heads) == 1 else None)} for i, s in enumerate(heads)]
 
 
@@ -2756,7 +2761,7 @@ def _pfile(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "-", name).strip(" .") + ".json"
 
 
-def _loaded(spools: list) -> dict[str, set]:
+def _in_use(spools: list) -> dict[str, set]:
     """Spool id to the printers it's loaded in, from the Printer tab and Live Link's RFID trays."""
     out: dict[str, set] = {}
     for p in printers_cfg():
@@ -2787,7 +2792,7 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
     live = [sp for sp in spools if isinstance(sp, dict) and isinstance(sp.get("filament"), dict)
             and not sp.get("archived") and (_num_or(sp.get("remaining_weight"), 1) or 0) > 0]
     picks: dict = {}
-    loaded = _loaded(live)
+    loaded = _in_use(live)
     want: dict = {}
     for sp in sorted(live, key=lambda x: x.get("id") or 0):
         key = sp["id"] if c["per"] == "spool" else sp["filament"].get("id")
