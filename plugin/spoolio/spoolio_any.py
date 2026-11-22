@@ -4647,7 +4647,7 @@ MAIN_PAGE = """
   .pj-pct { margin-left: auto; font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
   .pj-track { height: 10px; margin: 9px 0 8px; border-radius: 5px; background: rgba(127, 127, 127, 0.25); overflow: hidden; }
   .pj-fill { height: 100%; border-radius: 5px; background: var(--orca-accent); transition: width .9s ease; }
-  .pj-fill.run { background: linear-gradient(90deg, var(--orca-accent) 0 40%, color-mix(in srgb, var(--orca-accent) 35%, #fff) 50%, var(--orca-accent) 60% 100%); background-size: 250% 100%; animation: pj-run 1.6s linear infinite; }
+  .pj-fill.run { background: linear-gradient(90deg, var(--orca-accent) 0 40%, color-mix(in srgb, var(--orca-accent) 35%, #fff) 50%, var(--orca-accent) 60% 100%); background-size: 250% 100%; animation: pj-run 4.8s linear infinite; }
   @keyframes pj-run { from { background-position: 100% 0; } to { background-position: -150% 0; } }
   .pj-fill.warn { background: #d29922; }
   .pj-fill.ok { background: #3fb950; }
