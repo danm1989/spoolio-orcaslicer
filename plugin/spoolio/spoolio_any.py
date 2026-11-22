@@ -2427,7 +2427,7 @@ def editor_data() -> dict:
     out = []
     for f in sorted(fields, key=lambda x: (x.get("order") or 0, x.get("name") or "")):
         if isinstance(f, dict) and f.get("key") and f.get("field_type") in FIELD_TYPES \
-                and f["key"] not in TUNE_KEYS and f["key"] != PA_BY:
+                and f["key"] not in TUNE_KEYS and f["key"] not in TUNE_OLD.values() and f["key"] != PA_BY:
             out.append({"key": f["key"], "name": f.get("name") or f["key"], "type": f["field_type"],
                         "unit": f.get("unit") or "", "choices": f.get("choices") or [],
                         "multi": bool(f.get("multi_choice"))})
@@ -3012,18 +3012,19 @@ def presets_info(want: object = None) -> dict:
     return out
 
 
-TUNE = (("flow", "flow_ratio", "Flow Ratio", "filament_flow_ratio", ""),
+TUNE = (("flow", "filament_flow_ratio", "Flow Ratio", "filament_flow_ratio", ""),
         ("pa", "pressure_advance", "Pressure Advance", "pressure_advance", ""),
-        ("mvs", "max_volumetric_speed", "Max Volumetric Speed", "filament_max_volumetric_speed", "mm³/s"),
-        ("rlen", "retraction_length", "Retraction Length", "filament_retraction_length", "mm"),
-        ("rspd", "retraction_speed", "Retraction Speed", "filament_retraction_speed", "mm/s"))
+        ("mvs", "filament_max_volumetric_speed", "Max Volumetric Speed", "filament_max_volumetric_speed", "mm³/s"),
+        ("rlen", "filament_retraction_length", "Retraction Length", "filament_retraction_length", "mm"),
+        ("rspd", "filament_retraction_speed", "Retraction Speed", "filament_retraction_speed", "mm/s"))
 TUNE_KEYS = {t[1] for t in TUNE}
+TUNE_OLD = {"flow": "flow_ratio", "mvs": "max_volumetric_speed", "rlen": "retraction_length", "rspd": "retraction_speed"}
 PA_BY = "pressure_advance_printers"
 TAKE = ("colour", "temps", "dens", "cost")
 PRESET_RESERVED_KEYS = (
     {"type", "name", "from", "version", "instantiation", "inherits",
      "filament_settings_id", "compatible_printers", "compatible_printers_condition", "tag"}
-    | TUNE_KEYS | {PA_BY}
+    | set(TUNE_OLD.values()) | {PA_BY}
 )
 TEMP_PREVIEW_KEYS = {
     "nozzle_temperature", "nozzle_temperature_initial_layer",
@@ -3164,6 +3165,9 @@ def _xv(ex: object, key: str):
 
 def _tvals(ex: object) -> dict:
     out = {t[0]: _xv(ex, t[1]) for t in TUNE}
+    for k, old in TUNE_OLD.items():
+        if out[k] is None:
+            out[k] = _xv(ex, old)
     out["by"] = _xv(ex, PA_BY)
     return out
 
@@ -3305,6 +3309,109 @@ def live_tune() -> list[dict]:
             if it:
                 out.append(it)
     return out
+
+
+def _tnew(k: str) -> str:
+    return next(t[1] for t in TUNE if t[0] == k)
+
+
+def _tm_name(ent: str, e: dict) -> str:
+    f = e.get("filament") if ent == "spool" else e
+    f = f if isinstance(f, dict) else {}
+    n = " ".join(x for x in ((f.get("vendor") or {}).get("name"), f.get("name") or f.get("material")) if x) or "Filament"
+    return f"Spool #{e.get('id')} · {n}" if ent == "spool" else n
+
+
+def tune_move_scan() -> dict:
+    """Tuning values still under Spoolio's old Spoolman field names, and any clashes with the OrcaSlicer names."""
+    rows = {k: {"k": k, "old": o, "new": _tnew(k), "fil": 0, "spool": 0}
+            for k, o in TUNE_OLD.items()}
+    moves, clash, fields = [], [], []
+    kept = set(cfg().get("tune_kept") or [])
+    for ent in ("filament", "spool"):
+        have = {f.get("key") for f in sm_req("GET", f"field/{ent}") or [] if isinstance(f, dict)}
+        fields += [{"ent": ent, "key": o} for o in TUNE_OLD.values() if o in have]
+        for e in sm_req("GET", ent) or []:
+            ex = e.get("extra") if isinstance(e, dict) else None
+            if not isinstance(ex, dict):
+                continue
+            for k, o in TUNE_OLD.items():
+                ov = _xv(ex, o)
+                if ov is None:
+                    continue
+                r = rows[k]
+                nv = _xv(ex, r["new"])
+                if nv is None:
+                    moves.append({"ent": ent, "id": e.get("id"), "k": k, "v": ov})
+                elif abs(float(nv) - float(ov)) > 1e-9 and f"{ent}:{e.get('id')}:{k}:{ov}:{nv}" not in kept:
+                    clash.append({"id": f"{ent}:{e.get('id')}:{k}", "ent": ent, "eid": e.get("id"), "k": k,
+                                  "name": _tm_name(ent, e), "label": next(t[2] for t in TUNE if t[0] == k),
+                                  "old": o, "new": r["new"], "ov": ov, "nv": nv,
+                                  "c": _first_hex(e.get("filament") if ent == "spool" else e)})
+                else:
+                    continue
+                r["fil" if ent == "filament" else "spool"] += 1
+    return {"ok": True, "rows": [r for r in rows.values() if r["fil"] or r["spool"]], "moves": moves,
+            "clash": clash, "n": len(moves) + len(clash), "fields": fields}
+
+
+def tune_move_apply(pick: object) -> dict:
+    """Copies old-named tuning values into the OrcaSlicer-named fields; clashes follow the user's pick."""
+    pick = pick if isinstance(pick, dict) else {}
+    try:
+        sc = tune_move_scan()
+        todo: dict = {}
+        for m in sc["moves"]:
+            todo.setdefault((m["ent"], m["id"]), {})[_tnew(m["k"])] = m["v"]
+        kept = []
+        for x in sc["clash"]:
+            if pick.get(x["id"], "old") == "old":
+                todo.setdefault((x["ent"], x["eid"]), {})[x["new"]] = x["ov"]
+            else:
+                kept.append(f"{x['id']}:{x['ov']}:{x['nv']}")
+        if kept:
+            cfg_edit(lambda s: s.update(tune_kept=(list(s.get("tune_kept") or []) + kept)[-200:]))
+        for (ent, eid), vals in todo.items():
+            tune_save(ent, eid, vals)
+        cfg_edit(lambda s: s.update(tune_move="done"))
+        left = tune_move_scan()
+    except Exception as exc:
+        log.warning("Moving tuning values failed: %s", exc)
+        return {"ok": False, "error": _sm_err(exc)}
+    n = sum(len(v) for v in todo.values())
+    log.info("Moved %d tuning values to the OrcaSlicer field names", n)
+    return {"ok": True, "n": n, "fields": left["fields"] if not left["n"] else [], "left": left["n"]}
+
+
+def tune_move_delete() -> dict:
+    """Deletes Spoolio's old tuning fields from Spoolman, only once every value is in the new fields."""
+    try:
+        sc = tune_move_scan()
+        if sc["n"]:
+            return {"ok": False, "error": "Some values haven't been moved yet, so the old fields were kept."}
+        for f in sc["fields"]:
+            sm_req("DELETE", f"field/{f['ent']}/{f['key']}")
+    except Exception as exc:
+        log.warning("Deleting the old tuning fields failed: %s", exc)
+        return {"ok": False, "error": _sm_err(exc)}
+    _spool_cache["time"] = 0.0
+    log.info("Deleted old tuning fields: %s", ", ".join(f"{f['ent']}.{f['key']}" for f in sc["fields"]))
+    return {"ok": True, "n": len(sc["fields"])}
+
+
+def tune_move_state(auto: bool) -> dict | None:
+    c = parse_presets(cfg().get("presets"))
+    if source() != "spoolman" or not (c["on"] and c["tune"]["on"]):
+        return {"ok": True, "n": 0, "fields": [], "rows": [], "clash": [], "off": True}
+    if auto and cfg().get("tune_move"):
+        return None
+    try:
+        sc = tune_move_scan()
+    except Exception as exc:
+        log.warning("Checking for old tuning fields failed: %s", exc)
+        return None
+    sc.pop("moves")
+    return sc
 
 
 def tune_items() -> list[dict]:
@@ -7540,7 +7647,8 @@ EDITOR_JS = r"""
     add: [["fil", "Filament", "🧵"], ["amt", "Amount", "⚖️"], ["sto", "Storage", "📍"], ["tag", "RFID & Extras", "🏷️"], ["rev", "Review", "✅"]],
     edit: [["amt", "Amount", "⚖️"], ["sto", "Storage", "📍"], ["tag", "RFID & Extras", "🏷️"], ["fil", "Filament", "🧵"], ["rev", "Review", "✅"]]
   };
-  var TX = { flow: "flow_ratio", pa: "pressure_advance", mvs: "max_volumetric_speed", rlen: "retraction_length", rspd: "retraction_speed" };
+  var TX = { flow: "filament_flow_ratio", pa: "pressure_advance", mvs: "filament_max_volumetric_speed", rlen: "filament_retraction_length", rspd: "filament_retraction_speed" };
+  var TO = { flow: "flow_ratio", mvs: "max_volumetric_speed", rlen: "retraction_length", rspd: "retraction_speed" };
   var TS = { flow: "Flow", pa: "PA", mvs: "Max Speed", rlen: "Retract", rspd: "Retract Speed" };
   var tks = function () { return D && D.tune && D.tune.on ? D.tune.keys : []; };
   var perSp = function () { return !!(D && D.tune && D.tune.per === "spool"); };
@@ -7549,7 +7657,7 @@ EDITOR_JS = r"""
   function tv(ex) {
     ex = ex || {};
     var o = { by: {} }, by = dec(dec(ex.pressure_advance_printers));
-    Object.keys(TX).forEach(function (k) { var v = dec(dec(ex[TX[k]])); o[k] = typeof v === "number" ? cl(v) : ""; });
+    Object.keys(TX).forEach(function (k) { var v = dec(dec(ex[TX[k]])); if (typeof v !== "number" && TO[k]) v = dec(dec(ex[TO[k]])); o[k] = typeof v === "number" ? cl(v) : ""; });
     if (by && typeof by === "object") Object.keys(by).forEach(function (p) { if (typeof by[p] === "number") o.by[p] = cl(by[p]); });
     return o;
   }
@@ -8030,6 +8138,130 @@ EDITOR_JS = r"""
 """
 
 
+MOVE_CSS = """
+  #tm, #tm * { font-family: __FONT__; }
+  #tm { position: fixed; inset: 0; z-index: 1100; display: flex; align-items: center; justify-content: center; padding: 16px; box-sizing: border-box; background: rgba(0, 0, 0, 0.55); animation: pc-fade .18s ease-out; }
+  #tm[hidden] { display: none; }
+  #tm .pop { width: min(540px, 100%); max-height: 100%; overflow: auto; box-sizing: border-box; background: var(--orca-bg); border: 1px solid var(--orca-border); border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45); padding: 16px; color: var(--orca-fg); font-size: 13px; animation: pc-pop .22s ease-out; }
+  #tm .t { display: block; font-size: 15px; margin-bottom: 6px; }
+  .tm-warn, #tm .ok { display: flex; gap: 10px; align-items: flex-start; margin-top: 10px; padding: 10px 12px; border-radius: 8px; font-size: 12px; line-height: 1.45; }
+  .tm-warn { border: 1px solid rgba(210, 153, 34, 0.45); background: rgba(210, 153, 34, 0.14); color: #e0a030; }
+  .tm-warn a { color: inherit; font-weight: 700; }
+  #tm .ok { border: 1px solid color-mix(in srgb, var(--orca-accent) 50%, transparent); background: color-mix(in srgb, var(--orca-accent) 12%, transparent); }
+  .tm-warn svg, #tm .ok svg { flex: none; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  #tm .ok svg { stroke: var(--orca-accent); stroke-width: 2.4; }
+  #tm table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+  #tm th { text-align: left; color: var(--orca-muted); font-weight: 400; padding: 4px 6px; border-bottom: 1px solid var(--orca-border); }
+  #tm td { padding: 7px 6px; border-bottom: 1px solid var(--orca-border); }
+  #tm td.n, #tm th.n { text-align: right; color: var(--orca-muted); }
+  #tm td.a { color: var(--orca-accent); padding: 0 2px; }
+  #tm code, #tm td.c { font-family: ui-monospace, Consolas, monospace; }
+  #tm .cf { margin-top: 12px; border: 1px solid rgba(210, 153, 34, 0.45); border-radius: 8px; padding: 10px 12px; }
+  #tm .cf b { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  #tm .cf .d { width: 12px; height: 12px; border-radius: 50%; border: 1px solid var(--orca-border); flex: none; }
+  #tm .note { color: var(--orca-muted); font-size: 12px; line-height: 1.45; margin-top: 10px; }
+  #tm .err { color: #d9534f; font-size: 12px; margin-top: 10px; }
+  #tm .seg { display: inline-flex; margin-top: 8px; border: 1px solid var(--orca-border); border-radius: 6px; overflow: hidden; }
+  #tm .seg button { border: 0; border-right: 1px solid var(--orca-border); border-radius: 0; background: transparent; color: var(--orca-fg); padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  #tm .seg button:last-child { border-right: 0; }
+  #tm .seg button.on { background: var(--orca-accent); color: var(--orca-accent-fg); font-weight: 700; }
+  #tm .bar { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  #tm .bar button { background: transparent; color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }
+  #tm .bar button.ghost { border-color: transparent; font-weight: 400; color: var(--orca-muted); }
+  #tm .bar button.pri { background: var(--orca-accent); color: var(--orca-accent-fg); border-color: var(--orca-accent); }
+  #tm .bar button.del { border-color: #d9534f; color: #d9534f; }
+  #tm .bar button:disabled { opacity: .5; cursor: default; }
+  @media (prefers-reduced-motion: reduce) { #tm, #tm .pop { animation: none; } }
+"""
+
+MOVE_JS = r"""
+  var T = null, st = "", pick = {}, busy = false, err = "", res = null, auto = false;
+  var box = document.createElement("div");
+  box.id = "tm"; box.hidden = true; document.body.appendChild(box);
+  var W = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18h.01"/></svg>';
+  var OK = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+  var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); };
+  var pl = function (n, w) { return n + " " + w + (n === 1 ? "" : "s"); };
+  var olds = function () { var o = []; (T.fields || []).forEach(function (f) { if (o.indexOf(f.key) < 0) o.push(f.key); }); return o; };
+  var codes = function (a) { a = a.map(function (k) { return "<code>" + esc(k) + "</code>"; }); return a.length > 1 ? a.slice(0, -1).join(", ") + " and " + a[a.length - 1] : a.join(""); };
+  function note() {
+    var n = document.getElementById("pm-tm");
+    if (!n) return;
+    var on = T && !T.off && (T.n || (T.fields || []).length);
+    n.hidden = !on;
+    n.innerHTML = !on ? "" : '<div class="tm-warn">' + W + '<span>' + (T.n
+      ? pl(T.n, "tuning value") + (T.n === 1 ? " still uses" : " still use") + ' the old field names. Spoolio reads them for now. <a href="#" data-tm="open">Move Values</a>'
+      : 'The old tuning fields are still in Spoolman. Spoolio no longer uses them. <a href="#" data-tm="open">Delete Old Fields</a>') + '</span></div>';
+  }
+  function bar(b) { return '<div class="bar">' + b + '</div>'; }
+  function draw() {
+    if (!st) { box.hidden = true; box.innerHTML = ""; return; }
+    var h = "", e = err ? '<div class="err">' + esc(err) + '</div>' : "", dis = busy ? " disabled" : "";
+    if (st === "ask") {
+      h = '<b class="t">Move Tuning Values to OrcaSlicer Names</b><div class="tm-warn">' + W + '<span>Advanced Tuning now uses OrcaSlicer\'s own setting names in Spoolman, so Map Matching and tuning share one field. ' +
+        pl(T.n, "value") + (T.n === 1 ? " is" : " are") + ' still under the old names.</span></div>' +
+        '<table><tr><th>Old Field</th><th></th><th>OrcaSlicer Name</th><th class="n">Used By</th></tr>' + T.rows.map(function (r) {
+          var u = [r.fil ? pl(r.fil, "filament") : "", r.spool ? pl(r.spool, "spool") : ""].filter(Boolean).join(", ");
+          return '<tr><td class="c">' + esc(r.old) + '</td><td class="a">&rarr;</td><td class="c">' + esc(r["new"]) + '</td><td class="n">' + u + '</td></tr>';
+        }).join("") + '</table>' + T.clash.map(function (x) {
+          var p = pick[x.id] || "old";
+          return '<div class="cf"><b><span class="d" style="background:#' + esc(x.c || "555555") + '"></span>' + esc(x.name) + ' has both</b><div class="note" style="margin:0"><code>' + esc(x.old) + '</code> is ' + esc(x.ov) +
+            ' (calibrated in Spoolio). <code>' + esc(x["new"]) + '</code> is ' + esc(x.nv) + ' (set in Spoolman). Which ' + esc(x.label) + ' should Spoolio keep?</div><div class="seg">' +
+            '<button data-tp="' + esc(x.id) + '" data-v="old" class="' + (p === "old" ? "on" : "") + '">Keep ' + esc(x.ov) + '</button>' +
+            '<button data-tp="' + esc(x.id) + '" data-v="new" class="' + (p === "new" ? "on" : "") + '">Keep ' + esc(x.nv) + '</button></div></div>';
+        }).join("") + '<div class="note">Moving copies each value into the new field. Your old fields stay in Spoolman, untouched, until you delete them. Until you move them, Spoolio keeps reading the old fields, so nothing is lost.</div>' + e +
+        bar('<button class="ghost" data-tm="later"' + dis + '>Not Now</button><button class="pri" data-tm="move"' + dis + '>' + (busy ? "Moving…" : "Move Values") + '</button>');
+    } else if (st === "moved") {
+      var f = olds();
+      h = '<b class="t">Tuning Values Moved</b><div class="ok">' + OK + '<span>' + pl(res.n || 0, "value") + ' copied to the OrcaSlicer names. Spoolio and Map Matching now read the same fields.</span></div>' +
+        (f.length ? '<div class="note">The old fields ' + codes(f) + ' are still in Spoolman. Spoolio no longer uses them, so you can delete them now, or later from Settings.</div>' : "") + e +
+        bar(f.length ? '<button class="ghost" data-tm="close">Keep Old Fields</button><button class="del" data-tm="ask-del">Delete Old Fields</button>' : '<button class="pri" data-tm="close">Done</button>');
+    } else if (st === "del") {
+      h = '<b class="t">Delete Old Fields?</b><div class="tm-warn">' + W + '<span>This deletes ' + codes(olds()) + ' from Spoolman, along with their values on every filament and spool. It can\'t be undone.</span></div>' +
+        '<div class="note">Your tuning is already in the OrcaSlicer-named fields, so Spoolio won\'t lose anything.</div>' + e +
+        bar('<button class="ghost" data-tm="close"' + dis + '>Cancel</button><button class="del" data-tm="delete"' + dis + '>' + (busy ? "Deleting…" : "Delete Fields") + '</button>');
+    } else if (st === "gone") {
+      h = '<b class="t">Old Fields Deleted</b><div class="ok">' + OK + '<span>Removed ' + pl(res.n || 0, "field") + ' from Spoolman.</span></div>' + bar('<button class="pri" data-tm="close">Done</button>');
+    }
+    box.innerHTML = '<div class="pop" role="dialog" aria-modal="true">' + h + '</div>';
+    box.hidden = false;
+  }
+  function open(s) { st = s; err = ""; busy = false; draw(); }
+  function shut() {
+    if (st === "ask" && !busy) orca.postMessage({ type: "tm_later" });
+    if (!busy) { st = ""; draw(); }
+  }
+  document.addEventListener("click", function (ev) {
+    var t = ev.target.closest ? ev.target.closest("[data-tm],[data-tp]") : null;
+    if (ev.target === box) { shut(); return; }
+    if (!t) return;
+    if (t.dataset.tp) { pick[t.dataset.tp] = t.dataset.v; draw(); return; }
+    var a = t.dataset.tm;
+    if (a === "open") { ev.preventDefault(); if (T) open(T.n ? "ask" : "del"); }
+    else if (a === "later" || a === "close") shut();
+    else if (a === "move") { busy = true; err = ""; draw(); orca.postMessage({ type: "tm_apply", pick: pick }); }
+    else if (a === "ask-del") open("del");
+    else if (a === "delete") { busy = true; err = ""; draw(); orca.postMessage({ type: "tm_delete" }); }
+  });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && st) shut(); });
+  orca.onMessage(function (m) {
+    if (!m) return;
+    if (m.type === "spools" && m.ok && !auto) { auto = true; orca.postMessage({ type: "tm_scan", auto: true }); }
+    else if (m.type === "show_view" && m.view === "settings") orca.postMessage({ type: "tm_scan" });
+    else if (m.type === "tm") { T = m; note(); if (m.auto && m.n && !st) open("ask"); }
+    else if (m.type === "tm_moved" && st) {
+      busy = false;
+      if (!m.ok) { err = m.error || "Spoolman didn't accept it."; draw(); return; }
+      res = m; T.n = m.left || 0; T.fields = m.fields || []; T.rows = []; T.clash = []; note(); st = "moved"; draw();
+    } else if (m.type === "tm_deleted" && st) {
+      busy = false;
+      if (!m.ok) { err = m.error || "Spoolman didn't accept it."; draw(); return; }
+      res = m; T.fields = []; note(); st = "gone"; draw();
+    }
+  });
+"""
+
+
 EMOJI = '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"'
 LOOK_FONTS = [
     ("def", "Default", "Spoolio's current font", "Roboto · Segoe UI · San Francisco · Noto Sans", FONT_STACK),
@@ -8482,6 +8714,7 @@ PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</sp
     <div class="hint">Any filament extra field (or spool extra field when one preset per spool is chosen) whose key matches an OrcaSlicer filament setting overrides the base and assumed values.</div>
     <label class="check-row pm-tn"><input id="pm-tune" type="checkbox">Use Advanced Tuning From Spoolman</label>
     <div class="hint">Adds a Tuning step to Edit Spool for your calibrated values, and offers to update Spoolman whenever it detects a change from the preset.</div>
+    <div id="pm-tm" hidden></div>
     <div class="pm-ck" id="pm-tks"><label class="check-row"><input type="checkbox" data-tk="flow">Flow Ratio</label><label class="check-row"><input type="checkbox" data-tk="pa">Pressure Advance</label><label class="check-row"><input type="checkbox" data-tk="mvs">Max Volumetric Speed</label><label class="check-row"><input type="checkbox" data-tk="rlen">Retraction Length</label><label class="check-row"><input type="checkbox" data-tk="rspd">Retraction Speed</label></div>
     <div class="hint" id="pm-tkh">Anything you leave blank in Spoolman comes from the base preset.</div>
     <div class="pm-sync" id="pm-sync"><span class="pm-dot"></span><span id="pm-st"></span><button type="button" class="pm-btn" id="pm-now">Sync Now</button></div>
@@ -8522,7 +8755,7 @@ PRESET_CSS = """
   #pm-card .pm-ck { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 12px; margin-top: 6px; }
   #pm-card .pm-ck .check-row { margin: 4px 0; }
   #pm-card .pm-tn { margin: 14px 0 0; }
-  #pm-card.pm-tnoff #pm-tks, #pm-card.pm-tnoff #pm-tkh { display: none; }
+  #pm-card.pm-tnoff #pm-tks, #pm-card.pm-tnoff #pm-tkh, #pm-card.pm-tnoff #pm-tm { display: none; }
   #pm-card.pm-off #pm-opts { opacity: .45; pointer-events: none; }
   #pm-card.pm-off .pm-sync { display: none; }
   #pm-card.pm-na .srow-body > .srow-l > *:not(#pm-warn):not(.check-row), #pm-card.pm-na #pm-opts { opacity: .45; pointer-events: none; }
@@ -8688,6 +8921,7 @@ def tab_html(initial_view: str, c: dict) -> str:
 {TAB_SETTINGS_CSS}
 {LOOK_CSS}
 {_fill(EDITOR_CSS, FONT=FONT_STACK)}
+{_fill(MOVE_CSS, FONT=FONT_STACK)}
 {pv}
 {PRESET_CSS}
 </style>
@@ -8710,6 +8944,7 @@ def tab_html(initial_view: str, c: dict) -> str:
 <script>(function (bridge) {{{TAB_PREVIEW_JS}}})(window.__spoolio.settings);</script>
 <script>(function (bridge) {{{look_js}}})(window.__spoolio.settings);</script>
 <script>(function (orca) {{{EDITOR_JS}}})(window.__spoolio.main);</script>
+<script>(function (orca) {{{MOVE_JS}}})(window.__spoolio.main);</script>
 <script>(function (orca) {{{PRESET_JS}}})(window.__spoolio.settings);</script>
 </body>
 </html>
@@ -8784,6 +9019,14 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                 _bg(lambda: self.post_message({"type": "tune_orca", **tune_orca()}))
             elif msg_type == "tune_apply":
                 _bg(self._tune_apply, data)
+            elif msg_type == "tm_scan":
+                _bg(self._tm_scan, data.get("auto") is True)
+            elif msg_type == "tm_later":
+                cfg_edit(lambda s: s.update(tune_move=s.get("tune_move") or "later"))
+            elif msg_type == "tm_apply":
+                _bg(self._tm_do, "tm_moved", lambda: tune_move_apply(data.get("pick")))
+            elif msg_type == "tm_delete":
+                _bg(self._tm_do, "tm_deleted", tune_move_delete)
             elif msg_type == "printer_code":
                 save_printer_code(data.get("id"), data.get("code"))
             elif msg_type == "printer_test":
@@ -8801,6 +9044,17 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
 
     def _spoolman_url(self):
         return cfg().get("spoolman_url", "")
+
+    def _tm_scan(self, auto):
+        r = tune_move_state(auto)
+        if r is not None:
+            self.post_message({"type": "tm", "auto": auto, **r})
+
+    def _tm_do(self, kind, fn):
+        r = fn()
+        self.post_message({"type": kind, **r})
+        if r["ok"]:
+            self._push_data()
 
     def _tune_apply(self, data):
         save = data.get("save") is True
