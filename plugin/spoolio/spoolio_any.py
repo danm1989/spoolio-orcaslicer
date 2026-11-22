@@ -2606,7 +2606,7 @@ def parse_presets(value: object) -> dict:
             "use": {str(k)[:16]: [str(i)[:32] for i in x[:8]] for k, x in list(us.items())[-500:]
                     if isinstance(x, list) and x},
             "take": {k: parse_flag(tk.get(k)) for k in TAKE},
-            "extra_map": parse_flag(v.get("extra_map"), default=True),
+            "extra_map": parse_flag(v.get("extra_map"), default=False),
             "tune": {"on": parse_flag(tn.get("on"), default=False),
                      "keys": {t[0]: parse_flag(tnk.get(t[0]), default=False) for t in TUNE}}}
 
@@ -2876,7 +2876,10 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
                         if t[0] == "pa":
                             d["enable_pressure_advance"] = ["1"]
                     exp[t[0]] = v if v is not None else (_n1(bp.config_value(t[3])) if bp else None)
-            extra_applied = _apply_orca_extras(d, sp, f, c["per"], bp) if c["extra_map"] else {}
+            own = {t[3] for t in TUNE if c["tune"]["on"] and c["tune"]["keys"][t[0]]}
+            if own & {"pressure_advance"}:
+                own.add("enable_pressure_advance")
+            extra_applied = _apply_orca_extras(d, sp, f, c["per"], bp, own) if c["extra_map"] else {}
             out.append({"file": _pfile(name), "json": d, "spool": sp, "printer": p, "cost": cost, "exp": exp,
                         "lvl": lvl, "tv": tv, "extra": extra_applied})
     return out
@@ -3073,9 +3076,13 @@ def _extra_orca_val(raw: object) -> list[str] | None:
     if isinstance(val, bool):
         return ["1" if val else "0"]
     if isinstance(val, (int, float)):
+        if _fin(val) is None:
+            return None
         n = int(val) if isinstance(val, float) and val == int(val) else val
         return [str(n)]
     if isinstance(val, list):
+        if any(isinstance(x, float) and _fin(x) is None for x in val):
+            return None
         items = [str(x) for x in val if x is not None and str(x) != ""]
         return items or None
     if isinstance(val, dict):
@@ -3083,20 +3090,37 @@ def _extra_orca_val(raw: object) -> list[str] | None:
     return [str(val)]
 
 
-def _has_orca_key(bp, key: str) -> bool:
-    """True when key is an OrcaSlicer filament preset setting (including inherited keys)."""
+def _fin(x: object):
+    try:
+        n = float(x)
+    except (TypeError, ValueError):
+        return None
+    return n if n == n and abs(n) != float("inf") else None
+
+
+def _orca_base(bp, key: str):
+    """The base preset's value for key, or None when key isn't an OrcaSlicer filament setting."""
     if not bp or not key or key in PRESET_RESERVED_KEYS:
-        return False
+        return None
     for get in (lambda: bp.full_config_value(key), lambda: bp.config_value(key)):
         try:
-            if get() is not None:
-                return True
+            v = get()
+            if v is not None:
+                return v
         except Exception:
             continue
-    return False
+    return None
 
 
-def _apply_orca_extras(d: dict, sp: dict, f: dict, per: str, bp) -> dict[str, list[str]]:
+def _orca_fits(base: object, val: list[str]) -> bool:
+    """False when the base setting is numeric but val isn't, so one bad value can't spoil the bundle."""
+    b = [x.strip() for x in re.split(r"[,;]", str(base).replace('"', "")) if x.strip()]
+    if b and all(_fin(x) is not None for x in b):
+        return all(_fin(x) is not None for x in val)
+    return True
+
+
+def _apply_orca_extras(d: dict, sp: dict, f: dict, per: str, bp, own: set = frozenset()) -> dict[str, list[str]]:
     """Apply Spoolman extra fields whose keys match OrcaSlicer filament preset keys."""
     ex: dict = {}
     if isinstance(f.get("extra"), dict):
@@ -3107,10 +3131,18 @@ def _apply_orca_extras(d: dict, sp: dict, f: dict, per: str, bp) -> dict[str, li
                 ex[k] = v
     applied: dict[str, list[str]] = {}
     for k in sorted(ex):
-        if not _has_orca_key(bp, k):
+        if k in own or k in ("filament_id", "setting_id", "base_id"):
+            log.warning("Spoolman extra field %s skipped: Spoolio sets this OrcaSlicer setting itself", k)
+            continue
+        base = _orca_base(bp, k)
+        if base is None:
             continue
         val = _extra_orca_val(ex[k])
-        if val is not None:
+        if val is None:
+            continue
+        if not _orca_fits(base, val):
+            log.warning("Spoolman extra field %s skipped: %r doesn't suit this OrcaSlicer setting", k, ex[k])
+        else:
             d[k] = val
             applied[k] = val
     return applied
@@ -8559,7 +8591,7 @@ PRESET_JS = r"""
   function draw(d, full) {
     I = d; C = d.cfg;
     if (full) {
-      $("pm-on").checked = C.on; setRadio("pm-per", C.per); setRadio("pm-base", C.base); $("pm-extra").checked = C.extra_map !== false; $("pm-tune").checked = C.tune.on;
+      $("pm-on").checked = C.on; setRadio("pm-per", C.per); setRadio("pm-base", C.base); $("pm-extra").checked = !!C.extra_map; $("pm-tune").checked = C.tune.on;
       document.querySelectorAll("#pm-card [data-take]").forEach(function (x) { x.checked = C.take[x.dataset.take] !== false; });
       document.querySelectorAll("#pm-card [data-tk]").forEach(function (x) { x.checked = !!C.tune.keys[x.dataset.tk]; });
     }
