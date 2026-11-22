@@ -1277,7 +1277,7 @@ def _local_sync() -> bool:
             thread = threading.Thread(target=_local_run, args=(pid, link, stop), daemon=True)
             _local[pid] = {"link": link, "stop": stop, "thread": thread}
             thread.start()
-        _live["keep"] = bool(wanted) and usage_mode() != "off" and source() == "spoolman"
+        _live["keep"] = bool(wanted) and tracking() and source() == "spoolman"
         return bool(wanted)
 
 
@@ -1729,6 +1729,14 @@ def usage_mode() -> str:
     return value if value in USAGE_MODES else "ask"
 
 
+def stats_only() -> bool:
+    return usage_mode() == "off" and cfg().get("stats_when_off") is True
+
+
+def tracking() -> bool:
+    return usage_mode() != "off" or stats_only()
+
+
 def usage_load() -> dict:
     try:
         data = _read(USAGE_FILE)
@@ -1754,7 +1762,8 @@ def usage_save(data: dict) -> None:
 def usage_state() -> dict:
     enabled = source() == "spoolman"
     data = usage_load()
-    return {"enabled": enabled, "mode": usage_mode(), "prints": data["prints"] if enabled else []}
+    return {"enabled": enabled, "mode": usage_mode(), "stats": cfg().get("stats_when_off") is True,
+            "prints": data["prints"] if enabled else []}
 
 
 def usage_plan(slots: list[dict]) -> None:
@@ -1897,7 +1906,7 @@ def usage_track(dev_id: str, state: dict, has_state: bool) -> list[tuple]:
     """
     job = state.get("job") or {}
     gcode = job.get("gcode_state")
-    if not gcode or source() != "spoolman" or not state.get("link") or usage_mode() == "off":
+    if not gcode or source() != "spoolman" or not state.get("link") or not tracking():
         return []
     events: list[tuple] = []
     if not state.get("loaded"):
@@ -2301,11 +2310,18 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
              "pct": run["pct"], "time": time.time(), "rows": rows, "late": late, "src": src, "state": "pending",
              "tracked": books and bool(run.get("net")),
              "cal": is_cal(run["name"]) or any(i.get("cal") for i in items)}
+    nb = stats_only()
     with _usage_lock:
         data = usage_load()
         if run["id"] in data["done"]:
             return
         data["done"] = [run["id"]] + data["done"][:USAGE_DONE - 1]
+        if nb:
+            usage_save(data)
+            if rows:
+                hist_note(dict(entry, nb=True), by_id)
+                log.info("A print ended (%s, %d%%): recorded in Stats only", run["result"], run["pct"])
+            return
         if rows:
             data["prints"] = ([entry] + [e for e in data["prints"] if e.get("id") != entry["id"]])[:USAGE_PRINTS]
         usage_save(data)
@@ -3315,7 +3331,8 @@ def usage_undo(entry_id: str) -> None:
 def usage_action(data: dict) -> dict:
     kind = data.get("type")
     if kind == "usage_mode":
-        cfg_edit(lambda s: s.__setitem__("book_usage", data.get("mode") if data.get("mode") in USAGE_MODES else "ask"))
+        mode = data.get("mode") if data.get("mode") in USAGE_MODES else "ask"
+        cfg_edit(lambda s: s.update(book_usage=mode, **({"stats_when_off": data["stats"] is True} if "stats" in data else {})))
         _local_sync()
     elif kind == "usage_book":
         usage_book(str(data.get("run") or ""), data.get("rows"))
@@ -3362,15 +3379,17 @@ def hist_note(entry: dict, by_id: dict) -> None:
     old = next((e for e in hist if e.get("id") == entry["id"]), None)
     prev = {r.get("spool"): r for r in (old or {}).get("rows") or []}
     rows = []
+    nb = bool(entry.get("nb"))
     for row in entry["rows"]:
-        if row["state"] != "booked":
+        if row["state"] != "booked" and not nb:
             continue
         sp, p = by_id.get(row["spool"]), prev.get(row["spool"]) or {}
         if sp:
             f = sp.get("filament") or {}
             p = {"label": row.get("label") or _spool_label(sp), "material": f.get("material") or row.get("material") or "",
                  "colour": _hex(sp) or _hex6(row.get("colour")), "cost": _cost(sp, row["grams"])}
-        rows.append({"spool": row["spool"], "grams": row["grams"], "label": p.get("label") or row.get("label") or "",
+        rows.append({"spool": row["spool"], "grams": row["grams"],
+                     "label": p.get("label") or row.get("label") or row.get("preset") or "",
                      "material": p.get("material") or row.get("material") or "",
                      "colour": p.get("colour") or _hex6(row.get("colour")), "cost": p.get("cost"),
                      **{k: row[k] for k in ("ws", "wp") if isinstance(row.get(k), (int, float))}})
@@ -3378,7 +3397,8 @@ def hist_note(entry: dict, by_id: dict) -> None:
     if rows:
         hist.append({"id": entry["id"], "time": entry.get("time") or time.time(), "name": entry.get("name") or "",
                      "printer": entry.get("printer") or "", "result": entry.get("result") or "",
-                     "pct": entry.get("pct"), "rows": rows, **({"cal": True} if entry.get("cal") else {})})
+                     "pct": entry.get("pct"), "rows": rows, **({"cal": True} if entry.get("cal") else {}),
+                     **({"nb": True} if nb else {})})
         hist.sort(key=lambda e: e.get("time") or 0)
     elif old is None:
         return
@@ -3403,6 +3423,10 @@ def spoolman_currency(url: str) -> str:
         log.info("Could not read the currency from Spoolman: %s", exc)
     _cur.update(url=url, code=code, time=time.monotonic())
     return code
+
+
+def _hkey(r: dict) -> object:
+    return r["spool"] if r.get("spool") is not None else "?" + (r.get("label") or r.get("material") or "")
 
 
 def stats_data(period: object) -> dict:
@@ -3431,7 +3455,7 @@ def stats_data(period: object) -> dict:
         for r in e["rows"]:
             m = (r.get("material") or "Other").strip() or "Other"
             mats[m] = mats.get(m, 0) + r["grams"]
-            t = top.setdefault(r["spool"], {"label": r["label"], "colour": r["colour"], "g": 0})
+            t = top.setdefault(_hkey(r), {"label": r["label"], "colour": r["colour"], "g": 0})
             t["g"] += r["grams"]
     week0 = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday - lt.tm_wday, 0, 0, 0, 0, 0, -1))
     weeks = []
@@ -3442,14 +3466,14 @@ def stats_data(period: object) -> dict:
         for e in hist:
             if a <= (e.get("time") or 0) < b:
                 for r in e["rows"]:
-                    k = parts.setdefault(r["spool"], {"label": r["label"], "colour": r["colour"], "g": 0})
+                    k = parts.setdefault(_hkey(r), {"label": r["label"], "colour": r["colour"], "g": 0})
                     k["g"] += r["grams"]
         weeks.append({"start": a, "now": a == week0,
                       "parts": sorted(parts.values(), key=lambda x: -x["g"])})
     low = parse_low(cfg().get("low_stock_grams"))
     rate: dict = {}
     for e in hist:
-        if (e.get("time") or 0) >= now - 28 * 86400:
+        if (e.get("time") or 0) >= now - 28 * 86400 and not e.get("nb"):
             for r in e["rows"]:
                 rate[r["spool"]] = rate.get(r["spool"], 0) + r["grams"] / 4
     out, nlow = [], 0
@@ -3504,7 +3528,8 @@ def stats_data(period: object) -> dict:
             "top": sorted(top.values(), key=lambda x: -x["g"])[:5], "weeks": weeks, "soon": out[:5],
             "waste": ws if ws["prints"] else None, "worst": sorted(worst, key=lambda x: -x["g"])[:3],
             "history": [{"time": e["time"], "name": e["name"], "printer": e["printer"], "result": e["result"],
-                         "pct": e.get("pct"), "rows": e["rows"], "cal": bool(e.get("cal") or is_cal(e.get("name") or ""))}
+                         "pct": e.get("pct"), "rows": e["rows"], "nb": bool(e.get("nb")),
+                         "cal": bool(e.get("cal") or is_cal(e.get("name") or ""))}
                         for e in reversed(sel)]}
 
 
@@ -4455,6 +4480,18 @@ MAIN_PAGE = """
   .rb-sp .d { width: 12px; height: 12px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, 0.15); flex: none; }
   .rb-sp .w { display: flex; gap: 6px; color: var(--orca-muted); font-size: 12px; padding-left: 22px; }
   .rb-sp .w b { color: #3fb950; }
+  .rb-mask.dnt-in { animation: pc-fade .18s ease-out; }
+  .rb-mask.dnt-in .rb-pop { animation: pc-pop .22s ease-out; }
+  .dnt-warn .dnt-in { animation: pc-fade .2s ease-out; }
+  @media (prefers-reduced-motion: reduce) { .dnt-in, .dnt-in .rb-pop { animation: none !important; } }
+  .dnt-opt { display: flex; gap: 10px; align-items: center; margin-top: 12px; padding: 10px 12px; border: 1px solid var(--orca-border); border-radius: 8px; cursor: pointer; }
+  .dnt-opt.on { border-color: var(--orca-accent); background: color-mix(in srgb, var(--orca-accent) 10%, transparent); }
+  .dnt-opt input { margin: 0; accent-color: var(--orca-accent); }
+  .dnt-opt b { display: block; }
+  .dnt-warn { display: flex; gap: 10px; align-items: flex-start; margin-top: 10px; padding: 10px 12px; border: 1px solid rgba(210, 153, 34, 0.45); border-radius: 8px; background: rgba(210, 153, 34, 0.14); color: #e0a030; font-size: 12px; line-height: 1.45; }
+  .dnt-warn svg { flex: none; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .dnt-note { flex-basis: 100%; color: var(--orca-muted); font-size: 12px; margin-top: -4px; }
+  .ph .nb { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 99px; background: rgba(210, 153, 34, 0.22); color: #e0a030; margin-left: 6px; }
   .rb-bar { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
   #usage-slot:empty, #progress-slot:empty { display: none; }
   #usage-slot { margin-top: 14px; }
@@ -4635,6 +4672,7 @@ MAIN_PAGE = """
     let usageBooking = false;
     let usageUndoing = false;
     let rbUndo = null;
+    let dnt = null;
     let rbOpen = false;
     try { rbOpen = localStorage.getItem("spoolio.bookings") === "1"; } catch (err) {}
     let plateAttn = false;
@@ -4839,20 +4877,37 @@ MAIN_PAGE = """
         (usageUndoing ? " disabled" : "") + '>' + (usageUndoing ? "Adding Back..." : "Add Back to Spoolman") + '</button></div></div></div>';
     }
 
+    function dntPop() {
+      const fresh = dnt.fresh, warn = dnt.warn;
+      dnt.fresh = dnt.warn = false;
+      return '<div class="rb-mask' + (fresh ? ' dnt-in' : '') + '" data-usage="dnt-cancel"><div class="rb-pop"><b class="t">Stop Tracking Filament?</b>' +
+        '<div class="dnt-warn"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18h.01"/></svg>' +
+        '<span>Spoolio will no longer consume filament from your spools in Spoolman when a print finishes.' +
+        (dnt.stats ? '' : ' <span' + (warn ? ' class="dnt-in"' : '') + '>Turning off booking also stops Stats tracking unless Keep Tracking Stats is ticked.</span>') +
+        '</span></div>' +
+        '<label class="dnt-opt' + (dnt.stats ? ' on' : '') + '"><input type="checkbox" data-usage="dnt-stats"' + (dnt.stats ? ' checked' : '') + '>' +
+        '<span><b>Keep Tracking Stats</b></span></label>' +
+        '<div class="rb-bar"><button class="sbtn ghost" data-usage="dnt-cancel">Cancel</button><button class="sbtn primary" data-usage="dnt-ok">' +
+        (dnt.stats ? 'Stop Booking Only' : 'Stop Tracking') + '</button></div></div></div>';
+    }
+
     function renderUsage() {
       syncDot();
       if (!usage.enabled || (!liveOn && !usage.prints.length)) { usageSlot.innerHTML = ""; return; }
       const mode = '<label>When a Print Finishes <select data-usage="mode">' + [["ask", "Ask Me Before Booking"], ["auto", "Book Automatically"], ["off", "Do Not Track"]].map(function (m) {
         return '<option value="' + m[0] + '"' + (usage.mode === m[0] ? " selected" : "") + '>' + m[1] + '</option>';
       }).join("") + '</select></label>';
+      const note = usage.mode === "off" ? '<div class="dnt-note">' + (usage.stats ? 'Prints are still recorded in Stats. Your spools in Spoolman are not changed.' :
+        'Prints are not booked or recorded in Stats.') + '</div>' : "";
+      const chip = usage.mode === "off" ? '<span class="u-chip' + (usage.stats ? '' : ' warn') + '">' + (usage.stats ? 'Stats Only' : 'Not Tracking') + '</span>' : "";
       const list = usage.prints.slice(0, 5);
       const todo = list.filter(function (p) { return p.state === "pending"; }).length;
       const head = list.length ? '<div class="rb-h" data-usage="toggle"><span class="arrow">' + (rbOpen ? "▾" : "▸") + '</span><b>Recent Bookings</b>' +
         '<span class="sub">Last ' + list.length + (list.length === 1 ? ' Print' : ' Prints') + '</span>' +
         (todo ? '<span class="u-chip warn">' + todo + ' To Book</span>' : "") + '</div>' : "";
       const body = list.length && rbOpen ? '<div class="rb-list">' + list.map(rbCard).join("") + '</div>' : "";
-      usageSlot.innerHTML = '<div class="usage"><div class="usage-bar"><b>Filament Usage</b><span class="sub"></span>' + mode + '</div>' +
-        head + body + '</div>' + (rbUndo ? rbPop() : "");
+      usageSlot.innerHTML = '<div class="usage"><div class="usage-bar"><b>Filament Usage</b>' + chip + '<span class="sub"></span>' + mode + note + '</div>' +
+        head + body + '</div>' + (rbUndo ? rbPop() : "") + (dnt ? dntPop() : "");
     }
 
     function setUsage(u, done) {
@@ -4873,7 +4928,14 @@ MAIN_PAGE = """
       const kind = e.target.dataset.usage;
       const card = e.target.closest(".u-card");
       const row = e.target.closest(".u-row");
-      if (kind === "mode") {
+      if (kind === "dnt-stats") {
+        dnt.stats = e.target.checked;
+        dnt.warn = !dnt.stats;
+        renderUsage();
+      } else if (kind === "mode" && e.target.value === "off") {
+        dnt = { from: usage.mode, stats: !!usage.stats, fresh: true };
+        renderUsage();
+      } else if (kind === "mode") {
         usage.mode = e.target.value;
         orca.postMessage({ type: "usage_mode", mode: e.target.value });
       } else if (kind === "spool" && card && row) {
@@ -4896,7 +4958,17 @@ MAIN_PAGE = """
       if (!btn || btn.disabled) return;
       const kind = btn.dataset.usage;
       const card = e.target.closest(".u-card");
-      if (kind === "toggle") {
+      if (kind === "dnt-cancel") {
+        if (e.target !== btn) return;
+        dnt = null;
+      } else if (kind === "dnt-ok") {
+        usage.mode = "off";
+        usage.stats = dnt.stats;
+        dnt = null;
+        orca.postMessage({ type: "usage_mode", mode: "off", stats: usage.stats });
+      } else if (kind === "dnt-stats") {
+        return;
+      } else if (kind === "toggle") {
         rbOpen = !rbOpen;
         try { localStorage.setItem("spoolio.bookings", rbOpen ? "1" : "0"); } catch (err) {}
       } else if (kind === "cancel") {
@@ -5488,7 +5560,7 @@ MAIN_PAGE = """
         const cost = costs.length ? costs.reduce(function (a, r) { return a + r.cost; }, 0) : null;
         const wg = stWaste(e);
         const fail = (e.result === "cancelled" ? '<span class="fail">Failed at ' + (e.pct || 0) + '%</span>' : '') +
-          (e.cal ? '<span class="cal">Calibration</span>' : '');
+          (e.cal ? '<span class="cal">Calibration</span>' : '') + (e.nb ? '<span class="nb">Tracking Only</span>' : '');
         return '<tr><td class="d">' + stDate(e.time) + '</td><td><span class="nm">' + esc(e.name || "Print") + '</span>' + fail +
           (e.printer ? '<br><span class="pr">' + esc(e.printer) + '</span>' : '') + '</td><td><div class="mats">' + e.rows.map(function (r) {
             return '<span class="m" title="' + esc(r.label) + '"><i style="background:' + stCol(r.colour) + '"></i>' + esc(r.material || "") + ' ' + r.grams.toFixed(1) + ' g</span>';
