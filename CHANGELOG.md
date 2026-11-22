@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.12.0] - 2026-11-22
+
+Do Not Track can now keep recording your prints in Stats without consuming filament from your spools in Spoolman. Pages now slide in as you move around Spoolio, and the animations added in 0.11.1 are once again fixed. This update also fixes a bug identified on the usage booking, which could fail on every print since 0.11.0 (sorry about that - details below). Moonraker (specifically for the Snapmaker U1) now prints against the right spool when the printer moves a filament to a different toolhead.
+
+### Added
+- Choosing Do Not Track under When a Print Finishes now asks you to confirm first. Tick 'Keep Tracking Stats' to stop filament booking only: your prints are still recorded in Stats, but it's usage is not consumed in Spoolman. This is directly aimed for those who use the Spoolman intergration through Moonraker, which should handle all the material consumption for you, whilst allowing you to retain the function of the Stats tab. 
+
+- While Do Not Track is on, the Filament Usage bar shows Stats Only or a Not Tracking chip. Prints recorded this way are marked Tracking Only in Print History.
+
+- Pages now slide in from the direction you're moving when you switch between the Spools, Printer and Stats tabs, open or close Settings, or move between Settings tabs, with each card rising in just after the one before it. The highlight on the tab bar glides across to the tab you picked. Reduce Motion under Appearance > Configure Accessibility turns this off too.
+
+### Fixed
+- Fixed an issue where Spoolio's animations never played, including the pulsing Live dot and the moving bar on Print Progress. The animations were being broken when Spoolio applied its styles to the page, so the fix in 0.11.2 didn't take effect.
+
+- Fixed an issue where Spoolio could fail to book filament usage at the end of a print. Since 0.11.0, a helper added for filament presets shared its name with the one that records which spools were loaded at the start of a print, so saving that information failed and the print couldn't be booked.
+
+- Fixed a specific issue for Snapmaker U1 prints being booked against the wrong spool when the printer assigns a filament to a different toolhead than the slice. Spoolio now reads the printer's own filament to toolhead map, so usage goes to the spool that actually printed.
+
 ## [0.11.6] - 2026-11-20
 
 ### Fixed
