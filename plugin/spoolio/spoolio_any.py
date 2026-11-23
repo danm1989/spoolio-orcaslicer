@@ -2654,6 +2654,11 @@ def _papi():
     return (pb(), rl) if callable(pb) and callable(rl) else None
 
 
+def _reload():
+    rl = getattr(getattr(getattr(getattr(orca, "host", None), "preset", None), "bundles", None), "reload_local", None)
+    return rl if callable(rl) else None
+
+
 def _strs(v: object) -> list[str]:
     """A serialized string-list setting, like '"PLA";"PETG"', as a list."""
     if v is None:
@@ -2697,6 +2702,8 @@ def _pdir(pb) -> Path:
     root = DATA_DIR.parent / "user"
     for c in (pb.filaments, pb.printers, pb.prints):
         for p in _all(c):
+            if p.is_system or p.is_default:
+                continue
             try:
                 parts = Path(p.file or "").resolve().relative_to(root.resolve()).parts
             except (ValueError, OSError):
@@ -2709,11 +2716,10 @@ def _pdir(pb) -> Path:
 _pfold: dict = {"d": None}
 
 
-def _pfind(pb) -> Path:
+def _pfind(first: Path) -> Path:
     """The bundle folder in OrcaSlicer's active user folder, checked with list_ids when it can be."""
     if _pfold["d"]:
         return _pfold["d"]
-    first = _pdir(pb)
     ids = getattr(getattr(getattr(getattr(orca, "host", None), "preset", None), "bundles", None), "list_ids", None)
     if not callable(ids):
         return first
@@ -2782,6 +2788,53 @@ def _bases(pb) -> list[dict]:
     return out
 
 
+# Workers read this copy, never OrcaSlicer's live presets, which its own thread moves.
+_snap: dict = {"ok": False, "groups": {}, "bases": [], "dir": None, "vals": {}, "want": set()}
+
+
+def _skeys() -> set:
+    keys = {t[3] for t in TUNE} | set(_snap["want"])
+    if parse_presets(cfg().get("presets"))["extra_map"]:
+        for sp in _spool_cache["spools"]:
+            for h in (sp, sp.get("filament")) if isinstance(sp, dict) else ():
+                if isinstance(h, dict) and isinstance(h.get("extra"), dict):
+                    keys.update(str(k) for k in h["extra"])
+    return keys - PRESET_RESERVED_KEYS
+
+
+def psnap() -> None:
+    """Run on OrcaSlicer's own thread only (on_message)."""
+    api = _papi()
+    if not api:
+        _snap["ok"] = False
+        return
+    try:
+        pb = api[0]
+        bases = _bases(pb)
+        keys = _skeys()
+        vals = _snap["vals"]
+        for b in bases:
+            have = vals.setdefault(b["n"], {})
+            miss = [k for k in keys if k not in have]
+            p = pb.filaments.find_preset(b["n"]) if miss else None
+            for k in miss:
+                try:
+                    have[k] = p.config_value(k) if p else None
+                except Exception:
+                    have[k] = None
+        _snap.update(ok=True, groups=_groups(pb), bases=bases, dir=_pdir(pb), want=set())
+    except Exception:
+        log.exception("Couldn't read OrcaSlicer's presets")
+
+
+def _bval(base: str, key: str):
+    have = _snap["vals"].get(base) or {}
+    if key not in have:
+        _snap["want"].add(key)
+        return None
+    return have[key]
+
+
 def _base(bases: list[dict], f: dict, names: list[str], pick: str = "") -> str:
     mat = str(f.get("material") or "").upper()
     ven = str((f.get("vendor") or {}).get("name") or "").lower()
@@ -2809,8 +2862,10 @@ def _kg_cost(sp: dict, f: dict):
     return None
 
 
-def _pfile(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]', "-", name).strip(" .") + ".json"
+def _pname(name: str) -> str:
+    """OrcaSlicer names presets after their file."""
+    n = re.sub(r"\s+", " ", re.sub(r'[\\/:*?"<>|\x00-\x1f]', "-", name)).strip(" .")
+    return n or "Filament"
 
 
 def _in_use(spools: list) -> dict[str, set]:
@@ -2835,10 +2890,10 @@ def _in_use(spools: list) -> dict[str, set]:
     return out
 
 
-def build_presets(c: dict, spools: list, pb, only: str = "",
+def build_presets(c: dict, spools: list, only: str = "",
                   skipped: list | None = None) -> list[dict]:
     """The presets for the ticked printers: one per filament, or per spool."""
-    groups = _groups(pb)
+    groups = _snap["groups"]
     prs = [(p, groups[c["printers"][p["id"]]["group"]]) for p in printers_cfg()
            if c["printers"].get(p["id"], {}).get("on") and c["printers"][p["id"]]["group"] in groups
            and (not only or p["id"] == only)]
@@ -2868,8 +2923,9 @@ def build_presets(c: dict, spools: list, pb, only: str = "",
                 x = f"{n} ({vn})" if vn and sum((s["filament"].get("vendor") or {}).get("name") == vn for s in sps) == 1 \
                     else f"{n} #{f.get('id')}"
             label[id(sp)] = f"{x} #{sp['id']}" if c["per"] == "spool" else x
-    bases = _bases(pb) if prs else []
+    bases = _snap["bases"] if prs else []
     out = []
+    used: set = set()
     matched: set = set()
     unmatched: dict = {}
     for p, nz in prs:
@@ -2877,7 +2933,11 @@ def build_presets(c: dict, spools: list, pb, only: str = "",
             if key in want and p["id"] not in want[key]:
                 continue
             f = sp["filament"]
-            name = f"{label[id(sp)]} @ {p['name']}"
+            name = _pname(f"{label[id(sp)]} @ {p['name']}")
+            n = 1
+            while name.casefold() in used:
+                n += 1
+                name = _pname(f"{label[id(sp)]} ({n}) @ {p['name']}")
             base = _base(bases, f, nz, c["bases"].get(str(f.get("material") or "").upper(), "") if c["base"] == "pick" else "")
             if not base:
                 if skipped is not None:
@@ -2889,6 +2949,7 @@ def build_presets(c: dict, spools: list, pb, only: str = "",
                     })
                 continue
             matched.add(key)
+            used.add(name.casefold())
             d = {"type": "filament", "name": name, "from": "User", "version": PLUGIN_VERSION, "instantiation": "true",
                  "inherits": base,
                  "filament_settings_id": [name], "compatible_printers": nz, "compatible_printers_condition": ""}
@@ -2900,8 +2961,7 @@ def build_presets(c: dict, spools: list, pb, only: str = "",
             if ven:
                 d["filament_vendor"] = [ven]
             for k, keys, on in (("settings_extruder_temp", ("nozzle_temperature", "nozzle_temperature_initial_layer"), tk["temps"]),
-                                ("settings_bed_temp", ("hot_plate_temp", "hot_plate_temp_initial_layer",
-                                                       "textured_plate_temp", "textured_plate_temp_initial_layer"), tk["temps"]),
+                                ("settings_bed_temp", BED_KEYS, tk["temps"]),
                                 ("density", ("filament_density",), tk["dens"]), ("diameter", ("filament_diameter",), tk["dens"])):
                 v = _num_or(f.get(k))
                 if v and on:
@@ -2909,7 +2969,6 @@ def build_presets(c: dict, spools: list, pb, only: str = "",
             cost = _kg_cost(sp, f) if tk["cost"] else None
             if cost:
                 d["filament_cost"] = [str(cost)]
-            bp = pb.filaments.find_preset(base) if (c["tune"]["on"] or c["extra_map"]) else None
             exp, lvl, tv = {}, {}, {}
             if c["tune"]["on"]:
                 tv, lvl = tune_of(sp, c["per"])
@@ -2921,12 +2980,12 @@ def build_presets(c: dict, spools: list, pb, only: str = "",
                         d[t[3]] = [str(v)]
                         if t[0] == "pa":
                             d["enable_pressure_advance"] = ["1"]
-                    exp[t[0]] = v if v is not None else (_n1(bp.config_value(t[3])) if bp else None)
+                    exp[t[0]] = v if v is not None else _nums(_bval(base, t[3]))
             own = {t[3] for t in TUNE if c["tune"]["on"] and c["tune"]["keys"][t[0]]}
             if own & {"pressure_advance"}:
                 own.add("enable_pressure_advance")
-            extra_applied = _apply_orca_extras(d, sp, f, c["per"], bp, own) if c["extra_map"] else {}
-            out.append({"file": _pfile(name), "json": d, "spool": sp, "printer": p, "cost": cost, "exp": exp,
+            extra_applied = _apply_orca_extras(d, sp, f, c["per"], base, own) if c["extra_map"] else {}
+            out.append({"file": name + ".json", "json": d, "spool": sp, "printer": p, "cost": cost, "exp": exp,
                         "lvl": lvl, "tv": tv, "extra": extra_applied})
     if skipped is not None:
         skipped.extend(v for k, v in unmatched.items() if k not in matched)
@@ -2953,15 +3012,14 @@ def presets_sync(spools: list | None = None, force: bool = False) -> dict:
 def _psync_once(spools: list | None, force: bool) -> bool:
     """One sync; False when OrcaSlicer's user folder moved and it's worth another go."""
     c = parse_presets(cfg().get("presets"))
-    api = _papi()
-    if not api:
-        if c["on"]:
+    reload = _reload()
+    if not reload or not _snap["ok"]:
+        if c["on"] and not reload:
             _pst.update(err="This version of OrcaSlicer can't add presets.")
         _pst["skipped"] = []
         _post_preset_warn([], c["per"])
         return True
-    pb, reload = api
-    d = _pfind(pb) if c["on"] else (_pfold["d"] or _pdir(pb))
+    d = _pfind(_snap["dir"]) if c["on"] else (_pfold["d"] or _snap["dir"])
     fd = d / "filament"
     if not c["on"] and not fd.is_dir():
         _pst["skipped"] = []
@@ -2980,7 +3038,10 @@ def _psync_once(spools: list | None, force: bool) -> bool:
                 spools = res["spools"]
             else:
                 spools = _spool_cache["spools"]
-        es = build_presets(c, spools, pb, skipped=skipped)
+        es = build_presets(c, spools, skipped=skipped)
+        if _snap["want"]:
+            log.info("Preset sync waits for OrcaSlicer's values of %s", ", ".join(sorted(_snap["want"])))
+            return True
         files = {e["file"]: json.dumps(e["json"], indent=2) + "\n" for e in es}
         _pmap.clear()
         _pmap.update({e["json"]["name"]: e for e in es})
@@ -3020,11 +3081,9 @@ def presets_info(want: object = None) -> dict:
     c = parse_presets({**want, "use": saved["use"]}) if isinstance(want, dict) else saved
     out = {"type": "presets_info", "cfg": c, "api": False, "printers": [], "groups": [], "materials": [],
            "status": dict(_pst), "sample": None, "skipped": [], "skip_msg": ""}
-    api = _papi()
-    if not api:
+    if not _snap["ok"]:
         return out
-    pb = api[0]
-    groups = _groups(pb)
+    groups = _snap["groups"]
     out["api"] = True
     out["groups"] = list(groups)
     for p in printers_cfg():
@@ -3038,14 +3097,14 @@ def presets_info(want: object = None) -> dict:
     mats = sorted({str(sp["filament"].get("material") or "").upper() for sp in spools
                    if isinstance(sp.get("filament"), dict) and sp["filament"].get("material")})
     if c["base"] == "pick" and mats:
-        bases = _bases(pb)
+        bases = _snap["bases"]
         for m in mats:
             opts = sorted({b["n"].split("@")[0].strip() for b in bases if b["t"] == m})[:80]
             out["materials"].append({"m": m, "opts": opts, "pick": c["bases"].get(m, "")})
     first = next((p for p in out["printers"] if p["on"] and p["group"]), None)
     if first and spools:
         skipped: list[dict] = []
-        es = build_presets(c, spools, pb, first["id"], skipped=skipped)
+        es = build_presets(c, spools, first["id"], skipped=skipped)
         if c["on"]:
             out["skipped"] = skipped
             out["skip_msg"] = _skip_msg(skipped, c["per"])
@@ -3096,11 +3155,9 @@ PRESET_RESERVED_KEYS = (
      "filament_settings_id", "compatible_printers", "compatible_printers_condition", "tag"}
     | set(TUNE_OLD.values()) | {PA_BY}
 )
-TEMP_PREVIEW_KEYS = {
-    "nozzle_temperature", "nozzle_temperature_initial_layer",
-    "hot_plate_temp", "hot_plate_temp_initial_layer",
-    "textured_plate_temp", "textured_plate_temp_initial_layer",
-}
+BED_KEYS = tuple(f"{x}_plate_temp{y}" for x in ("supertack", "cool", "textured_cool", "eng", "hot", "textured")
+                 for y in ("", "_initial_layer"))
+TEMP_PREVIEW_KEYS = {"nozzle_temperature", "nozzle_temperature_initial_layer", *BED_KEYS}
 _tune_q: dict = {}
 
 
@@ -3169,18 +3226,11 @@ def _fin(x: object):
     return n if n == n and abs(n) != float("inf") else None
 
 
-def _orca_base(bp, key: str):
+def _orca_base(base: str, key: str):
     """The base preset's value for key, or None when key isn't an OrcaSlicer filament setting."""
-    if not bp or not key or key in PRESET_RESERVED_KEYS:
+    if not base or not key or key in PRESET_RESERVED_KEYS:
         return None
-    for get in (lambda: bp.full_config_value(key), lambda: bp.config_value(key)):
-        try:
-            v = get()
-            if v is not None:
-                return v
-        except Exception:
-            continue
-    return None
+    return _bval(base, key)
 
 
 def _orca_fits(base: object, val: list[str]) -> bool:
@@ -3191,7 +3241,7 @@ def _orca_fits(base: object, val: list[str]) -> bool:
     return True
 
 
-def _apply_orca_extras(d: dict, sp: dict, f: dict, per: str, bp, own: set = frozenset()) -> dict[str, list[str]]:
+def _apply_orca_extras(d: dict, sp: dict, f: dict, per: str, bp: str, own: set = frozenset()) -> dict[str, list[str]]:
     """Apply Spoolman extra fields whose keys match OrcaSlicer filament preset keys."""
     ex: dict = {}
     if isinstance(f.get("extra"), dict):
@@ -3256,6 +3306,16 @@ def tune_of(sp: dict, per: str) -> tuple[dict, dict]:
     return out, lvl
 
 
+def _nums(v: object) -> list | None:
+    ns = [n for x in re.split(r"[,;]", str(v if v is not None else "").replace('"', ""))
+          if (n := _num_or(x.strip())) is not None]
+    return ns or None
+
+
+def _cells(v: object) -> list[str]:
+    return [x.strip() for x in re.split(r"[,;]", str(v if v is not None else "").replace('"', ""))]
+
+
 def _n1(v: object):
     return _num_or(re.split(r"[,;]", str(v if v is not None else "").replace('"', ""))[0].strip())
 
@@ -3309,8 +3369,10 @@ def tune_orca() -> dict:
 
 
 def _tune_item(src: str, sp: dict, p: dict, k: str, old, new, lvl: str) -> dict | None:
-    if new is None or (old is not None and abs(float(new) - float(old)) < 1e-6):
+    olds = [x for x in (old if isinstance(old, list) else [old]) if x is not None]
+    if new is None or any(abs(float(new) - float(x)) < 1e-6 for x in olds):
         return None
+    old = olds[0] if olds else None
     f = sp.get("filament") or {}
     iid = f"{f.get('id')}|{sp.get('id') if lvl == 'spool' else ''}|{p['id']}|{k}|{new}"
     if iid in (cfg().get("tune_skip") or []):
@@ -3328,14 +3390,23 @@ def tune_check(ctx) -> None:
         return
     names = split_list(ctx.config_value("filament_settings_id"))
     keys = [t for t in TUNE if c["tune"]["keys"][t[0]]]
-    cols = {t[0]: split_list(ctx.config_value(t[3])) for t in keys}
+    cols = {t[0]: _cells(ctx.config_value(t[3])) for t in keys}
+    # H2D/H2C: one value per filament variant.
+    owner = [_int(x, 0) for x in _cells(ctx.config_value("filament_self_index"))]
+    owner = owner if all(o > 0 for o in owner) else []
     new = 0
     for i, n in enumerate(names):
         e = _pmap.get(n.split("/", 2)[-1] if n.startswith("_local/") else n)
         if not e:
             continue
         for t in keys:
-            v = _num_or(cols[t[0]][i].strip()) if i < len(cols[t[0]]) else None
+            col = cols[t[0]]
+            vals = [col[j] for j, o in enumerate(owner) if o == i + 1] if owner and len(col) == len(owner) else \
+                [col[i]] if i < len(col) else []
+            exp = e["exp"].get(t[0])
+            exps = exp if isinstance(exp, list) else [exp]
+            v = next((x for x in (_num_or(y.strip()) for y in vals)
+                      if x is not None and not any(o is not None and abs(x - o) < 1e-6 for o in exps)), None)
             it = _tune_item("slice", e["spool"], e["printer"], t[0], e["exp"].get(t[0]), v,
                             "fil" if t[0] == "pa" else e["lvl"].get(t[0], "fil"))
             if it and it["id"] not in _tune_q:
@@ -9125,6 +9196,8 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
             data = json.loads(arg0) if isinstance(arg0, str) else arg0
             if not isinstance(data, dict):
                 return
+            if data.get("type") in ("ready", "refresh", "save", "presets_info", "presets_sync"):
+                psnap()
             if data.get("view") == "settings":
                 self._on_settings(data)
                 return
@@ -9159,7 +9232,7 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
             elif msg_type == "new_skip":
                 new_skip(data.get("uid"))
             elif msg_type == "tune_orca":
-                _bg(lambda: self.post_message({"type": "tune_orca", **tune_orca()}))
+                self.post_message({"type": "tune_orca", **tune_orca()})
             elif msg_type == "tune_apply":
                 _bg(self._tune_apply, data)
             elif msg_type == "tm_scan":
