@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.13.0] - 2026-11-22
+
+Spoolio can now carry any OrcaSlicer filament setting straight from Spoolman. If a filament (or spool) extra field in Spoolman has the same name as an OrcaSlicer filament setting, Spoolio can put its value into the matching preset. Thanks to heliodsn for this contribution. To go with it, Advanced Tuning now keeps your calibrated values under OrcaSlicer's own setting names, so both features share one field, and Spoolio offers to move your existing values across for you.
+
+### Added
+- Added Map Matching Spoolman Extra Fields under Configure OrcaSlicer Presets. When ticked, any filament extra field whose key matches an OrcaSlicer filament setting, such as `nozzle_temperature_initial_layer` or `filament_max_volumetric_speed`, overrides the base preset's value. When you pick one preset per spool, spool extra fields are used too and win over the filament's. (#8 (@heliodsn))
+
+- Spoolio checks each value before using it. If an OrcaSlicer setting expects a number and the extra field holds something else (for example "245 C"), or the value is NaN or Infinity, that field is skipped and noted in Spoolio's log, so one bad value can't stop OrcaSlicer loading the presets.
+
+- Extra fields that would clash with settings Spoolio already manages are skipped and noted in the log. With Use Advanced Tuning From Spoolman on, your calibrated values always win over an extra field of the same name. Extra fields named `filament_id` or `setting_id` are never used, as OrcaSlicer relies on these to identify the material and the presets.
+
+- The preset preview now lists any settings taken from your extra fields, so you can see what will change before you sync.
+
+- The first time your spools load after updating, Spoolio shows you which old tuning fields are still in use and offers to Move Values into the new ones. If a filament or spool already has a different value under the new name, you choose which one to keep, with your calibrated value picked to start with.
+
+- After moving, Spoolio can delete the old fields from Spoolman for you. It asks you to confirm first, and only deletes them once every value has been moved.
+
+- Choosing Not Now stops the popup coming back. A note under Use Advanced Tuning From Spoolman in Settings lets you move the values, or delete the old fields, whenever you're ready.
+
+### Changed
+- Advanced Tuning now saves Flow Ratio, Max Volumetric Speed, Retraction Length and Retraction Speed to Spoolman extra fields named after OrcaSlicer's settings (`filament_flow_ratio`, `filament_max_volumetric_speed`, `filament_retraction_length` and `filament_retraction_speed`). Pressure Advance already used OrcaSlicer's name, and Pressure Advance by Printer is unchanged.
+
+- Until you move them, Spoolio still reads your values from the old fields (`flow_ratio`, `max_volumetric_speed`, `retraction_length`, `retraction_speed`), so your presets keep their tuning straight after updating.
+
+- Slowed the glow that sweeps across the Print Progress bar to a third of its old speed, so it's calmer to watch during a print.
+
+- The preset preview now shows first layer nozzle and bed temperatures when they differ from the rest of the print, and falls back to the textured plate temperature when no hot plate temperature is set.
+
 ## [0.12.0] - 2026-11-22
 
 Do Not Track can now keep recording your prints in Stats without consuming filament from your spools in Spoolman. Pages now slide in as you move around Spoolio, and the animations added in 0.11.1 are once again fixed. This update also fixes a bug identified on the usage booking, which could fail on every print since 0.11.0 (sorry about that - details below). Moonraker (specifically for the Snapmaker U1) now prints against the right spool when the printer moves a filament to a different toolhead.
