@@ -2583,9 +2583,44 @@ def _where(unit_id: int, slot: int) -> str:
 
 PRESET_ID = "spoolio"
 NOZZLE_RE = re.compile(r"\s*[(\-]?\s*\d+(?:\.\d+)?\s*(?:mm\s*)?nozzle\)?", re.I)
-_pst: dict = {"n": 0, "time": "", "err": ""}
+_pst: dict = {"n": 0, "time": "", "err": "", "skipped": []}
 _pmap: dict = {}
 _psync = threading.Lock()
+
+
+def _skip_msg(skipped: list[dict], per: str) -> str:
+    if not skipped:
+        return ""
+    noun = "spool" if per == "spool" else "filament"
+    n = len(skipped)
+    head = ", ".join(f"{x['name']} ({x['mat']})" for x in skipped[:3])
+    more = f" (+{n - 3} more)" if n > 3 else ""
+    return (
+        f"No OrcaSlicer preset created for {n} {noun}{'' if n == 1 else 's'} "
+        f"(no matching OrcaSlicer material): {head}{more}. "
+        "Update the material in Spoolman (for example PLA+ to PLA) to include them."
+    )
+
+
+def _post_preset_warn(skipped: list[dict], per: str) -> None:
+    page = _plate["page"]
+    if page is not None:
+        key = "|".join(f"{x['name']}:{x['mat']}" for x in skipped)
+        fids = (
+            sorted({x["fid"] for x in skipped if x.get("fid") is not None})
+            if per == "filament" else []
+        )
+        sids = (
+            sorted({x["sid"] for x in skipped if x.get("sid") is not None})
+            if per == "spool" else []
+        )
+        page.post_message({
+            "type": "preset_warn",
+            "msg": _skip_msg(skipped, per),
+            "key": key,
+            "fids": fids,
+            "sids": sids,
+        })
 
 
 def parse_presets(value: object) -> dict:
@@ -2800,7 +2835,8 @@ def _in_use(spools: list) -> dict[str, set]:
     return out
 
 
-def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
+def build_presets(c: dict, spools: list, pb, only: str = "",
+                  skipped: list | None = None) -> list[dict]:
     """The presets for the ticked printers: one per filament, or per spool."""
     groups = _groups(pb)
     prs = [(p, groups[c["printers"][p["id"]]["group"]]) for p in printers_cfg()
@@ -2834,6 +2870,8 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
             label[id(sp)] = f"{x} #{sp['id']}" if c["per"] == "spool" else x
     bases = _bases(pb) if prs else []
     out = []
+    matched: set = set()
+    unmatched: dict = {}
     for p, nz in prs:
         for key, sp in picks.items():
             if key in want and p["id"] not in want[key]:
@@ -2842,7 +2880,15 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
             name = f"{label[id(sp)]} @ {p['name']}"
             base = _base(bases, f, nz, c["bases"].get(str(f.get("material") or "").upper(), "") if c["base"] == "pick" else "")
             if not base:
+                if skipped is not None:
+                    unmatched.setdefault(key, {
+                        "name": label[id(sp)],
+                        "mat": str(f.get("material") or "").strip() or "(none)",
+                        "fid": f.get("id"),
+                        "sid": sp.get("id"),
+                    })
                 continue
+            matched.add(key)
             d = {"type": "filament", "name": name, "from": "User", "version": PLUGIN_VERSION, "instantiation": "true",
                  "inherits": base,
                  "filament_settings_id": [name], "compatible_printers": nz, "compatible_printers_condition": ""}
@@ -2882,6 +2928,8 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
             extra_applied = _apply_orca_extras(d, sp, f, c["per"], bp, own) if c["extra_map"] else {}
             out.append({"file": _pfile(name), "json": d, "spool": sp, "printer": p, "cost": cost, "exp": exp,
                         "lvl": lvl, "tv": tv, "extra": extra_applied})
+    if skipped is not None:
+        skipped.extend(v for k, v in unmatched.items() if k not in matched)
     return out
 
 
@@ -2909,21 +2957,39 @@ def _psync_once(spools: list | None, force: bool) -> bool:
     if not api:
         if c["on"]:
             _pst.update(err="This version of OrcaSlicer can't add presets.")
+        _pst["skipped"] = []
+        _post_preset_warn([], c["per"])
         return True
     pb, reload = api
     d = _pfind(pb) if c["on"] else (_pfold["d"] or _pdir(pb))
     fd = d / "filament"
     if not c["on"] and not fd.is_dir():
+        _pst["skipped"] = []
+        _post_preset_warn([], c["per"])
         return True
     files = {}
+    skipped: list[dict] = []
     if c["on"] and source() == "spoolman":
         if spools is None:
             url = cfg().get("spoolman_url", "")
-            spools = _spool_cache["spools"] if _spool_cache["url"] == url else get_spools(url).get("spools") or []
-        es = build_presets(c, spools, pb)
+            if force or _spool_cache["url"] != url:
+                res = get_spools(url)
+                if not res.get("ok"):
+                    _pst.update(err=res.get("error") or "Could not reach Spoolman.")
+                    return True
+                spools = res["spools"]
+            else:
+                spools = _spool_cache["spools"]
+        es = build_presets(c, spools, pb, skipped=skipped)
         files = {e["file"]: json.dumps(e["json"], indent=2) + "\n" for e in es}
         _pmap.clear()
         _pmap.update({e["json"]["name"]: e for e in es})
+        if skipped and skipped != _pst.get("skipped"):
+            names = ", ".join(f"{x['name']} ({x['mat']})" for x in skipped)
+            log.warning("Skipped %d OrcaSlicer preset(s) with no matching base material: %s",
+                        len(skipped), names)
+    _pst["skipped"] = skipped
+    _post_preset_warn(skipped, c["per"])
     old = {p.name: p.read_text(encoding="utf-8") for p in fd.glob("*.json")} if fd.is_dir() else {}
     if files == old and not force and not _pst["err"]:
         return True
@@ -2953,7 +3019,7 @@ def presets_info(want: object = None) -> dict:
     saved = parse_presets(cfg().get("presets"))
     c = parse_presets({**want, "use": saved["use"]}) if isinstance(want, dict) else saved
     out = {"type": "presets_info", "cfg": c, "api": False, "printers": [], "groups": [], "materials": [],
-           "status": dict(_pst), "sample": None}
+           "status": dict(_pst), "sample": None, "skipped": [], "skip_msg": ""}
     api = _papi()
     if not api:
         return out
@@ -2978,7 +3044,11 @@ def presets_info(want: object = None) -> dict:
             out["materials"].append({"m": m, "opts": opts, "pick": c["bases"].get(m, "")})
     first = next((p for p in out["printers"] if p["on"] and p["group"]), None)
     if first and spools:
-        es = build_presets(c, spools, pb, first["id"])
+        skipped: list[dict] = []
+        es = build_presets(c, spools, pb, first["id"], skipped=skipped)
+        if c["on"]:
+            out["skipped"] = skipped
+            out["skip_msg"] = _skip_msg(skipped, c["per"])
         if es:
             e = es[0]
             sp = dict(e["spool"], rfid_tags=sorted(spool_tags(e["spool"])))
@@ -4733,6 +4803,19 @@ MAIN_PAGE = """
   .dnt-warn { display: flex; gap: 10px; align-items: flex-start; margin-top: 10px; padding: 10px 12px; border: 1px solid rgba(210, 153, 34, 0.45); border-radius: 8px; background: rgba(210, 153, 34, 0.14); color: #e0a030; font-size: 12px; line-height: 1.45; }
   .dnt-warn svg { flex: none; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
   .dnt-note { flex-basis: 100%; color: var(--orca-muted); font-size: 12px; margin-top: -4px; }
+  .preset-warn { margin: 0 0 12px; align-items: center; }
+  .preset-warn[hidden] { display: none; }
+  .preset-warn .pw-txt { flex: 1; min-width: 0; }
+  .preset-warn .pw-acts { display: flex; gap: 6px; flex: none; }
+  .spool-card.spool-warn { border-color: #e0a030 !important; box-shadow: 0 0 0 1px rgba(224, 160, 48, 0.45); }
+  .spool-card.spool-warn .spool-tag { left: 22px; }
+  .spool-warn-badge {
+    position: absolute; top: -8px; left: -6px; z-index: 3;
+    display: flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; pointer-events: auto;
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
+  }
+  .spool-warn-badge svg { width: 20px; height: 20px; display: block; }
   .ph .nb { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 99px; background: rgba(210, 153, 34, 0.22); color: #e0a030; margin-left: 6px; }
   .rb-bar { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
   #usage-slot:empty, #progress-slot:empty { display: none; }
@@ -4833,6 +4916,12 @@ MAIN_PAGE = """
     </select>
     <button class="sort-dir" id="sort-dir" title="Toggle ascending/descending">&#9650;</button>
   </div>
+  </div>
+
+  <div id="preset-warn" class="dnt-warn preset-warn" hidden>
+    <svg viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+    <span class="pw-txt" id="pw-txt"></span>
+    <div class="pw-acts"><button type="button" class="sbtn" id="pw-open">Open Spoolman</button><button type="button" class="sbtn ghost" id="pw-dim">Dismiss</button></div>
   </div>
 
   <div id="plate" class="plate" hidden>
@@ -6263,8 +6352,20 @@ MAIN_PAGE = """
             '</svg>' +
           '</div>'
         : '';
+      const isWarn = !s.archived && (typeof remaining !== "number" || remaining > 0) &&
+        (warnSids.has(s.id) || (filament.id != null && warnFids.has(filament.id)));
+      const warnTitle = "No OrcaSlicer preset created (no matching OrcaSlicer material" + (material ? ": " + material : "") + ")";
+      const warnBadge = isWarn
+        ? '<div class="spool-warn-badge" title="' + esc(warnTitle) + '">' +
+            '<svg viewBox="0 0 24 24">' +
+              '<path d="M12 2L1 21h22L12 2z" fill="#f5c518" stroke="#111" stroke-width="1.5" stroke-linejoin="round"></path>' +
+              '<rect x="11" y="9" width="2" height="6" rx="1" fill="#111"></rect>' +
+              '<circle cx="12" cy="17.8" r="1.2" fill="#111"></circle>' +
+            '</svg></div>'
+        : '';
       return (
-        '<div class="spool-card" title="' + tip.replace(/"/g, "&quot;") + '">' +
+        '<div class="spool-card' + (isWarn ? ' spool-warn' : '') + '" title="' + tip.replace(/"/g, "&quot;") + '">' +
+          warnBadge +
           tagHtml +
           '<div class="spool-body">' +
             '<div class="spool-swatch-col">' +
@@ -6460,8 +6561,35 @@ MAIN_PAGE = """
         if (data.usage) setUsage(data.usage);
         if (key !== liveKey && !picking && !renaming && !linkOpen) { liveKey = key; renderPrinters(); }
         renderProgress();
+      } else if (data && data.type === "preset_warn") {
+        setPresetWarn(data.msg || "", data.key || "", data.fids, data.sids);
       }
     });
+
+    let presetWarnKey = "";
+    let presetWarnDismissed = "";
+    let warnFids = new Set();
+    let warnSids = new Set();
+    function setPresetWarn(msg, key, fids, sids) {
+      const box = document.getElementById("preset-warn");
+      const txt = document.getElementById("pw-txt");
+      presetWarnKey = key || "";
+      const nextFids = new Set(Array.isArray(fids) ? fids : []);
+      const nextSids = new Set(Array.isArray(sids) ? sids : []);
+      const changed = nextFids.size !== warnFids.size || nextSids.size !== warnSids.size ||
+        [...nextFids].some(function (id) { return !warnFids.has(id); }) ||
+        [...nextSids].some(function (id) { return !warnSids.has(id); });
+      warnFids = nextFids;
+      warnSids = nextSids;
+      if (changed && allSpools.length) applyFilters();
+      if (!msg || (presetWarnKey && presetWarnKey === presetWarnDismissed)) {
+        box.hidden = true;
+        txt.textContent = "";
+        return;
+      }
+      txt.textContent = msg;
+      box.hidden = false;
+    }
 
     listEl.addEventListener("click", function (e) {
       const btn = e.target.closest(".spool-cart");
@@ -6492,6 +6620,13 @@ MAIN_PAGE = """
 
     document.getElementById("settings-btn").addEventListener("click", function () {
       orca.postMessage({ type: "settings" });
+    });
+    document.getElementById("pw-open").addEventListener("click", function () {
+      orca.postMessage({ type: "open_spoolman" });
+    });
+    document.getElementById("pw-dim").addEventListener("click", function () {
+      presetWarnDismissed = presetWarnKey;
+      setPresetWarn("", presetWarnKey);
     });
     fToggle.addEventListener("click", function () { setFilters(fPanel.hidden); });
     try { setFilters(localStorage.getItem("spoolio.filters") === "1"); } catch (err) { setFilters(false); }
@@ -8720,6 +8855,7 @@ PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</sp
     <div class="pm-sync" id="pm-sync"><span class="pm-dot"></span><span id="pm-st"></span><button type="button" class="pm-btn" id="pm-now">Sync Now</button></div>
   </div>
   <div class="hint warn" id="pm-warn" hidden><strong>!</strong> <span id="pm-wt"></span></div>
+  <div class="hint warn" id="pm-skip" hidden><strong>!</strong> <span id="pm-skt"></span></div>
 </div><div class="srow-r" id="pm-prev"></div></div></div>"""
 
 PRESET_CSS = """
@@ -8791,6 +8927,8 @@ PRESET_JS = r"""
     card.classList.toggle("pm-tnoff", !$("pm-tune").checked);
     $("pm-wt").textContent = I && !I.api ? "This version of OrcaSlicer can't add presets." : !spoolman() ? "Only available with Spoolman as your spool source." : "";
     $("pm-warn").hidden = !$("pm-wt").textContent;
+    $("pm-skt").textContent = !na && $("pm-on").checked && I ? (I.skip_msg || "") : "";
+    $("pm-skip").hidden = !$("pm-skt").textContent;
   }
   function ask() { clearTimeout(t); t = setTimeout(function () { orca.postMessage({ type: "presets_info", cfg: cur() }); }, 150); }
   function nz(names) {
@@ -8834,6 +8972,7 @@ PRESET_JS = r"""
         '<div class="pm-nz">' + esc(p.group ? nz(p.nozzles) : "No OrcaSlicer printer preset matched. Choose one.") + '</div>';
     }).join("") : '<div class="hint">Add your printers on the Printer tab first.</div>';
     $("pm-mats").innerHTML = radio("pm-base") === "pick" ? (d.materials.length ? d.materials.map(function (m) {
+      if (!m.opts.length) return '<div class="pm-mat"><span>' + esc(m.m) + '</span><select data-m="' + esc(m.m) + '" disabled><option value="">No OrcaSlicer preset matches ' + esc(m.m) + '</option></select></div>';
       return '<div class="pm-mat"><span>' + esc(m.m) + '</span><select data-m="' + esc(m.m) + '"><option value="">Printer\'s Own Preset</option>' +
         m.opts.map(function (o) { return '<option' + (o === m.pick ? " selected" : "") + '>' + esc(o) + '</option>'; }).join("") + '</select></div>';
     }).join("") : '<div class="hint">Spoolio lists your materials here once it has loaded your spools.</div>') : "";
@@ -8998,6 +9137,10 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                     send_heads()
             elif msg_type == "settings":
                 self._open_settings()
+            elif msg_type == "open_spoolman":
+                url = clean_url(self._spoolman_url())
+                if url:
+                    open_url(url)
             elif msg_type == "order":
                 open_search(data.get("query"))
             elif msg_type == "printers":
