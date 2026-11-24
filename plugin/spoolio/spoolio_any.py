@@ -94,13 +94,27 @@ def _data_dir() -> Path:
     Not the plugin folder: updates would reset it, and OrcaSlicer expects that folder to
     hold only the plugin file.
     """
+    # Plugins live in <data folder>/orca_plugins, also for portable installs and --datadir.
+    for parent in (PLUGIN_DIR, *PLUGIN_DIR.parents):
+        if parent.name == "orca_plugins":
+            return parent.parent / "spoolio"
     for parent in PLUGIN_DIR.parents:
         if parent.name == "OrcaSlicer":
             return parent / "spoolio"
     return _config_root() / "OrcaSlicer" / "spoolio"
 
 
+def _copy_old(new: Path) -> None:
+    old = _config_root() / "OrcaSlicer" / "spoolio"
+    try:
+        if new != old and not new.exists() and (old / SETTINGS_FILENAME).is_file():
+            shutil.copytree(old, new)
+    except OSError:
+        pass
+
+
 DATA_DIR = _data_dir()
+_copy_old(DATA_DIR)
 SETTINGS_FILE = DATA_DIR / SETTINGS_FILENAME
 LOG_FILE = DATA_DIR / LOG_FILENAME
 # Where earlier builds kept settings when OrcaSlicer's data folder wasn't found.
@@ -205,9 +219,12 @@ def cfg() -> dict:
     }
     for path in (SETTINGS_FILE, OLD_SETTINGS):
         try:
-            return {**defaults, **_read(path)}
+            out = {**defaults, **_read(path)}
         except (OSError, ValueError):
             continue
+        # No trailing slash, so cache lookups match.
+        out["spoolman_url"] = clean_url(out["spoolman_url"]) if isinstance(out["spoolman_url"], str) else ""
+        return out
     return defaults
 
 
@@ -2323,7 +2340,13 @@ def usage_finish(run: dict, dev_id: str = "") -> None:
                 log.info("A print ended (%s, %d%%): recorded in Stats only", run["result"], run["pct"])
             return
         if rows:
-            data["prints"] = ([entry] + [e for e in data["prints"] if e.get("id") != entry["id"]])[:USAGE_PRINTS]
+            prints = [entry] + [e for e in data["prints"] if e.get("id") != entry["id"]]
+            data["prints"] = prints[:USAGE_PRINTS]
+            # Unbooked prints that drop off go to Stats as Not Booked.
+            for e in prints[USAGE_PRINTS:]:
+                if e.get("state") == "pending" and e.get("rows") and \
+                        not any(r.get("state") == "booked" for r in e["rows"]):
+                    hist_note(dict(e, nb=True), by_id)
         usage_save(data)
     if not rows:
         return
@@ -2497,10 +2520,22 @@ def _extra_raw(sent: dict, raw: dict) -> dict:
     out = dict(raw)
     for k, v in sent.items():
         if v in ("", None, []) or (isinstance(v, list) and all(x in ("", None) for x in v)):
-            out.pop(k, None)
+            if k in out:
+                out[k] = None
         else:
             out[k] = json.dumps(v)
     return out
+
+
+def sm_patch(path: str, body: dict):
+    """PATCH; retried without nulls for Spoolman before 0.26."""
+    try:
+        return sm_req("PATCH", path, body)
+    except urllib.error.HTTPError as exc:
+        ex = body.get("extra")
+        if exc.code != 422 or not isinstance(ex, dict) or None not in ex.values():
+            raise
+        return sm_req("PATCH", path, {**body, "extra": {k: v for k, v in ex.items() if v is not None}})
 
 
 def spool_save(d: dict) -> dict:
@@ -2532,7 +2567,7 @@ def spool_save(d: dict) -> dict:
             if extra:
                 body["extra"] = _extra_raw(extra, raw)
             if body:
-                sm_req("PATCH", f"spool/{sid}", body)
+                sm_patch(f"spool/{sid}", body)
         else:
             body = {k: v for k, v in body.items() if v is not None}
             body["filament_id"] = fid
@@ -2603,6 +2638,13 @@ def _skip_msg(skipped: list[dict], per: str) -> str:
 
 
 def _post_preset_warn(skipped: list[dict], per: str) -> None:
+    try:
+        _pwarn(skipped, per)
+    except Exception:
+        log.exception("Could not show the preset warning")
+
+
+def _pwarn(skipped: list[dict], per: str) -> None:
     page = _plate["page"]
     if page is not None:
         key = "|".join(f"{x['name']}:{x['mat']}" for x in skipped)
@@ -2994,7 +3036,8 @@ def build_presets(c: dict, spools: list, only: str = "",
 
 def presets_sync(spools: list | None = None, force: bool = False) -> dict:
     """Writes Spoolio's local preset bundle and asks OrcaSlicer to reload it when anything changed."""
-    if not _psync.acquire(blocking=False):
+    # Sync Now waits for a running sync.
+    if not (_psync.acquire(timeout=60) if force else _psync.acquire(blocking=False)):
         return dict(_pst)
     try:
         for _ in range(2):
@@ -3344,7 +3387,7 @@ def tune_save(ent: str, eid: int, vals: dict) -> None:
             sent[k] = n if n is not None else ""
     _tune_fields(ent, [k for k, v in sent.items() if v != ""])
     raw = (sm_req("GET", f"{ent}/{eid}") or {}).get("extra") or {}
-    sm_req("PATCH", f"{ent}/{eid}", {"extra": _extra_raw(sent, raw)})
+    sm_patch(f"{ent}/{eid}", {"extra": _extra_raw(sent, raw)})
     _spool_cache["time"] = 0.0
 
 
@@ -3472,7 +3515,7 @@ def tune_move_scan() -> dict:
     for ent in ("filament", "spool"):
         have = {f.get("key") for f in sm_req("GET", f"field/{ent}") or [] if isinstance(f, dict)}
         fields += [{"ent": ent, "key": o} for o in TUNE_OLD.values() if o in have]
-        for e in sm_req("GET", ent) or []:
+        for e in sm_req("GET", "spool?allow_archived=true" if ent == "spool" else ent) or []:
             ex = e.get("extra") if isinstance(e, dict) else None
             if not isinstance(ex, dict):
                 continue
@@ -3574,9 +3617,15 @@ def tune_apply(ids: object, save: bool) -> dict:
     try:
         for x in items:
             if x["k"] == "pa":
-                by = _xv((sm_req("GET", f"filament/{x['fid']}") or {}).get("extra"), PA_BY)
+                ent, eid = "filament", x["fid"]
+                # Per spool, the spool's own value wins.
+                if x.get("sid") and parse_presets(cfg().get("presets"))["per"] == "spool":
+                    sby = _xv((sm_req("GET", f"spool/{x['sid']}") or {}).get("extra"), PA_BY)
+                    if x["printer"] in sby:
+                        ent, eid = "spool", x["sid"]
+                by = _xv((sm_req("GET", f"{ent}/{eid}") or {}).get("extra"), PA_BY)
                 by[x["printer"]] = x["new"]
-                tune_save("filament", x["fid"], {PA_BY: by})
+                tune_save(ent, eid, {PA_BY: by})
             else:
                 key = next(t[1] for t in TUNE if t[0] == x["k"])
                 tune_save("spool" if x["lvl"] == "spool" else "filament",
@@ -8153,10 +8202,16 @@ EDITOR_JS = r"""
   function num(x) { var n = parseFloat(String(x).replace(",", ".")); return isNaN(n) ? x : n; }
   var NUM = ["initial_weight", "spool_weight", "remaining_weight", "price", "diameter", "density", "ext", "bed"];
   function keep(fn) {
-    var a = document.activeElement, sel = null, pos = a && a.selectionStart;
+    var a = document.activeElement, sel = null, pos = a && a.selectionStart, raw = a && a.value;
     if (a && a.dataset) { if (a.dataset.k) sel = '[data-k="' + a.dataset.k + '"]'; else if (a.dataset.x) sel = '[data-x="' + a.dataset.x + '"]'; else if (a.dataset.q) sel = '[data-q="1"]'; else if (a.dataset.t) sel = '[data-t="' + a.dataset.t + '"]'; }
     fn(); draw();
-    if (sel) { var b = pc.querySelector(sel); if (b) { b.focus(); try { b.setSelectionRange(pos, pos); } catch (e) {} } }
+    if (sel) {
+      var b = pc.querySelector(sel);
+      if (b) {
+        if (typeof raw === "string" && b.value !== raw && /^\s*-?\d*[.,]?\d*\s*$/.test(raw) && num(raw) === num(b.value)) b.value = raw;
+        b.focus(); try { b.setSelectionRange(pos, pos); } catch (e) {}
+      }
+    }
   }
   pc.addEventListener("input", function (e) {
     var t = e.target, d = t.dataset;
@@ -9312,8 +9367,8 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                                "weight_display": weight_mode(), "show_cart": cart_on(),
                                "spool_columns": spool_columns(), "can_edit": source() == "spoolman",
                                **printer_state(), **result})
-            if result.get("ok") and source() == "spoolman":
-                presets_sync(result["spools"])
+            if result.get("ok"):
+                presets_sync(result["spools"] if source() == "spoolman" else None)
 
         _bg(worker)
 
@@ -9325,7 +9380,7 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
         def put(s):
             s["spool_source"] = parse_source(src)
             if s["spool_source"] == "spoolman":
-                s["spoolman_url"] = url
+                s["spoolman_url"] = clean_url(url)
             s["low_stock_grams"] = parse_low(low_stock)
             s["plate_check"] = parse_flag(plate_check)
             s["plate_margin_percent"] = parse_margin(plate_margin)
