@@ -8954,49 +8954,58 @@ LOOK_JS = r"""
 """
 
 
-PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</span>Configure OrcaSlicer Presets</h3><div class="srow-body"><div class="srow-l">
-  <label class="check-row"><input id="pm-on" type="checkbox">Add Spoolman Spools as OrcaSlicer Filament Presets</label>
-  <div class="hint">Spoolio keeps a filament preset for your spools.</div>
-  <div id="pm-opts">
-    <div class="field-label">Create one preset per:</div>
-    <div class="seg"><label><input type="radio" name="pm-per" value="filament">Filament</label><label><input type="radio" name="pm-per" value="spool">Spool</label></div>
-    <div class="hint">Filament gives one preset for all spools of the same filament. Spool gives each spool its own, named with its ID.</div>
-    <div class="field-label">Make presets for these printers:</div>
-    <div id="pm-prs"></div>
-    <div class="hint">Names come from your Printer tab, e.g. Filament @ Printer. Each preset only shows when that printer is selected in OrcaSlicer, with any of its nozzles.</div>
-    <div class="hint">A spool loaded in a printer, on the Printer tab or by Live Link, only gets that printer's preset. Use With in Edit Spool changes this.</div>
-    <div class="field-label">Base each preset on:</div>
-    <div class="seg"><label><input type="radio" name="pm-base" value="auto">Printer's Own Preset</label><label><input type="radio" name="pm-base" value="pick">Choose Per Material</label></div>
-    <div id="pm-mats"></div>
-    <div class="hint">Anything not taken from Spoolman comes from the printer's own preset for that material, or Generic if it has none.</div>
-    <div class="field-label">Take these from Spoolman:</div>
-    <div class="pm-ck"><label class="check-row"><input type="checkbox" data-take="colour">Colour</label><label class="check-row"><input type="checkbox" data-take="temps">Nozzle and Bed Temperatures</label><label class="check-row"><input type="checkbox" data-take="dens">Density and Diameter</label><label class="check-row"><input type="checkbox" data-take="cost">Cost</label></div>
-    <label class="check-row pm-tn"><input id="pm-extra" type="checkbox">Map Matching Spoolman Extra Fields</label>
-    <div class="hint">Any filament extra field (or spool extra field when one preset per spool is chosen) whose key matches an OrcaSlicer filament setting overrides the base and assumed values.</div>
-    <label class="check-row pm-tn"><input id="pm-tune" type="checkbox">Use Advanced Tuning From Spoolman</label>
-    <div class="hint">Adds a Tuning step to Edit Spool for your calibrated values, and offers to update Spoolman whenever it detects a change from the preset.</div>
-    <div id="pm-tm" hidden></div>
-    <div class="pm-ck" id="pm-tks"><label class="check-row"><input type="checkbox" data-tk="flow">Flow Ratio</label><label class="check-row"><input type="checkbox" data-tk="pa">Pressure Advance</label><label class="check-row"><input type="checkbox" data-tk="mvs">Max Volumetric Speed</label><label class="check-row"><input type="checkbox" data-tk="rlen">Retraction Length</label><label class="check-row"><input type="checkbox" data-tk="rspd">Retraction Speed</label></div>
-    <div class="hint" id="pm-tkh">Anything you leave blank in Spoolman comes from the base preset.</div>
-    <div class="pm-sync" id="pm-sync"><span class="pm-dot"></span><span id="pm-st"></span><button type="button" class="pm-btn" id="pm-now">Sync Now</button></div>
-  </div>
+PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</span>Configure OrcaSlicer Presets<label class="pm-sw pm-msw"><span>Add Spools as Filament Presets</span><input id="pm-on" type="checkbox"><i></i></label></h3><div class="srow-body"><div class="srow-l">
   <div class="hint warn" id="pm-warn" hidden><strong>!</strong> <span id="pm-wt"></span></div>
   <div class="hint warn" id="pm-skip" hidden><strong>!</strong> <span id="pm-skt"></span></div>
-</div><div class="srow-r" id="pm-prev"></div></div></div>"""
+  <div id="pm-opts"><div class="pm-lab">Settings</div><div class="pm-acc">
+<div class="pm-sec" data-s="pr"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="12" rx="2"/><path d="M8 21h8M12 15v6"/></svg></span><span class="pm-tx"><span class="pm-tt">Presets and Printers</span><span class="pm-sm" id="pm-s-pr"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="field-label">Create one preset per:</div><div class="seg"><label><input type="radio" name="pm-per" value="filament">Filament</label><label><input type="radio" name="pm-per" value="spool">Spool</label></div><div class="hint">Spool gives each spool its own preset, named with its ID.</div><div class="field-label">Make presets for these printers:</div><div id="pm-prs"></div><div class="hint">Named Filament @ Printer. A spool loaded in a printer only gets that printer's preset. Use With in Edit Spool changes this.</div></div></div>
+<div class="pm-sec" data-s="base"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="m3 13 9 5 9-5"/></svg></span><span class="pm-tx"><span class="pm-tt">Base Presets</span><span class="pm-sm" id="pm-s-base"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="seg"><label><input type="radio" name="pm-base" value="auto">Printer's Own Preset</label><label><input type="radio" name="pm-base" value="pick">Choose Per Material</label></div><div id="pm-mats"></div><div class="hint">Anything Spoolio doesn't set comes from this preset, or Generic if there is none.</div></div></div>
+<div class="pm-sec" data-s="sm"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg></span><span class="pm-tx"><span class="pm-tt">Values From Spoolman</span><span class="pm-sm" id="pm-s-sm"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="pm-ck"><label class="check-row"><input type="checkbox" data-take="colour">Colour</label><label class="check-row"><input type="checkbox" data-take="temps">Nozzle and Bed Temperatures</label><label class="check-row"><input type="checkbox" data-take="dens">Density and Diameter</label><label class="check-row"><input type="checkbox" data-take="cost">Cost</label></div><label class="check-row pm-tn"><input id="pm-extra" type="checkbox">Map Matching Spoolman Extra Fields</label><div class="hint">Extra fields named like an OrcaSlicer filament setting override it (spool fields too, with one preset per spool).</div></div></div>
+<div class="pm-sec" data-s="tn"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></span><span class="pm-tx"><span class="pm-tt">Advanced Tuning</span><span class="pm-sm" id="pm-s-tn"></span></span><label class="pm-sw" title="Use Advanced Tuning From Spoolman"><input id="pm-tune" type="checkbox"><i></i></label><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div id="pm-tm" hidden></div><div class="pm-ck" id="pm-tks"><label class="check-row"><input type="checkbox" data-tk="flow">Flow Ratio</label><label class="check-row"><input type="checkbox" data-tk="pa">Pressure Advance</label><label class="check-row"><input type="checkbox" data-tk="mvs">Max Volumetric Speed</label><label class="check-row"><input type="checkbox" data-tk="rlen">Retraction Length</label><label class="check-row"><input type="checkbox" data-tk="rspd">Retraction Speed</label></div><div class="hint" id="pm-tkh">Adds a Tuning step to Edit Spool and offers to update Spoolman when a value changes. Blank values come from the base preset.</div></div></div>
+  </div></div>
+</div><div class="srow-r" id="pm-prev"></div></div><div class="pm-sync" id="pm-sync"><span class="pm-dot"></span><span id="pm-st"></span><button type="button" class="pm-btn" id="pm-now">Sync Now</button></div></div>"""
 
 PRESET_CSS = """
   #pm-card .pm-sq { display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--orca-border); margin-right: 8px; vertical-align: -2px; flex: none; }
-  #pm-card #pm-opts .field-label { margin-top: 14px; }
-  #pm-card #pm-opts .hint { margin-top: 6px; }
-  #pm-card .hint.warn { margin-top: 14px; }
+  #pm-card > h3 { gap: 10px; }
+  #pm-card .pm-lab { margin-bottom: 8px; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--orca-muted); }
+  #pm-card .pm-sw { position: relative; display: inline-flex; align-items: center; gap: 10px; cursor: pointer; flex: none; }
+  #pm-card .pm-msw { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--orca-muted); }
+  #pm-card .pm-sw input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+  #pm-card .pm-sw i { position: relative; width: 34px; height: 20px; border-radius: 999px; background: var(--orca-border); flex: none; transition: background .2s; }
+  #pm-card .pm-sw i::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .2s; }
+  #pm-card .pm-sw input:checked + i { background: var(--orca-accent); }
+  #pm-card .pm-sw input:checked + i::after { left: 17px; }
+  #pm-card .pm-sw input:focus-visible + i { outline: 2px solid var(--orca-accent); outline-offset: 2px; }
+  #pm-card .pm-acc { border: 1px solid var(--orca-border); border-radius: 10px; overflow: hidden; background: color-mix(in srgb, var(--orca-fg) 2%, transparent); }
+  #pm-card .pm-sec + .pm-sec { border-top: 1px solid var(--orca-border); }
+  #pm-card .pm-sh { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; user-select: none; }
+  #pm-card .pm-sh:focus-visible { outline: 2px solid var(--orca-accent); outline-offset: -2px; }
+  #pm-card .pm-ic { width: 28px; height: 28px; border-radius: 7px; flex: none; display: flex; align-items: center; justify-content: center; color: var(--orca-accent); background: color-mix(in srgb, var(--orca-accent) 16%, transparent); }
+  #pm-card .pm-ic svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  #pm-card .pm-tx { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #pm-card .pm-tt { font-weight: 600; }
+  #pm-card .pm-sm { font-size: 12px; color: var(--orca-muted); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #pm-card .pm-chev { color: var(--orca-muted); width: 14px; font-size: 15px; text-align: center; transition: transform .2s; }
+  #pm-card .pm-sec.open .pm-chev { transform: rotate(90deg); }
+  #pm-card .pm-sec.open .pm-sh { background: color-mix(in srgb, var(--orca-fg) 4%, transparent); }
+  #pm-card .pm-sb { display: none; padding: 4px 14px 16px 54px; border-top: 1px solid var(--orca-border); }
+  #pm-card .pm-sec.open .pm-sb { display: block; animation: pm-open .2s ease-out; }
+  @keyframes pm-open { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  #pm-card.pm-tnoff .pm-sec[data-s="tn"] .pm-sb, #pm-card.pm-tnoff .pm-sec[data-s="tn"] .pm-chev { display: none; }
+  #pm-card .pm-sb .field-label { margin-top: 12px; }
+  #pm-card .pm-sb > .seg:first-child, #pm-card .pm-sb > .pm-ck:first-child { margin-top: 10px; }
+  #pm-card .pm-sb .hint { margin-top: 6px; }
+  #pm-card .hint.warn { margin: 0 0 12px; }
   #pm-card .pm-pr { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
   #pm-card .pm-pr .check-row { margin: 0; flex: 1; min-width: 0; }
-  #pm-card .pm-pr select, #pm-card .pm-mat select { max-width: 55%; background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; padding: 4px 6px; font: inherit; font-size: 12px; }
+  #pm-card .pm-pr select { width: 55%; }
+  #pm-card .pm-pr select, #pm-card .pm-mat select { background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; padding: 4px 6px; font: inherit; font-size: 12px; }
   #pm-card .pm-nz { margin: -2px 0 6px 24px; font-size: 11.5px; color: var(--orca-muted); }
   #pm-card .pm-mat { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
   #pm-card .pm-mat span { width: 70px; font-weight: 600; }
   #pm-card .pm-mat select { max-width: none; flex: 1; }
-  #pm-card .pm-sync { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 12px; color: var(--orca-muted); }
+  #pm-card .pm-sync { display: flex; align-items: center; gap: 8px; margin: 0 18px 16px; padding-top: 12px; border-top: 1px solid var(--orca-border); font-size: 12px; color: var(--orca-muted); }
   #pm-card .pm-dot { width: 8px; height: 8px; border-radius: 50%; background: #2e9d5b; flex: none; }
   #pm-card .pm-sync.bad .pm-dot { background: #d9534f; }
   #pm-card .pm-sync.idle .pm-dot { background: var(--orca-muted); }
@@ -9013,17 +9022,17 @@ PRESET_CSS = """
   #pm-card .pm-tb td { padding: 4px 0; border-bottom: 1px solid var(--orca-border); }
   #pm-card .pm-tb td:first-child { color: var(--orca-muted); width: 45%; }
   #pm-card .pm-l { margin-top: 14px; }
+  #pm-card.pm-vals .pm-pv-dd, #pm-card:not(.pm-vals) .pm-pv-tb { display: none; }
   #pm-card .pm-note { font-size: 12px; color: var(--orca-muted); border: 1px dashed var(--orca-border); border-radius: 8px; padding: 14px; }
   #pm-card .pm-ck { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 12px; margin-top: 6px; }
   #pm-card .pm-ck .check-row { margin: 4px 0; }
-  #pm-card .pm-tn { margin: 14px 0 0; }
-  #pm-card.pm-tnoff #pm-tks, #pm-card.pm-tnoff #pm-tkh, #pm-card.pm-tnoff #pm-tm { display: none; }
+  #pm-card .pm-tn { margin: 12px 0 0; }
   #pm-card.pm-off #pm-opts { opacity: .45; pointer-events: none; }
   #pm-card.pm-off .pm-sync { display: none; }
-  #pm-card.pm-na .srow-body > .srow-l > *:not(#pm-warn):not(.check-row), #pm-card.pm-na #pm-opts { opacity: .45; pointer-events: none; }
-  #pm-card.pm-na .check-row { opacity: .45; pointer-events: none; }
+  #pm-card.pm-na #pm-opts, #pm-card.pm-na .pm-msw, #pm-card.pm-na .pm-sync { opacity: .45; pointer-events: none; }
   #pm-real .spool-card { margin: 0; }
   #pm-real .spool-edit, #pm-real .spool-cart { display: none; }
+  @media (max-width: 900px) { #pm-card .pm-msw span { display: none; } }
 """
 
 PRESET_JS = r"""
@@ -9055,6 +9064,34 @@ PRESET_JS = r"""
     $("pm-warn").hidden = !$("pm-wt").textContent;
     $("pm-skt").textContent = !na && $("pm-on").checked && I ? (I.skip_msg || "") : "";
     $("pm-skip").hidden = !$("pm-skt").textContent;
+    sums();
+  }
+  var OPEN = [];
+  try { OPEN = JSON.parse(localStorage.getItem("spoolio.pmopen") || "[]") || []; } catch (e) { OPEN = []; }
+  function lst(a) { return a.length > 1 ? a.slice(0, -1).join(", ") + " and " + a[a.length - 1] : a.join(""); }
+  function sums() {
+    var c = cur(), pr = [];
+    document.querySelectorAll("#pm-prs [data-p]").forEach(function (r) { if (r.querySelector("input").checked) pr.push(r.querySelector(".check-row").textContent.trim()); });
+    $("pm-s-pr").textContent = (c.per === "spool" ? "One per spool" : "One per filament") + " · " + (pr.length ? pr.join(", ") : "no printers ticked");
+    $("pm-s-base").textContent = c.base === "pick" ? "Chosen per material" : "Printer's own preset for each material";
+    var tk = [["colour", "colour"], ["temps", "temperatures"], ["dens", "density"], ["cost", "cost"]].filter(function (x) { return c.take[x[0]]; }).map(function (x) { return x[1]; });
+    var sm = tk.length ? lst(tk) : "nothing";
+    $("pm-s-sm").textContent = sm.charAt(0).toUpperCase() + sm.slice(1) + (c.extra_map ? " · extra fields" : "");
+    var tn = [["flow", "flow ratio"], ["pa", "pressure advance"], ["mvs", "max volumetric speed"], ["rlen", "retraction length"], ["rspd", "retraction speed"]].filter(function (x) { return c.tune.keys[x[0]]; }).map(function (x) { return x[1]; });
+    var tt = !c.tune.on ? "Off" : tn.length ? lst(tn) : "Nothing ticked yet";
+    $("pm-s-tn").textContent = tt.charAt(0).toUpperCase() + tt.slice(1);
+    document.querySelectorAll("#pm-card .pm-sec").forEach(function (x) {
+      var o = OPEN.indexOf(x.dataset.s) >= 0 && !(x.dataset.s === "tn" && !c.tune.on);
+      x.classList.toggle("open", o); x.querySelector(".pm-sh").setAttribute("aria-expanded", o ? "true" : "false");
+    });
+    card.classList.toggle("pm-vals", OPEN.some(function (k) { return k === "sm" || (k === "tn" && c.tune.on); }));
+  }
+  function fold(sec) {
+    var k = sec.dataset.s, i = OPEN.indexOf(k);
+    if (k === "tn" && !$("pm-tune").checked) return;
+    if (i >= 0) OPEN.splice(i, 1); else OPEN.push(k);
+    try { localStorage.setItem("spoolio.pmopen", JSON.stringify(OPEN)); } catch (e) {}
+    sums();
   }
   function ask() { clearTimeout(t); t = setTimeout(function () { orca.postMessage({ type: "presets_info", cfg: cur() }); }, 150); }
   function nz(names) {
@@ -9075,13 +9112,13 @@ PRESET_JS = r"""
     else if (!s) h = '<div class="pm-note">' + (d.printers.some(function (p) { return p.on && p.group; }) ? "Your presets show here once Spoolio has loaded your spools." : "Tick a printer to see the presets Spoolio will add.") + '</div>';
     else {
       h = '<div class="label">Your Spool</div><div id="pm-real">' + (window.__spoolioCard ? window.__spoolioCard(s.spool) : "") + '</div>' +
-        '<div class="label pm-l">In OrcaSlicer, With ' + esc(s.printer) + ' Selected</div>' +
+        '<div class="pm-pv-dd"><div class="label pm-l">In OrcaSlicer, With ' + esc(s.printer) + ' Selected</div>' +
         '<div class="pm-dd"><div class="pm-dd-top">' + sq(s.colour) + esc(s.name) + '<span class="pm-car">▾</span></div><div class="pm-dd-list"><div class="pm-grp">Spoolio</div>' +
         s.list.map(function (x) { return '<div class="pm-it' + (x.n === s.name ? " sel" : "") + '">' + sq(x.c) + esc(x.n) + '</div>'; }).join("") +
         (s.more ? '<div class="pm-it dim">+ ' + s.more + ' more</div>' : "") +
-        '<div class="pm-grp">System</div><div class="pm-it dim">' + sq("#888") + esc(s.base) + '</div></div></div>' +
-        '<div class="label pm-l">Copied From Spoolman</div><table class="pm-tb">' +
-        s.rows.map(function (r) { return '<tr><td>' + esc(r[0]) + '</td><td>' + (r[0] === "Colour" && r[1].charAt(0) === "#" ? sq(r[1]) : "") + esc(r[1]) + '</td></tr>'; }).join("") + '</table>';
+        '<div class="pm-grp">System</div><div class="pm-it dim">' + sq("#888") + esc(s.base) + '</div></div></div></div>' +
+        '<div class="pm-pv-tb"><div class="label pm-l">Copied From Spoolman</div><table class="pm-tb">' +
+        s.rows.map(function (r) { return '<tr><td>' + esc(r[0]) + '</td><td>' + (r[0] === "Colour" && r[1].charAt(0) === "#" ? sq(r[1]) : "") + esc(r[1]) + '</td></tr>'; }).join("") + '</table></div>';
     }
     $("pm-prev").innerHTML = h;
   }
@@ -9105,6 +9142,14 @@ PRESET_JS = r"""
     status(d); prev(d); look();
   }
   card.addEventListener("change", function () { look(); ask(); });
+  card.addEventListener("click", function (e) {
+    var h = e.target.closest(".pm-sh");
+    if (h && !e.target.closest(".pm-sw")) fold(h.parentNode);
+  });
+  card.addEventListener("keydown", function (e) {
+    var h = e.target.closest(".pm-sh");
+    if (h && e.target === h && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); fold(h.parentNode); }
+  });
   document.querySelectorAll('input[name="spool-source"]').forEach(function (r) { r.addEventListener("change", look); });
   $("pm-now").addEventListener("click", function () { $("pm-st").textContent = "Syncing…"; orca.postMessage({ type: "presets_sync", cfg: cur() }); });
   window.__spoolioPresets = function () { return I && I.api ? cur() : null; };
