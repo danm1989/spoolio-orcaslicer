@@ -2673,6 +2673,7 @@ def parse_presets(value: object) -> dict:
     tk = v.get("take") if isinstance(v.get("take"), dict) else {}
     tn = v.get("tune") if isinstance(v.get("tune"), dict) else {}
     tnk = tn.get("keys") if isinstance(tn.get("keys"), dict) else {}
+    sy = v.get("sync") if isinstance(v.get("sync"), dict) else {}
     return {"on": parse_flag(v.get("on"), default=False),
             "per": "spool" if v.get("per") == "spool" else "filament",
             "base": "pick" if v.get("base") == "pick" else "auto",
@@ -2684,6 +2685,9 @@ def parse_presets(value: object) -> dict:
                     if isinstance(x, list) and x},
             "take": {k: parse_flag(tk.get(k)) for k in TAKE},
             "extra_map": parse_flag(v.get("extra_map"), default=False),
+            "sync": {"on": parse_flag(sy.get("on"), default=False), "auto": parse_flag(sy.get("auto"), default=False),
+                     "scope": "all" if sy.get("scope") == "all" else "printer",
+                     "clash": sy.get("clash") if sy.get("clash") in ("spoolman", "orca") else "ask"},
             "tune": {"on": parse_flag(tn.get("on"), default=False),
                      "keys": {t[0]: parse_flag(tnk.get(t[0]), default=False) for t in TUNE}}}
 
@@ -2836,7 +2840,13 @@ _snap: dict = {"ok": False, "groups": {}, "bases": [], "dir": None, "vals": {}, 
 
 def _skeys() -> set:
     keys = {t[3] for t in TUNE} | set(_snap["want"])
-    if parse_presets(cfg().get("presets"))["extra_map"]:
+    c = parse_presets(cfg().get("presets"))
+    if c["sync"]["on"]:
+        for sp in _spool_cache["spools"]:
+            for h in (sp, sp.get("filament")) if isinstance(sp, dict) else ():
+                if isinstance(h, dict):
+                    keys.update(k for m in _os(h.get("extra")).values() for k in m)
+    if c["extra_map"]:
         for sp in _spool_cache["spools"]:
             for h in (sp, sp.get("filament")) if isinstance(sp, dict) else ():
                 if isinstance(h, dict) and isinstance(h.get("extra"), dict):
@@ -3027,8 +3037,9 @@ def build_presets(c: dict, spools: list, only: str = "",
             if own & {"pressure_advance"}:
                 own.add("enable_pressure_advance")
             extra_applied = _apply_orca_extras(d, sp, f, c["per"], base, own) if c["extra_map"] else {}
+            osv = _apply_os(d, sp, c["per"], p["name"], base, own) if c["sync"]["on"] else {}
             out.append({"file": name + ".json", "json": d, "spool": sp, "printer": p, "cost": cost, "exp": exp,
-                        "lvl": lvl, "tv": tv, "extra": extra_applied})
+                        "lvl": lvl, "tv": tv, "extra": extra_applied, "os": osv})
     if skipped is not None:
         skipped.extend(v for k, v in unmatched.items() if k not in matched)
     return out
@@ -3123,7 +3134,7 @@ def presets_info(want: object = None) -> dict:
     saved = parse_presets(cfg().get("presets"))
     c = parse_presets({**want, "use": saved["use"]}) if isinstance(want, dict) else saved
     out = {"type": "presets_info", "cfg": c, "api": False, "printers": [], "groups": [], "materials": [],
-           "status": dict(_pst), "sample": None, "skipped": [], "skip_msg": ""}
+           "status": dict(_pst), "sample": None, "skipped": [], "skip_msg": "", "fs": fs_list(c["per"])}
     if not _snap["ok"]:
         return out
     groups = _snap["groups"]
@@ -3154,7 +3165,7 @@ def presets_info(want: object = None) -> dict:
         if es:
             e = es[0]
             sp = dict(e["spool"], rfid_tags=sorted(spool_tags(e["spool"])))
-            j = e["json"]
+            j = {k: _cells(v) if k in e["os"] else v for k, v in e["json"].items()}
             sign = CUR_SIGNS.get(_cur["code"], _cur["code"] + " " if _cur["code"] else "€")
             rows = [["Colour", (j.get("default_filament_colour") or ["From Base Preset"])[0]],
                     ["Type and Vendor", ", ".join(x for x in (str(e["spool"]["filament"].get("material") or ""),
@@ -3171,8 +3182,11 @@ def presets_info(want: object = None) -> dict:
                     by = t[0] == "pa" and first["name"] in e["tv"].get("by", {})
                     txt = f"{v} {t[4]}".strip() + (f" ({first['name']})" if by else "")
                     rows.append([t[2], txt if v else "From Base Preset"])
+            for k, (sc, v) in e["os"].items():
+                if k not in TEMP_PREVIEW_KEYS:
+                    rows.append([fs_label(k), fs_show(v) + ("" if sc == "*" else f" ({sc})")])
             for k, vals in (e.get("extra") or {}).items():
-                if k in TEMP_PREVIEW_KEYS:
+                if k in TEMP_PREVIEW_KEYS or k in e["os"]:
                     continue
                 txt = ", ".join(vals)
                 rows.append([k, txt if len(txt) <= 60 else txt[:57] + "..."])
@@ -3196,7 +3210,7 @@ TAKE = ("colour", "temps", "dens", "cost")
 PRESET_RESERVED_KEYS = (
     {"type", "name", "from", "version", "instantiation", "inherits",
      "filament_settings_id", "compatible_printers", "compatible_printers_condition", "tag"}
-    | set(TUNE_OLD.values()) | {PA_BY}
+    | set(TUNE_OLD.values()) | {PA_BY, "orca_settings"}
 )
 BED_KEYS = tuple(f"{x}_plate_temp{y}" for x in ("supertack", "cool", "textured_cool", "eng", "hot", "textured")
                  for y in ("", "_initial_layer"))
@@ -3310,6 +3324,220 @@ def _apply_orca_extras(d: dict, sp: dict, f: dict, per: str, bp: str, own: set =
             d[k] = val
             applied[k] = val
     return applied
+
+
+OS_KEY = "orca_settings"
+FS_SKIP = {"compatible_prints", "compatible_prints_condition", "filament_extruder_variant", "filament_self_index",
+           "filament_ids", "filament_id", "setting_id", "base_id", "filament_settings_id", "inherits"}
+FS_NAMES = {"nozzle_temperature": "Nozzle Temperature", "nozzle_temperature_initial_layer": "First Layer Nozzle Temperature",
+            "fan_max_speed": "Max Fan Speed", "fan_min_speed": "Min Fan Speed", "overhang_fan_speed": "Overhang Fan Speed",
+            "close_fan_the_first_x_layers": "No Fan for the First Layers", "slow_down_layer_time": "Slow Down Layer Time",
+            "filament_start_gcode": "Filament Start G-code", "filament_end_gcode": "Filament End G-code",
+            "hot_plate_temp": "Bed Temperature (Smooth PEI)", "textured_plate_temp": "Bed Temperature (Textured PEI)",
+            "cool_plate_temp": "Bed Temperature (Cool Plate)", "eng_plate_temp": "Bed Temperature (Engineering Plate)",
+            "default_filament_colour": "Colour", "filament_density": "Density", "filament_cost": "Cost",
+            "filament_diameter": "Diameter", "filament_flow_ratio": "Flow Ratio", "pressure_advance": "Pressure Advance",
+            "filament_max_volumetric_speed": "Max Volumetric Speed", "filament_retraction_length": "Retraction Length",
+            "filament_retraction_speed": "Retraction Speed", "temperature_vitrification": "Softening Temperature"}
+_fs: dict = {"pend": {}}
+
+
+def fs_label(k: str) -> str:
+    return FS_NAMES.get(k) or " ".join(w.capitalize() for w in k.split("_")).replace("Gcode", "G-code")
+
+
+def fs_show(v: object) -> str:
+    """An OrcaSlicer setting value, short enough for one line."""
+    t = str(v if v is not None else "")
+    if t.startswith('"') and t.endswith('"') and len(t) > 1:
+        t = t[1:-1].replace("\\n", "\n").replace('\\"', '"')
+    if "\n" in t:
+        n = len([x for x in t.split("\n") if x.strip()])
+        return f"{n} line" + ("" if n == 1 else "s")
+    return t if len(t) <= 40 else t[:37] + "..."
+
+
+def _os(ex: object) -> dict:
+    """The OrcaSlicer settings Spoolio keeps in Spoolman: {"*" or printer name: {key: serialized value}}."""
+    v = ex.get(OS_KEY) if isinstance(ex, dict) else None
+    for _ in range(2):
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except ValueError:
+                return {}
+    if not isinstance(v, dict):
+        return {}
+    return {str(sc)[:40]: {str(k): x for k, x in m.items() if isinstance(x, str)}
+            for sc, m in v.items() if isinstance(m, dict)}
+
+
+def _os_of(sp: dict, per: str) -> dict:
+    f = _os((sp.get("filament") or {}).get("extra"))
+    if per != "spool":
+        return f
+    s = _os(sp.get("extra"))
+    return {sc: {**f.get(sc, {}), **s.get(sc, {})} for sc in set(f) | set(s)}
+
+
+def _apply_os(d: dict, sp: dict, per: str, pname: str, base: str, own: set) -> dict:
+    """Settings saved from OrcaSlicer: all printers first, then this printer's own."""
+    m = _os_of(sp, per)
+    out: dict = {}
+    for sc in ("*", pname):
+        for k, v in m.get(sc, {}).items():
+            if k in own or k in FS_SKIP or k in PRESET_RESERVED_KEYS:
+                continue
+            b = _orca_base(base, k)
+            if b is None:
+                continue
+            if not _orca_fits(b, [x.strip() for x in re.split(r"[,;]", v.replace('"', "")) if x.strip()] or [v]):
+                log.warning("OrcaSlicer setting %s from Spoolman skipped: %r doesn't suit it", k, v)
+                continue
+            d[k] = v
+            out[k] = (sc, v)
+    return out
+
+
+def fs_list(per: str) -> list[dict]:
+    """Filaments (or spools) with OrcaSlicer settings stored in Spoolman."""
+    url = cfg().get("spoolman_url", "")
+    if _spool_cache["url"] != url or not url:
+        return []
+    out, seen = [], set()
+    for sp in _spool_cache["spools"]:
+        if not isinstance(sp, dict) or sp.get("archived") or not isinstance(sp.get("filament"), dict):
+            continue
+        f = sp["filament"]
+        for ent, h in (("filament", f),) + ((("spool", sp),) if per == "spool" else ()):
+            m = _os(h.get("extra"))
+            if not any(m.values()) or (ent, h.get("id")) in seen:
+                continue
+            seen.add((ent, h.get("id")))
+            nm = " ".join(x for x in ((f.get("vendor") or {}).get("name"), f.get("name") or f.get("material")) if x) or "Filament"
+            out.append({"ent": ent, "id": h.get("id"), "c": _first_hex(f), "name": f"Spool #{sp.get('id')} · {nm}" if ent == "spool" else nm,
+                        "rows": [{"sc": sc, "k": k, "label": fs_label(k), "v": fs_show(v)}
+                                 for sc in sorted(m, key=lambda x: (x != "*", x)) for k, v in sorted(m[sc].items())]})
+    return out
+
+
+def fs_scan() -> list[dict]:
+    """Run on OrcaSlicer's own thread only: unsaved edits to the Spoolio preset open in OrcaSlicer."""
+    c = parse_presets(cfg().get("presets"))
+    api = _papi()
+    if not (c["on"] and c["sync"]["on"] and _pmap and api):
+        return []
+    fc = api[0].filaments
+    try:
+        ed, sel = fc.edited_preset(), fc.selected_preset()
+    except Exception as exc:
+        log.warning("Couldn't read OrcaSlicer's filament preset: %s", exc)
+        return []
+    n = ed.name
+    e = _pmap.get(n.split("/", 2)[-1] if n.startswith("_local/") else n)
+    if not e or not getattr(ed, "is_dirty", True) or e["json"]["name"] in (cfg().get("fs_never") or []):
+        return []
+    own = {t[3] for t in TUNE if c["tune"]["on"] and c["tune"]["keys"][t[0]]} | {"enable_pressure_advance"}
+    sp, f = e["spool"], e["spool"]["filament"]
+    spool = c["per"] == "spool"
+    items = []
+    for k in ed.config_keys():
+        if k in own or k in FS_SKIP or k in PRESET_RESERVED_KEYS:
+            continue
+        nv, ov = ed.config_value(k), sel.config_value(k)
+        if nv is None or nv == ov:
+            continue
+        items.append({"id": f"{e['json']['name']}|{k}", "k": k, "label": fs_label(k), "new": nv, "old": ov,
+                      "nshow": fs_show(nv), "oshow": fs_show(ov), "base": (e["os"].get(k) or (None, None))[1],
+                      "preset": e["json"]["name"], "printer": e["printer"]["name"],
+                      "ent": "spool" if spool else "filament", "eid": sp.get("id") if spool else f.get("id"),
+                      "name": str(f.get("name") or f"Spool #{sp.get('id')}"), "c": _first_hex(f)})
+    return items[:40]
+
+
+def fs_check(items: list[dict]) -> dict:
+    """Marks the edits whose setting also changed in Spoolman since the last sync."""
+    c = parse_presets(cfg().get("presets"))["sync"]
+    got: dict = {}
+    for x in items:
+        key = (x["ent"], x["eid"])
+        if key not in got:
+            got[key] = _os((sm_req("GET", f"{x['ent']}/{x['eid']}") or {}).get("extra"))
+        m = got[key]
+        cur = m.get(x["printer"], {}).get(x["k"], m.get("*", {}).get(x["k"]))
+        x["clash"] = cur is not None and cur != x["base"] and cur != x["new"]
+        x["sm"] = cur
+        x["smshow"] = fs_show(cur) if cur is not None else ""
+    if c["clash"] == "spoolman":
+        items = [x for x in items if not x["clash"]]
+    elif c["clash"] == "orca":
+        for x in items:
+            x["clash"] = False
+    _fs["pend"] = {x["id"]: x for x in items}
+    return {"items": items, "auto": c["auto"], "scope": c["scope"]}
+
+
+def _fs_write(ent: str, eid, fn) -> None:
+    have = {f.get("key") for f in sm_req("GET", f"field/{ent}") or [] if isinstance(f, dict)}
+    if OS_KEY not in have:
+        sm_req("POST", f"field/{ent}/{OS_KEY}", {"name": "OrcaSlicer Settings", "field_type": "text"})
+    raw = (sm_req("GET", f"{ent}/{eid}") or {}).get("extra") or {}
+    m = _os(raw)
+    fn(m)
+    m = {sc: x for sc, x in m.items() if x}
+    sm_patch(f"{ent}/{eid}", {"extra": _extra_raw({OS_KEY: json.dumps(m, sort_keys=True) if m else ""}, raw)})
+
+
+def fs_apply(pick: object, never: bool = False) -> dict:
+    """Saves the chosen OrcaSlicer edits to Spoolman. pick: {id: "printer" | "all" | "skip"}."""
+    pick = pick if isinstance(pick, dict) else {}
+    items = [x for i, x in _fs["pend"].items() if pick.get(i) in ("printer", "all")]
+    if never:
+        names = {x["preset"] for x in _fs["pend"].values()}
+        cfg_edit(lambda s: s.update(fs_never=(list(s.get("fs_never") or []) + sorted(names))[-200:]))
+        _fs["pend"] = {}
+        return {"ok": True, "n": 0, "never": True}
+    try:
+        by: dict = {}
+        for x in items:
+            by.setdefault((x["ent"], x["eid"]), []).append(x)
+        for (ent, eid), xs in by.items():
+            def edit(m, xs=xs):
+                for x in xs:
+                    if pick[x["id"]] == "all":
+                        m.setdefault("*", {})[x["k"]] = x["new"]
+                        m.get(x["printer"], {}).pop(x["k"], None)
+                    else:
+                        m.setdefault(x["printer"], {})[x["k"]] = x["new"]
+            _fs_write(ent, eid, edit)
+    except Exception as exc:
+        log.warning("Saving OrcaSlicer settings to Spoolman failed: %s", exc)
+        return {"ok": False, "error": _sm_err(exc)}
+    _fs["pend"] = {}
+    _spool_cache["time"] = 0.0
+    log.info("Saved %d OrcaSlicer settings to Spoolman", len(items))
+    if items:
+        presets_sync(force=True)
+    return {"ok": True, "n": len(items)}
+
+
+def fs_remove(ent: object, eid: object, sc: object = None, k: object = None) -> dict:
+    """Removes one stored setting, or all of them for a filament or spool when k is empty."""
+    if ent not in ("filament", "spool") or not isinstance(eid, int):
+        return {"ok": False, "error": "Unknown filament."}
+    try:
+        def edit(m):
+            if not k:
+                m.clear()
+            else:
+                m.get(str(sc), {}).pop(str(k), None)
+        _fs_write(ent, eid, edit)
+    except Exception as exc:
+        log.warning("Removing OrcaSlicer settings from Spoolman failed: %s", exc)
+        return {"ok": False, "error": _sm_err(exc)}
+    _spool_cache["time"] = 0.0
+    presets_sync(force=True)
+    return {"ok": True}
 
 
 def _xv(ex: object, key: str):
@@ -3457,6 +3685,16 @@ def tune_check(ctx) -> None:
                 new += 1
     if new:
         _bg(_tune_push)
+
+
+def _fs_poke() -> None:
+    c = parse_presets(cfg().get("presets"))
+    if not (c["on"] and c["sync"]["on"] and _pmap):
+        return
+    time.sleep(NOTICE_DELAY)
+    page = _plate["page"]
+    if page is not None:
+        page.post_message({"type": "fs_poke"})
 
 
 def _tune_push() -> None:
@@ -7872,6 +8110,27 @@ EDITOR_CSS = """
   #pc .dtag { display: flex; flex-direction: column; gap: 4px; padding: 9px 12px; border-radius: 8px; background: color-mix(in srgb, var(--orca-fg) 5%, transparent); margin-bottom: 16px; }
   #pc .dtag span { font-size: 11px; color: var(--orca-muted); font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
   #pc .dtag code { font-family: ui-monospace, Consolas, Menlo, "DejaVu Sans Mono", monospace !important; font-size: 12.5px; word-break: break-all; color: #4fd1c5; }
+  #pc .dcard.fs { width: 600px; }
+  #pc .fsh { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--orca-border); border-radius: 8px; }
+  #pc .fsh .d, #pc .fcf .d { width: 14px; height: 14px; border-radius: 4px; border: 1px solid var(--orca-border); flex: none; }
+  #pc .fsh small { margin-left: auto; color: var(--orca-muted); font-size: 12px; }
+  #pc .fst { max-height: 300px; overflow: auto; margin-top: 6px; }
+  #pc .fst table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  #pc .fst th { text-align: left; color: var(--orca-muted); font-weight: 400; padding: 4px 6px; border-bottom: 1px solid var(--orca-border); }
+  #pc .fst td { padding: 7px 6px; border-bottom: 1px solid var(--orca-border); vertical-align: middle; }
+  #pc .fst td.v { white-space: nowrap; }
+  #pc .fst s { color: var(--orca-muted); }
+  #pc .fst .ar { color: var(--orca-accent); padding: 0 4px; }
+  #pc .fst code { display: block; color: var(--orca-muted); font: 11px ui-monospace, Consolas, monospace; }
+  #pc .fsg { display: inline-flex; border: 1px solid var(--orca-border); border-radius: 6px; overflow: hidden; font-size: 11.5px; }
+  #pc .fsg button { background: transparent; color: var(--orca-fg); border: 0; border-right: 1px solid var(--orca-border); padding: 4px 9px; font: inherit; cursor: pointer; white-space: nowrap; }
+  #pc .fsg button:last-child { border-right: 0; }
+  #pc .fsg button.on { background: var(--orca-accent); color: var(--orca-accent-fg); font-weight: 700; }
+  #pc .fcf { margin-top: 10px; border: 1px solid rgba(210,153,34,.45); border-radius: 8px; padding: 10px 12px; }
+  #pc .fcf .h { display: flex; align-items: center; gap: 8px; font-weight: 700; margin-bottom: 4px; }
+  #pc .fcf .fsg { margin-top: 8px; font-size: 12px; }
+  #pc .fcf .fsg button { padding: 5px 12px; }
+  #pc .dcard.fs .row .grow { flex: 1; }
   #pt { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); background: color-mix(in srgb, var(--orca-fg) 10%, var(--orca-bg)); border: 1px solid var(--orca-border); color: var(--orca-fg); border-radius: 8px; padding: 10px 16px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.35); z-index: 1001; }
   #pt b { color: #3fb950; }
   @media (max-width: 760px) {
@@ -8278,6 +8537,31 @@ EDITOR_JS = r"""
     var o = msg.tune[w === "ts" ? "spool" : "fil"] = msg.tune[w === "ts" ? "spool" : "fil"] || {};
     if (k.indexOf("by:") === 0) o.pressure_advance_printers = S[w].by; else o[TX[k]] = S[w][k];
   }
+  var fsI = null, fsP = {};
+  function fsDraw() {
+    var it = fsI.items, x0 = it[0], cl = it.filter(function (x) { return x.clash; }), ok = it.filter(function (x) { return !x.clash; });
+    var seg = function (id, opts) { return '<span class="fsg">' + opts.map(function (o) { return '<button type="button" data-fs="' + esc(id) + '" data-v="' + o[0] + '" class="' + (fsP[id] === o[0] ? "on" : "") + '">' + esc(o[1]) + '</button>'; }).join("") + '</span>'; };
+    var sc = function (x) { return seg(x.id, [["printer", x.printer + " Only"], ["all", "All Printers"]]); };
+    pc.innerHTML = '<div class="dcard fs"><div class="dh"><span class="pulse"></span>' + (ok.length ? "Save OrcaSlicer Changes to Spoolman?" : "Changed in Both Places") + '</div>' +
+      '<p style="margin-top:0">' + (ok.length ? "You changed a Spoolio preset in OrcaSlicer. Save the changes to Spoolman so they come back every time Spoolio syncs." : "These settings changed in OrcaSlicer and in Spoolman since the last sync. Pick the value to keep.") + '</p>' +
+      '<div class="fsh"><span class="d" style="background:#' + esc(x0.c || "555555") + '"></span><b>' + esc(x0.preset) + '</b></div>' +
+      (ok.length ? '<div class="fst"><table><tr><th>Setting</th><th>Change</th><th>Use For</th></tr>' + ok.map(function (x) {
+        return '<tr><td>' + esc(x.label) + '<code>' + esc(x.k) + '</code></td><td class="v"><s>' + esc(x.oshow || "-") + '</s><span class="ar">&rarr;</span><b>' + esc(x.nshow) + '</b></td><td>' + sc(x) + '</td></tr>';
+      }).join("") + '</table></div>' : "") +
+      cl.map(function (x) {
+        return '<div class="fcf"><div class="h">' + esc(x.label) + '</div><div style="color:var(--orca-muted);font-size:12px">It\'s <b>' + esc(x.nshow) + '</b> in OrcaSlicer and <b>' + esc(x.smshow) + '</b> in Spoolman.' +
+          (fsP[x.id] === "skip" ? " Discard your edit in OrcaSlicer to use the Spoolman value." : "") + '</div>' +
+          seg(x.id, [[fsI.scope === "all" ? "all" : "printer", "Keep " + x.nshow + " (OrcaSlicer)"], ["skip", "Keep " + x.smshow + " (Spoolman)"]]) + '</div>';
+      }).join("") +
+      (ok.length ? '<p>Once saved, OrcaSlicer stops showing the preset as modified. Not Now keeps your edits in OrcaSlicer only.</p>' : '<p></p>') +
+      '<div class="row"><button class="sb ghost" data-a="fs-never">Never for This Preset</button><span class="grow"></span><button class="sb ghost" data-a="fs-later">Not Now</button><button class="sb pri" data-a="fs-save">' + (ok.length ? "Save to Spoolman" : "Keep These") + '</button></div></div>';
+  }
+  function fsPrompt(m) {
+    if (!m.items || !m.items.length) return;
+    fsI = m; fsP = {};
+    m.items.forEach(function (x) { fsP[x.id] = m.scope === "all" ? "all" : "printer"; });
+    pc.tune = null; pc.det = null; pc.fs = true; mode = null; pc.dataset.at = ""; fsDraw(); pc.hidden = false;
+  }
   function tunePrompt(items) {
     items = (items || []).filter(function (x) { return !tseen[x.id]; });
     if (!items.length) return;
@@ -8319,7 +8603,7 @@ EDITOR_JS = r"""
   }
   pc.addEventListener("click", function (e) {
     if (e.target === pc) { if (!mode) { pc.hidden = true; return; } return close(); }
-    var t = e.target.closest("[data-a],[data-go],[data-src],[data-pick],[data-used],[data-xb],[data-use],[data-tg]"); if (!t) return;
+    var t = e.target.closest("[data-a],[data-go],[data-src],[data-pick],[data-used],[data-xb],[data-use],[data-tg],[data-fs]"); if (!t) return;
     var d = t.dataset;
     if (d.go != null) { if (+d.go > 0 && !ok("fil")) return; step = +d.go; ask = ""; draw(); pc.querySelector(".body").scrollTop = 0; return; }
     if (d.src) { src = d.src; q = ""; draw(); return; }
@@ -8331,6 +8615,7 @@ EDITOR_JS = r"""
     }
     if (d.xb) { S.extra[d.xb] = !S.extra[d.xb]; draw(); return; }
     if (d.tg) { tg = d.tg; draw(); return; }
+    if (d.fs) { fsP[d.fs] = d.v; fsDraw(); return; }
     if (d.use != null) {
       var u = (S.use || []).slice(), i = u.indexOf(d.use);
       if (!d.use) u = []; else if (i >= 0) u.splice(i, 1); else u.push(d.use);
@@ -8347,6 +8632,8 @@ EDITOR_JS = r"""
     if (a === "det-later") { orca.postMessage({ type: "new_skip", uid: pc.det.uid }); pc.hidden = true; toast("Won't Ask Again for This Spool."); }
     if (a === "det-add") { var n = pc.det; openAdd(); prefill(n); draw(); }
     if (a === "tune-orca") { tmsg = "Reading OrcaSlicer…"; draw(); orca.postMessage({ type: "tune_orca" }); }
+    if (a === "fs-save" || a === "fs-never") { orca.postMessage({ type: "fs_apply", pick: fsP, never: a === "fs-never" }); pc.hidden = true; pc.innerHTML = ""; pc.fs = null; if (a === "fs-save") toast("Saving to Spoolman…"); }
+    if (a === "fs-later") { pc.hidden = true; pc.innerHTML = ""; pc.fs = null; }
     if (a === "tune-skip" || a === "tune-save") { orca.postMessage({ type: "tune_apply", ids: pc.tune, save: a === "tune-save" }); pc.hidden = true; pc.innerHTML = ""; }
   });
   document.addEventListener("keydown", function (e) {
@@ -8377,6 +8664,14 @@ EDITOR_JS = r"""
     } else if (m.type === "live" && pc.hidden && !document.getElementById("view-main").classList.contains("view-hidden")) {
       var n = canEdit && Array.isArray(m["new"]) ? m["new"].filter(function (x) { return !seen[x.uid]; })[0] : null;
       if (n) det(n); else if (Array.isArray(m.tune)) tunePrompt(m.tune);
+    } else if (m.type === "fs_poke") {
+      orca.postMessage({ type: "fs_scan" });
+    } else if (m.type === "fs" && pc.hidden) {
+      fsPrompt(m);
+    } else if (m.type === "fs_done") {
+      if (!m.ok) toast("Couldn't Update Spoolman: " + esc(m.error || ""));
+      else if (m.never) toast("Won't Ask Again for This Preset.");
+      else if (m.n) toast('<b>✓</b> Saved ' + plural(m.n, "Setting") + ' to Spoolman' + (m.auto ? " From OrcaSlicer" : "") + '.');
     } else if (m.type === "tune" && pc.hidden) {
       tunePrompt(m.items);
     } else if (m.type === "tune_orca" && mode) {
@@ -8962,6 +9257,7 @@ PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</sp
 <div class="pm-sec" data-s="base"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="m3 13 9 5 9-5"/></svg></span><span class="pm-tx"><span class="pm-tt">Base Presets</span><span class="pm-sm" id="pm-s-base"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="seg"><label><input type="radio" name="pm-base" value="auto">Printer's Own Preset</label><label><input type="radio" name="pm-base" value="pick">Choose Per Material</label></div><div id="pm-mats"></div><div class="hint">Anything Spoolio doesn't set comes from this preset, or Generic if there is none.</div></div></div>
 <div class="pm-sec" data-s="sm"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg></span><span class="pm-tx"><span class="pm-tt">Values From Spoolman</span><span class="pm-sm" id="pm-s-sm"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="pm-ck"><label class="check-row"><input type="checkbox" data-take="colour">Colour</label><label class="check-row"><input type="checkbox" data-take="temps">Nozzle and Bed Temperatures</label><label class="check-row"><input type="checkbox" data-take="dens">Density and Diameter</label><label class="check-row"><input type="checkbox" data-take="cost">Cost</label></div><label class="check-row pm-tn"><input id="pm-extra" type="checkbox">Map Matching Spoolman Extra Fields</label><div class="hint">Extra fields named like an OrcaSlicer filament setting override it (spool fields too, with one preset per spool).</div></div></div>
 <div class="pm-sec" data-s="tn"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></span><span class="pm-tx"><span class="pm-tt">Advanced Tuning</span><span class="pm-sm" id="pm-s-tn"></span></span><label class="pm-sw" title="Use Advanced Tuning From Spoolman"><input id="pm-tune" type="checkbox"><i></i></label><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div id="pm-tm" hidden></div><div class="pm-ck" id="pm-tks"><label class="check-row"><input type="checkbox" data-tk="flow">Flow Ratio</label><label class="check-row"><input type="checkbox" data-tk="pa">Pressure Advance</label><label class="check-row"><input type="checkbox" data-tk="mvs">Max Volumetric Speed</label><label class="check-row"><input type="checkbox" data-tk="rlen">Retraction Length</label><label class="check-row"><input type="checkbox" data-tk="rspd">Retraction Speed</label></div><div class="hint" id="pm-tkh">Adds a Tuning step to Edit Spool and offers to update Spoolman when a value changes. Blank values come from the base preset.</div></div></div>
+<div class="pm-sec" data-s="sy"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><path d="M20 7H8a4 4 0 0 0 0 8h1"/><path d="m17 4 3 3-3 3"/><path d="M4 17h12a4 4 0 0 0 0-8h-1"/><path d="m7 20-3-3 3-3"/></svg></span><span class="pm-tx"><span class="pm-tt">Sync All Settings</span><span class="pm-sm" id="pm-s-sy"></span></span><label class="pm-sw" title="Sync All Filament Settings With Spoolman"><input id="pm-fs" type="checkbox"><i></i></label><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="hint" style="margin-top:10px">Change any filament setting on a Spoolio preset in OrcaSlicer and Spoolio saves it to Spoolman, so it comes back on every sync. Spoolman changes come back to OrcaSlicer too.</div><div class="field-label">Save OrcaSlicer changes:</div><div class="seg"><label><input type="radio" name="pm-fsa" value="ask">Ask After Each Slice</label><label><input type="radio" name="pm-fsa" value="auto">Automatically</label></div><div class="field-label">New changes apply to:</div><div class="seg"><label><input type="radio" name="pm-fss" value="printer">That Printer Only</label><label><input type="radio" name="pm-fss" value="all">All Printers</label></div><div class="hint">You can change this for each setting when Spoolio asks.</div><div class="field-label">If a setting changed in both places:</div><div class="seg"><label><input type="radio" name="pm-fsc" value="ask">Ask Me</label><label><input type="radio" name="pm-fsc" value="spoolman">Spoolman Wins</label><label><input type="radio" name="pm-fsc" value="orca">OrcaSlicer Wins</label></div><div class="hint" id="pm-fsn"></div></div></div>
   </div></div>
 </div><div class="srow-r" id="pm-prev"></div></div><div class="pm-sync" id="pm-sync"><span class="pm-dot"></span><span id="pm-st"></span><button type="button" class="pm-btn" id="pm-now">Sync Now</button></div></div>"""
 
@@ -8992,7 +9288,26 @@ PRESET_CSS = """
   #pm-card .pm-sb { display: none; padding: 4px 14px 16px 54px; border-top: 1px solid var(--orca-border); }
   #pm-card .pm-sec.open .pm-sb { display: block; animation: pm-open .2s ease-out; }
   @keyframes pm-open { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
-  #pm-card.pm-tnoff .pm-sec[data-s="tn"] .pm-sb, #pm-card.pm-tnoff .pm-sec[data-s="tn"] .pm-chev { display: none; }
+  #pm-card.pm-tnoff .pm-sec[data-s="tn"] .pm-sb, #pm-card.pm-tnoff .pm-sec[data-s="tn"] .pm-chev,
+  #pm-card.pm-fsoff .pm-sec[data-s="sy"] .pm-sb, #pm-card.pm-fsoff .pm-sec[data-s="sy"] .pm-chev { display: none; }
+  #pm-card .pm-sb a { color: var(--orca-accent); cursor: pointer; }
+  #pm-rv { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(0, 0, 0, .55); }
+  #pm-rv[hidden] { display: none; }
+  #pm-rv, #pm-rv * { font-family: __FONT__; }
+  #pm-rv .pop { width: min(600px, 100%); max-height: calc(100vh - 32px); overflow: auto; box-sizing: border-box; background: var(--orca-bg); border: 1px solid var(--orca-border); border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, .45); padding: 16px; font-size: 13px; animation: pm-open .2s ease-out; }
+  #pm-rv .pop > b { display: block; font-size: 15px; margin-bottom: 6px; }
+  #pm-rv .note { color: var(--orca-muted); font-size: 12px; line-height: 1.45; }
+  #pm-rv .fh { display: flex; align-items: center; gap: 10px; margin-top: 14px; padding: 8px 10px; border: 1px solid var(--orca-border); border-radius: 8px; font-weight: 600; }
+  #pm-rv .fh .d { width: 14px; height: 14px; border-radius: 4px; border: 1px solid var(--orca-border); flex: none; }
+  #pm-rv .fh a { margin-left: auto; font-weight: 400; font-size: 12px; color: var(--orca-muted); cursor: pointer; }
+  #pm-rv .grp { margin: 10px 0 2px; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--orca-muted); }
+  #pm-rv table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+  #pm-rv td { padding: 6px; border-bottom: 1px solid var(--orca-border); }
+  #pm-rv td.v { width: 35%; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #pm-rv td.x { width: 20px; text-align: right; color: var(--orca-muted); cursor: pointer; }
+  #pm-rv code { display: block; color: var(--orca-muted); font: 11px ui-monospace, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; }
+  #pm-rv .bar { display: flex; justify-content: flex-end; margin-top: 14px; }
+  #pm-rv .bar button { background: var(--orca-accent); color: var(--orca-accent-fg); border: 1px solid var(--orca-accent); border-radius: 6px; padding: 5px 12px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
   #pm-card .pm-sb .field-label { margin-top: 12px; }
   #pm-card .pm-sb > .seg:first-child, #pm-card .pm-sb > .pm-ck:first-child { margin-top: 10px; }
   #pm-card .pm-sb .hint { margin-top: 6px; }
@@ -9051,7 +9366,8 @@ PRESET_JS = r"""
     document.querySelectorAll("#pm-card [data-take]").forEach(function (x) { tk[x.dataset.take] = x.checked; });
     document.querySelectorAll("#pm-card [data-tk]").forEach(function (x) { tn[x.dataset.tk] = x.checked; });
     return { on: $("pm-on").checked, per: radio("pm-per") || "filament", base: radio("pm-base") || "auto", printers: pr, bases: bs,
-      take: tk, extra_map: $("pm-extra").checked, tune: { on: $("pm-tune").checked, keys: tn } };
+      take: tk, extra_map: $("pm-extra").checked, tune: { on: $("pm-tune").checked, keys: tn },
+      sync: { on: $("pm-fs").checked, auto: radio("pm-fsa") === "auto", scope: radio("pm-fss") || "printer", clash: radio("pm-fsc") || "ask" } };
   }
   function spoolman() { var x = document.querySelector('input[name="spool-source"]:checked'); return !x || x.value === "spoolman"; }
   function look() {
@@ -9060,6 +9376,7 @@ PRESET_JS = r"""
     card.classList.toggle("pm-na", na);
     card.classList.toggle("pm-off", !$("pm-on").checked);
     card.classList.toggle("pm-tnoff", !$("pm-tune").checked);
+    card.classList.toggle("pm-fsoff", !$("pm-fs").checked);
     $("pm-wt").textContent = I && !I.api ? "This version of OrcaSlicer can't add presets." : !spoolman() ? "Only available with Spoolman as your spool source." : "";
     $("pm-warn").hidden = !$("pm-wt").textContent;
     $("pm-skt").textContent = !na && $("pm-on").checked && I ? (I.skip_msg || "") : "";
@@ -9080,15 +9397,19 @@ PRESET_JS = r"""
     var tn = [["flow", "flow ratio"], ["pa", "pressure advance"], ["mvs", "max volumetric speed"], ["rlen", "retraction length"], ["rspd", "retraction speed"]].filter(function (x) { return c.tune.keys[x[0]]; }).map(function (x) { return x[1]; });
     var tt = !c.tune.on ? "Off" : tn.length ? lst(tn) : "Nothing ticked yet";
     $("pm-s-tn").textContent = tt.charAt(0).toUpperCase() + tt.slice(1);
+    $("pm-s-sy").textContent = !c.sync.on ? "Off" : [c.sync.auto ? "Save automatically" : "Ask after each slice", c.sync.scope === "all" ? "all printers" : "that printer only",
+      { ask: "ask on conflicts", spoolman: "Spoolman wins conflicts", orca: "OrcaSlicer wins conflicts" }[c.sync.clash]].join(" · ");
+    var fl = (I && I.fs) || [], fn = fl.reduce(function (a, x) { return a + x.rows.length; }, 0);
+    $("pm-fsn").innerHTML = fn ? fn + " setting" + (fn === 1 ? "" : "s") + " stored for " + fl.length + (fl.length === 1 ? (fl[0].ent === "spool" ? " spool" : " filament") : (fl[0].ent === "spool" ? " spools" : " filaments")) + '. <a data-rv="open">Review Settings</a>' : "Nothing stored in Spoolman yet.";
     document.querySelectorAll("#pm-card .pm-sec").forEach(function (x) {
-      var o = OPEN.indexOf(x.dataset.s) >= 0 && !(x.dataset.s === "tn" && !c.tune.on);
+      var o = OPEN.indexOf(x.dataset.s) >= 0 && !(x.dataset.s === "tn" && !c.tune.on) && !(x.dataset.s === "sy" && !c.sync.on);
       x.classList.toggle("open", o); x.querySelector(".pm-sh").setAttribute("aria-expanded", o ? "true" : "false");
     });
-    card.classList.toggle("pm-vals", OPEN.some(function (k) { return k === "sm" || (k === "tn" && c.tune.on); }));
+    card.classList.toggle("pm-vals", OPEN.some(function (k) { return k === "sm" || (k === "tn" && c.tune.on) || (k === "sy" && c.sync.on); }));
   }
   function fold(sec) {
     var k = sec.dataset.s, i = OPEN.indexOf(k);
-    if (k === "tn" && !$("pm-tune").checked) return;
+    if ((k === "tn" && !$("pm-tune").checked) || (k === "sy" && !$("pm-fs").checked)) return;
     if (i >= 0) OPEN.splice(i, 1); else OPEN.push(k);
     try { localStorage.setItem("spoolio.pmopen", JSON.stringify(OPEN)); } catch (e) {}
     sums();
@@ -9128,7 +9449,10 @@ PRESET_JS = r"""
       $("pm-on").checked = C.on; setRadio("pm-per", C.per); setRadio("pm-base", C.base); $("pm-extra").checked = !!C.extra_map; $("pm-tune").checked = C.tune.on;
       document.querySelectorAll("#pm-card [data-take]").forEach(function (x) { x.checked = C.take[x.dataset.take] !== false; });
       document.querySelectorAll("#pm-card [data-tk]").forEach(function (x) { x.checked = !!C.tune.keys[x.dataset.tk]; });
+      var sy = C.sync || {};
+      $("pm-fs").checked = !!sy.on; setRadio("pm-fsa", sy.auto ? "auto" : "ask"); setRadio("pm-fss", sy.scope || "printer"); setRadio("pm-fsc", sy.clash || "ask");
     }
+    if (!$("pm-rv").hidden) rv();
     var opts = function (g) { return '<option value="">Choose a Printer Preset</option>' + d.groups.map(function (x) { return '<option' + (x === g ? " selected" : "") + '>' + esc(x) + '</option>'; }).join(""); };
     $("pm-prs").innerHTML = d.printers.length ? d.printers.map(function (p) {
       return '<div class="pm-pr" data-p="' + esc(p.id) + '"><label class="check-row"><input type="checkbox"' + (p.on ? " checked" : "") + '>' + esc(p.name) + '</label><select>' + opts(p.group) + '</select></div>' +
@@ -9142,7 +9466,34 @@ PRESET_JS = r"""
     status(d); prev(d); look();
   }
   card.addEventListener("change", function () { look(); ask(); });
+  var RV = document.createElement("div");
+  RV.id = "pm-rv"; RV.hidden = true; document.body.appendChild(RV);
+  function rv() {
+    var fl = (I && I.fs) || [];
+    if (!fl.length) { RV.hidden = true; return; }
+    RV.innerHTML = '<div class="pop" role="dialog" aria-modal="true"><b>OrcaSlicer Settings in Spoolman</b><div class="note">Settings saved from OrcaSlicer. Anything not listed comes from the base preset. Remove a setting to go back to the base value. Printer values win over All Printers values.</div>' +
+      fl.map(function (f, i) {
+        var g = {}, h = "";
+        f.rows.forEach(function (r) { (g[r.sc] = g[r.sc] || []).push(r); });
+        Object.keys(g).forEach(function (sc) {
+          h += '<div class="grp">' + (sc === "*" ? "All Printers" : esc(sc) + " Only") + '</div><table>' + g[sc].map(function (r) {
+            return '<tr><td>' + esc(r.label) + '<code>' + esc(r.k) + '</code></td><td class="v">' + esc(r.v) + '</td><td class="x" title="Remove" data-rm="' + i + '" data-sc="' + esc(sc) + '" data-k="' + esc(r.k) + '">&#x2715;</td></tr>';
+          }).join("") + '</table>';
+        });
+        return '<div class="fh"><span class="d" style="background:#' + esc(f.c || "555555") + '"></span>' + esc(f.name) + '<a data-rm="' + i + '">Reset All to Base</a></div>' + h;
+      }).join("") + '<div class="bar"><button type="button" data-rv="close">Done</button></div></div>';
+    RV.hidden = false;
+  }
+  RV.addEventListener("click", function (e) {
+    if (e.target === RV || e.target.closest('[data-rv="close"]')) { RV.hidden = true; return; }
+    var x = e.target.closest("[data-rm]"); if (!x) return;
+    var f = I.fs[+x.dataset.rm];
+    x.closest("tr") ? x.closest("tr").style.opacity = ".4" : x.closest(".fh").style.opacity = ".4";
+    orca.postMessage({ type: "fs_remove", ent: f.ent, id: f.id, sc: x.dataset.sc || "", k: x.dataset.k || "", cfg: cur() });
+  });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !RV.hidden) RV.hidden = true; });
   card.addEventListener("click", function (e) {
+    if (e.target.closest('[data-rv="open"]')) { e.preventDefault(); rv(); return; }
     var h = e.target.closest(".pm-sh");
     if (h && !e.target.closest(".pm-sw")) fold(h.parentNode);
   });
@@ -9233,7 +9584,7 @@ def tab_html(initial_view: str, c: dict) -> str:
 {_fill(EDITOR_CSS, FONT=FONT_STACK)}
 {_fill(MOVE_CSS, FONT=FONT_STACK)}
 {pv}
-{PRESET_CSS}
+{_fill(PRESET_CSS, FONT=FONT_STACK)}
 </style>
 </head>
 <body>
@@ -9335,6 +9686,10 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                 self.post_message({"type": "tune_orca", **tune_orca()})
             elif msg_type == "tune_apply":
                 _bg(self._tune_apply, data)
+            elif msg_type == "fs_scan":
+                self._fs_scan()
+            elif msg_type == "fs_apply":
+                _bg(lambda: self.post_message({"type": "fs_done", **fs_apply(data.get("pick"), data.get("never") is True)}))
             elif msg_type == "tm_scan":
                 _bg(self._tm_scan, data.get("auto") is True)
             elif msg_type == "tm_later":
@@ -9371,6 +9726,30 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
         self.post_message({"type": kind, **r})
         if r["ok"]:
             self._push_data()
+
+    def _fs_scan(self):
+        items = fs_scan()
+        if not items:
+            return
+        # Base values for these settings, read here on OrcaSlicer's thread for the next sync.
+        _snap["want"].update(x["k"] for x in items)
+        psnap()
+
+        def worker():
+            try:
+                r = fs_check(items)
+            except Exception as exc:
+                log.warning("Couldn't compare OrcaSlicer edits with Spoolman: %s", exc)
+                return
+            if not r["items"]:
+                return
+            if r["auto"] and not any(x["clash"] for x in r["items"]):
+                pick = {x["id"]: "all" if r["scope"] == "all" else "printer" for x in r["items"]}
+                self.post_message({"type": "fs_done", "auto": True, **fs_apply(pick)})
+                return
+            self.post_message({"type": "fs", **r})
+
+        _bg(worker)
 
     def _tune_apply(self, data):
         save = data.get("save") is True
@@ -9535,7 +9914,11 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
         elif msg_type == "presets_info":
             _bg(lambda: self._settings_post(presets_info(data.get("cfg"))))
         elif msg_type == "presets_sync":
+            self._fs_scan()
             _bg(lambda: (presets_sync(force=True), self._settings_post(presets_info(data.get("cfg")))))
+        elif msg_type == "fs_remove":
+            _bg(lambda: (fs_remove(data.get("ent"), data.get("id"), data.get("sc"), data.get("k")),
+                         self._settings_post(presets_info(data.get("cfg")))))
         elif msg_type == "feedback":
             open_url(FEEDBACK_URL)
         elif msg_type == "check_update":
@@ -9593,6 +9976,7 @@ if _SLICING:
                     tune_check(ctx)
                 except Exception:
                     log.exception("Tuning check failed")
+                _bg(_fs_poke)
                 _bg(run_heads, slots, str(ctx.config_value("printer_settings_id") or ""))
                 if enabled:
                     if any(slot["grams"] > 0 for slot in slots):
