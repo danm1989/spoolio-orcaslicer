@@ -2408,10 +2408,17 @@ FIELD_TYPES = ("text", "integer", "integer_range", "float", "float_range", "date
 _ext_cache: dict = {"url": "", "time": 0.0, "items": []}
 
 
+NUM_RX = re.compile(r"[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?")
+
+
 def _num_or(value: object, default=None):
+    if isinstance(value, str) and not NUM_RX.fullmatch(value.strip()):
+        return default
     try:
         n = float(value)
     except (TypeError, ValueError):
+        return default
+    if n != n or abs(n) == float("inf"):
         return default
     return int(n) if n == int(n) else n
 
@@ -3290,12 +3297,46 @@ def _orca_base(base: str, key: str):
     return _bval(base, key)
 
 
-def _orca_fits(base: object, val: list[str]) -> bool:
-    """False when the base setting is numeric but val isn't, so one bad value can't spoil the bundle."""
+ORCA_INT = {
+    "filament_printable", "filament_extruder_compatibility", "filament_adhesiveness_category",
+    "filament_tower_interface_print_temp", "nozzle_temperature", "nozzle_temperature_initial_layer",
+    "cool_plate_temp", "textured_cool_plate_temp", "eng_plate_temp", "hot_plate_temp", "textured_plate_temp",
+    "cool_plate_temp_initial_layer", "textured_cool_plate_temp_initial_layer", "eng_plate_temp_initial_layer",
+    "hot_plate_temp_initial_layer", "textured_plate_temp_initial_layer", "supertack_plate_temp_initial_layer",
+    "supertack_plate_temp", "temperature_vitrification", "overhang_fan_speed", "close_fan_the_first_x_layers",
+    "close_additional_fan_first_x_layers", "full_fan_speed_layer", "initial_layer_fan_speed",
+    "additional_fan_full_speed_layer", "during_print_exhaust_fan_speed", "complete_print_exhaust_fan_speed",
+    "additional_cooling_fan_speed", "nozzle_temperature_range_low", "nozzle_temperature_range_high",
+    "chamber_temperature", "chamber_temperatures", "support_material_interface_fan_speed", "internal_bridge_fan_speed",
+    "ironing_fan_speed", "filament_cooling_moves", "chamber_minimal_temperature", "idle_temperature",
+    "filament_flush_temp", "filament_flush_temp_fast", "filament_pre_cooling_temperature",
+    "filament_pre_cooling_temperature_nc"}
+ORCA_BOOL = {
+    "filament_soluble", "filament_is_support", "filament_adaptive_volumetric_speed", "reduce_fan_stop_start_freq",
+    "dont_slow_down_outer_wall", "slow_down_for_layer_cooling", "enable_overhang_bridge_fan", "activate_air_filtration",
+    "activate_air_filtration_during_print", "activate_air_filtration_on_completion", "enable_pressure_advance",
+    "adaptive_pressure_advance", "adaptive_pressure_advance_overhangs", "filament_multitool_ramming",
+    "activate_chamber_temp_control", "long_retractions_when_ec", "filament_wipe", "filament_retract_when_changing_layer",
+    "filament_long_retractions_when_cut"}
+ORCA_PCT = {"filament_shrink", "filament_shrinkage_compensation_z", "filament_ironing_flow", "filament_retract_before_wipe"}
+DEC_RX = r"-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?"
+
+
+def _orca_fits(base: object, val: list[str], key: str = "") -> bool:
+    """False when val isn't the kind of value the setting takes, so one bad value can't spoil the bundle.
+    Whole numbers for whole-number settings, digits with one dot for decimal ones."""
     b = [x.strip() for x in re.split(r"[,;]", str(base).replace('"', "")) if x.strip()]
-    if b and all(_fin(x) is not None for x in b):
-        return all(_fin(x) is not None for x in val)
-    return True
+    if key in ORCA_INT:
+        rx = r"-?\d+"
+    elif key in ORCA_BOOL:
+        rx = r"[01]"
+    elif key in ORCA_PCT:
+        rx = DEC_RX + "%?"
+    elif b and all(x == "nil" or re.fullmatch(DEC_RX, x) for x in b):
+        rx = DEC_RX
+    else:
+        return True
+    return bool(val) and all(x.strip() == "nil" or re.fullmatch(rx, x.strip()) for x in val)
 
 
 def _apply_orca_extras(d: dict, sp: dict, f: dict, per: str, bp: str, own: set = frozenset()) -> dict[str, list[str]]:
@@ -3318,7 +3359,7 @@ def _apply_orca_extras(d: dict, sp: dict, f: dict, per: str, bp: str, own: set =
         val = _extra_orca_val(ex[k])
         if val is None:
             continue
-        if not _orca_fits(base, val):
+        if not _orca_fits(base, val, k):
             log.warning("Spoolman extra field %s skipped: %r doesn't suit this OrcaSlicer setting", k, ex[k])
         else:
             d[k] = val
@@ -3391,7 +3432,7 @@ def _apply_os(d: dict, sp: dict, per: str, pname: str, base: str, own: set) -> d
             b = _orca_base(base, k)
             if b is None:
                 continue
-            if not _orca_fits(b, [x.strip() for x in re.split(r"[,;]", v.replace('"', "")) if x.strip()] or [v]):
+            if not _orca_fits(b, [x.strip() for x in re.split(r"[,;]", v.replace('"', "")) if x.strip()] or [v], k):
                 log.warning("OrcaSlicer setting %s from Spoolman skipped: %r doesn't suit it", k, v)
                 continue
             d[k] = v
@@ -8187,6 +8228,17 @@ EDITOR_JS = r"""
   }
   document.body.insertAdjacentHTML("beforeend", '<div id="pc" hidden></div><div id="pt" hidden></div>');
   var pc = document.getElementById("pc"), pt = document.getElementById("pt"), tt;
+  document.addEventListener("keydown", function (e) {
+    var t = e.target;
+    if (t.tagName !== "INPUT" || t.type !== "number" || e.ctrlKey || e.metaKey || e.altKey || e.key.length !== 1) return;
+    var dec = /\./.test(t.getAttribute("step") || "");
+    if (!/[0-9]/.test(e.key) && !(dec && e.key === "." && t.value.indexOf(".") < 0)) e.preventDefault();
+  }, true);
+  document.addEventListener("paste", function (e) {
+    var t = e.target, x = e.clipboardData && e.clipboardData.getData("text");
+    if (t.tagName !== "INPUT" || t.type !== "number" || x == null) return;
+    if (!(/\./.test(t.getAttribute("step") || "") ? /^\s*\d*\.?\d*\s*$/ : /^\s*\d*\s*$/).test(x)) e.preventDefault();
+  }, true);
   function toast(t) { clearTimeout(tt); pt.innerHTML = t; pt.hidden = false; tt = setTimeout(function () { pt.hidden = true; }, 4000); }
   var fields = function () { return (D && D.fields || []).filter(function (f) { return f.key !== "tag"; }); };
   function fils() {
@@ -8472,9 +8524,31 @@ EDITOR_JS = r"""
       }
     }
   }
+  var INT = ["ext", "bed"];
+  function nf(d) {
+    if (d.k) return d.k === "usedg" || NUM.indexOf(d.k) >= 0 ? (INT.indexOf(d.k) >= 0 ? "i" : "d") : "";
+    if (d.t) return "d";
+    if (d.x) { var f = fields().filter(function (x) { return x.key === d.x; })[0]; if (!f) return ""; return f.type === "integer" ? "-i" : f.type === "float" ? "-d" : /range/.test(f.type) ? "r" : ""; }
+    return "";
+  }
+  function nclean(v, k) {
+    if (k === "r") return v.replace(/,/g, ".").replace(/[^0-9. \-]/g, "");
+    var neg = k.charAt(0) === "-" && /^\s*-/.test(v), i = k.slice(-1) === "i";
+    v = v.replace(i ? /[^0-9]/g : /[^0-9.,]/g, "").replace(/,/g, ".");
+    var j = v.indexOf(".");
+    if (j >= 0) v = v.slice(0, j + 1) + v.slice(j + 1).replace(/\./g, "");
+    return (neg ? "-" : "") + v;
+  }
+  function nfix(t) {
+    var k = nf(t.dataset); if (!k) return;
+    var v = t.value, c = nclean(v, k); if (c === v) return;
+    var p = t.selectionStart == null ? c.length : nclean(v.slice(0, t.selectionStart), k).length;
+    t.value = c; try { t.setSelectionRange(p, p); } catch (e) {}
+  }
   pc.addEventListener("input", function (e) {
     var t = e.target, d = t.dataset;
     if (t.tagName === "SELECT") return;
+    nfix(t);
     keep(function () {
       if (d.k === "usedg") S.remaining_weight = r2(Number(S.initial_weight) - num(t.value));
       else if (d.k) {
