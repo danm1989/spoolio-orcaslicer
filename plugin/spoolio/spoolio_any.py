@@ -8070,6 +8070,7 @@ EDITOR_CSS = """
   #pc .seg button { margin: 0; padding: 6px 14px; cursor: pointer; border: 0; border-right: 1px solid var(--orca-border); background: transparent; color: var(--orca-fg); font-size: 12.5px; border-radius: 0; }
   #pc .seg button:last-child { border-right: 0; }
   #pc .seg button.on { background: var(--orca-accent); color: var(--orca-accent-fg); font-weight: 700; }
+  #pc .seg button:disabled { opacity: .45; cursor: not-allowed; }
   #pc .ams { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--orca-accent) 55%, transparent); background: color-mix(in srgb, var(--orca-accent) 9%, transparent); margin-bottom: 14px; }
   #pc .ams .d { width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0; }
   #pc .ams span:not(.d) { flex: 1; font-size: 12.5px; }
@@ -8187,7 +8188,7 @@ EDITOR_CSS = """
 # The Add Spool / Edit Spool card and the New Spool Detected pop-up.
 EDITOR_JS = r"""
   var D = null, spools = [], canEdit = false, seen = {}, cat = { q: null, items: [], busy: false }, ct;
-  var mode, step, S, M, src, q, pick, unlock, ams, cur, ask, used, busy, err, auto, raw0, tg, tmsg, tseen = {};
+  var mode, step, S, M, src, q, pick, unlock, ams, cur, ask, used, mw, cu, busy, err, auto, raw0, tg, tmsg, tseen = {};
   var RF = '<div class="spool-rfid"><span>RFID</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="5" cy="19" r="1.8" fill="currentColor" stroke="none"></circle><path d="M5,14 A5,5 0 0 1 10,19"></path><path d="M5,10.5 A8.5,8.5 0 0 1 13.5,19"></path><path d="M5,7 A12,12 0 0 1 17,19"></path></svg></div>';
   var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); };
   var nv = function (a, b) { return a == null || a === "" ? (b == null ? "" : b) : a; };
@@ -8280,17 +8281,18 @@ EDITOR_JS = r"""
   }
   function load() { orca.postMessage({ type: "editor" }); }
   function find(qq) { cat.busy = true; cat.q = qq; orca.postMessage({ type: "catalogue", q: qq }); }
-  function reset() { step = 0; ask = ""; busy = false; err = ""; auto = null; ams = null; q = ""; pick = ""; raw0 = {}; tg = "fil"; tmsg = ""; }
+  function reset() { step = 0; mw = null; cu = ""; ask = ""; busy = false; err = ""; auto = null; ams = null; q = ""; pick = ""; raw0 = {}; tg = "fil"; tmsg = ""; }
   function openAdd() { reset(); mode = "add"; S = blank(); M = null; src = "mine"; unlock = true; used = false; cur = null; fillX(); load(); draw(); }
   function openEdit(s) {
     reset();
     var f = s.filament || {};
-    mode = "edit"; cur = s.id; unlock = false; used = "rem"; raw0 = s.extra || {};
+    mode = "edit"; cur = s.id; unlock = false; used = "use"; raw0 = s.extra || {};
     S = { fid: f.id, ext_id: "", name: f.name || "", vendor: (f.vendor || {}).name || "", material: f.material || "", color_hex: hex(f.color_hex),
       diameter: cl(nv(f.diameter)), density: cl(nv(f.density)), ext: cl(nv(f.settings_extruder_temp)), bed: cl(nv(f.settings_bed_temp)),
       initial_weight: r2(nv(s.initial_weight, f.weight)), spool_weight: r2(nv(s.spool_weight, f.spool_weight)), remaining_weight: r2(nv(s.remaining_weight)),
       location: s.location || "", lot_nr: s.lot_nr || "", price: r2(nv(s.price)), comment: s.comment || "",
       tag: String(nv(dec(raw0.tag))), extra: {}, use: D ? (D.use[s.id] || []).slice() : null, tf: tv(f.extra), ts: tv(s.extra) };
+    if (sw()) used = "mw";
     M = JSON.parse(JSON.stringify(S)); fillX(); load(); draw();
   }
   window.__spoolioEdit = function (s) { if (s) openEdit(s); else openAdd(); };
@@ -8389,15 +8391,30 @@ EDITOR_JS = r"""
       inp("diameter", "mm", { dis: dis }) + inp("density", "g/cm³", { dis: dis }) + inp("ext", "°C", { dis: dis }) + inp("bed", "°C", { dis: dis }) + '</div>' +
       '<datalist id="pc-vend">' + (D ? D.vendors : []).map(function (v) { return '<option value="' + esc(v) + '">'; }).join("") + '</datalist><datalist id="pc-mats"><option value="PLA"><option value="PETG"><option value="ABS"><option value="ASA"><option value="TPU"><option value="PA"><option value="PC"></datalist>';
   }
+  function sw() { var v = Number(S.spool_weight); return S.spool_weight !== "" && v > 0 ? v : 0; }
+  function fromMw() {
+    var w = sw(), ini = Number(S.initial_weight) || 0; if (mw == null || !w) return;
+    var r = Math.max(0, mw - w); S.remaining_weight = r2(ini > 0 ? Math.min(ini, r) : r);
+  }
   function pAmt() {
-    var rem = Number(S.remaining_weight), ini = Number(S.initial_weight), col = "#" + (S.color_hex || "555555"), h = "";
-    var opts = mode === "add" ? [[false, "New and Sealed"], [true, "Already Used"]] : [["rem", "Grams Left"], ["use", "Grams Used"]];
-    h += '<div class="seg">' + opts.map(function (x) { return '<button data-used="' + x[0] + '" class="' + (used === x[0] ? "on" : "") + '">' + x[1] + '</button>'; }).join("") + '</div>';
-    var main = used === "use" ? '<div class="' + (!same(S.remaining_weight, M.remaining_weight) ? "chg" : "") + '"><label class="fl">Used</label><div class="in"><input data-k="usedg" value="' + r2(ini - rem) + '" style="padding-right:24px"><span class="u">g</span></div></div>'
+    var rem = Number(S.remaining_weight), ini = Number(S.initial_weight), col = "#" + (S.color_hex || "555555"), h = "", w = sw();
+    var opts = mode === "add" ? [[false, "New and Sealed"], ["mw", "Measured Weight"], ["use", "Grams Used"]] : [["mw", "Measured Weight"], ["use", "Grams Used"]];
+    h += '<div class="seg">' + opts.map(function (x) { var off = x[0] === "mw" && !w && used !== "mw"; return '<button data-used="' + x[0] + '" class="' + (used === x[0] ? "on" : "") + '"' + (off ? ' disabled title="Needs the empty spool weight"' : "") + '>' + x[1] + '</button>'; }).join("") + '</div>';
+    var ch = M && !same(S.remaining_weight, M.remaining_weight) ? "chg" : "";
+    var main = used === "use" ? '<div class="' + ch + '"><label class="fl">Consume Amount</label><div class="in"><input data-k="usedg" value="' + esc(cu) + '" placeholder="0" style="padding-right:24px"><span class="u">g</span></div></div>'
+      : used === "mw" ? '<div class="' + ch + '"><label class="fl">Measured Weight</label><div class="in"><input data-k="mw" value="' + (w ? (mw != null ? mw : r2(rem + w)) : "") + '"' + (w ? "" : ' disabled placeholder="-"') + ' style="padding-right:24px"><span class="u">g</span></div></div>'
       : (mode === "add" && !used) ? '<div><label class="fl">Remaining</label><div class="in"><input value="' + esc(S.initial_weight) + '" disabled style="padding-right:24px"><span class="u">g</span></div></div>'
       : inp("remaining_weight", "g");
     h += '<div class="f3">' + main + inp("initial_weight", "g", { l: "Filament Weight" }) + inp("spool_weight", "g", { l: "Empty Spool Weight" }) + '</div>';
-    h += '<div class="meter"><i style="width:' + Math.max(0, Math.min(100, rem / (ini || 1) * 100)) + '%;background:' + col + '"></i></div><div class="calc"><b>' + g(rem) + '</b> Left of ' + g(ini) + ' · ' + g(ini - rem) + ' Used</div>';
+    h += '<div class="meter"><i style="width:' + Math.max(0, Math.min(100, rem / (ini || 1) * 100)) + '%;background:' + col + '"></i></div>';
+    h += used === "mw" && w ? '<div class="calc"><b>' + g(mw != null ? mw : rem + w) + '</b> on the scale − ' + g(w) + ' empty spool = <b>' + g(rem) + '</b> Left of ' + g(ini) + '</div>'
+      : '<div class="calc"><b>' + g(rem) + '</b> Left of ' + g(ini) + ' · ' + g(ini - rem) + ' Used</div>';
+    if (used === "mw" && !w) h += '<div class="note amb">Enter the empty spool weight to work out what\'s left from the scale.</div>';
+    else if (used === "mw" && mw != null && mw < w) h += '<div class="note amb">That\'s lighter than the empty spool, so it saves as 0 g left. Check the empty spool weight.</div>';
+    else if (used === "mw" && mw != null && ini > 0 && mw - w > ini) h += '<div class="note amb">That\'s heavier than a full spool, so it saves as ' + g(ini) + ' left. Check the filament and empty spool weights.</div>';
+    else if (used === "mw") h += '<div class="note">Total weight of the spool + remaining filament, as read from a scale.</div>';
+    else if (used === "use") h += '<div class="note">Positive consumes filament, negative adds it back.</div>';
+    if (!w && used !== "mw") h += '<div class="note">Measured weight is only available if the spool weight is set.</div>';
     return h;
   }
   function useTxt(v) {
@@ -8526,7 +8543,8 @@ EDITOR_JS = r"""
   }
   var INT = ["ext", "bed"];
   function nf(d) {
-    if (d.k) return d.k === "usedg" || NUM.indexOf(d.k) >= 0 ? (INT.indexOf(d.k) >= 0 ? "i" : "d") : "";
+    if (d.k === "usedg") return "-d";
+    if (d.k) return d.k === "mw" || NUM.indexOf(d.k) >= 0 ? (INT.indexOf(d.k) >= 0 ? "i" : "d") : "";
     if (d.t) return "d";
     if (d.x) { var f = fields().filter(function (x) { return x.key === d.x; })[0]; if (!f) return ""; return f.type === "integer" ? "-i" : f.type === "float" ? "-d" : /range/.test(f.type) ? "r" : ""; }
     return "";
@@ -8550,10 +8568,13 @@ EDITOR_JS = r"""
     if (t.tagName === "SELECT") return;
     nfix(t);
     keep(function () {
-      if (d.k === "usedg") S.remaining_weight = r2(Number(S.initial_weight) - num(t.value));
+      if (d.k === "usedg") { cu = t.value; var c = parseFloat(cu) || 0, b = M ? Number(M.remaining_weight) || 0 : Number(S.initial_weight) || 0; S.remaining_weight = r2(Math.max(0, b - c)); }
+      else if (d.k === "mw") { mw = t.value.trim() === "" ? null : num(t.value); fromMw(); }
       else if (d.k) {
         S[d.k] = NUM.indexOf(d.k) >= 0 && t.value !== "" ? num(t.value) : (d.k === "color_hex" ? t.value.replace("#", "").toUpperCase() : t.value);
         if (d.k === "initial_weight" && mode === "add" && !used) S.remaining_weight = S.initial_weight;
+        if (used === "mw" && (d.k === "spool_weight" || d.k === "initial_weight")) fromMw();
+        if (used === "use" && !M && d.k === "initial_weight") S.remaining_weight = r2(Math.max(0, (Number(S.initial_weight) || 0) - (parseFloat(cu) || 0)));
         if (mode === "add" && FILK.indexOf(d.k) >= 0 && src === "new") { pick = "new"; S.fid = null; S.ext_id = ""; }
       }
       if (d.t) {
@@ -8658,9 +8679,10 @@ EDITOR_JS = r"""
     else toast('<b>✓</b> Saved ' + n + (n === 1 ? " Change" : " Changes") + ' to Spoolman.');
   }
   function prefill(n) {
-    ams = n; used = n.pct != null && n.pct < 100;
+    ams = n; used = n.pct != null && n.pct < 100 ? "use" : false;
     S.name = n.name; S.vendor = "Bambu Lab"; S.material = n.m; S.color_hex = n.c; S.diameter = n.dia; S.ext = nv(n.e); S.bed = nv(n.b);
     S.initial_weight = n.w; S.spool_weight = 250; S.remaining_weight = n.pct == null ? n.w : Math.round(n.w * n.pct / 100);
+    if (used) cu = String(r2(n.w - S.remaining_weight));
     S.tag = n.uid; S.location = n.printer + (n.unit ? " " + n.unit : "");
     var mine = fils().filter(function (f) { return /bambu/i.test(f.v) && f.m === n.m && f.c === n.c; })[0];
     if (mine) { src = "mine"; fromFil(mine, "mine"); }
@@ -8683,8 +8705,8 @@ EDITOR_JS = r"""
     if (d.src) { src = d.src; q = ""; draw(); return; }
     if (d.pick != null) { var r = pFil.rows[+d.pick]; if (r) { fromFil(r.f, src); draw(); } return; }
     if (d.used != null) {
-      used = d.used === "true" ? true : d.used === "false" ? false : d.used;
-      if (mode === "add" && !used) S.remaining_weight = S.initial_weight;
+      used = d.used === "true" ? true : d.used === "false" ? false : d.used; mw = null; cu = "";
+      if (M) S.remaining_weight = M.remaining_weight; else if (!used || used === "use") S.remaining_weight = S.initial_weight;
       draw(); return;
     }
     if (d.xb) { S.extra[d.xb] = !S.extra[d.xb]; draw(); return; }
