@@ -2683,6 +2683,7 @@ def parse_presets(value: object) -> dict:
     sy = v.get("sync") if isinstance(v.get("sync"), dict) else {}
     return {"on": parse_flag(v.get("on"), default=False),
             "per": "spool" if v.get("per") == "spool" else "filament",
+            "name": " ".join(str(v.get("name") or "").split())[:120] or PNAME,
             "base": "pick" if v.get("base") == "pick" else "auto",
             "printers": {str(k)[:32]: {"on": parse_flag(x.get("on"), default=False),
                                        "group": str(x.get("group") or "")[:120]}
@@ -2921,6 +2922,31 @@ def _kg_cost(sp: dict, f: dict):
     return None
 
 
+PNAME = "{name} @ {printer}"
+PSEP = re.compile(r"[\s\-–—_·|,/@:+]*")
+
+
+def _pfill(pat: str, f: dict, sp: dict, name: str, pr: str) -> str:
+    """A preset name from the user's pattern, dropping empty parts with the separator before them."""
+    v = {"brand": str((f.get("vendor") or {}).get("name") or "").strip(), "material": str(f.get("material") or "").strip(),
+         "name": name, "spool": f"#{sp.get('id')}" if sp.get("id") is not None else "", "printer": pr}
+    bits = re.split(r"(\{\w+\})", pat)
+    out = []
+    for i, b in enumerate(bits):
+        if i % 2 == 0:
+            out.append(b)
+            continue
+        k = b[1:-1].lower()
+        x = v.get(k, b)
+        if x:
+            out.append(x)
+        elif out and PSEP.fullmatch(out[-1]) and len(out) > 1:
+            out.pop()
+        elif i + 1 < len(bits) and PSEP.fullmatch(bits[i + 1]):
+            bits[i + 1] = ""
+    return "".join(out)
+
+
 def _pname(name: str) -> str:
     """OrcaSlicer names presets after their file."""
     n = re.sub(r"\s+", " ", re.sub(r'[\\/:*?"<>|\x00-\x1f]', "-", name)).strip(" .")
@@ -2953,9 +2979,12 @@ def build_presets(c: dict, spools: list, only: str = "",
                   skipped: list | None = None) -> list[dict]:
     """The presets for the ticked printers: one per filament, or per spool."""
     groups = _snap["groups"]
-    prs = [(p, groups[c["printers"][p["id"]]["group"]]) for p in printers_cfg()
-           if c["printers"].get(p["id"], {}).get("on") and c["printers"][p["id"]]["group"] in groups
-           and (not only or p["id"] == only)]
+    ons = [p for p in printers_cfg() if c["printers"].get(p["id"], {}).get("on") and c["printers"][p["id"]]["group"] in groups]
+    prs = [(p, groups[c["printers"][p["id"]]["group"]]) for p in ons if not only or p["id"] == only]
+    pat = c.get("name") or PNAME
+    has = lambda k: "{" + k + "}" in pat.lower()
+    tail = len(ons) > 1 and not has("printer")
+    sv = c["per"] == "spool"
     live = [sp for sp in spools if isinstance(sp, dict) and isinstance(sp.get("filament"), dict)
             and not sp.get("archived") and (_num_or(sp.get("remaining_weight"), 1) or 0) > 0]
     picks: dict = {}
@@ -2968,20 +2997,21 @@ def build_presets(c: dict, spools: list, only: str = "",
         if w:
             want.setdefault(key, set()).update(w)
     names: dict = {}
+    raw = {}
     for sp in picks.values():
         f = sp["filament"]
-        n = str(f.get("name") or f.get("material") or "Filament").strip()
-        names.setdefault(n, []).append(sp)
+        n = raw[id(sp)] = str(f.get("name") or f.get("material") or "Filament").strip()
+        names.setdefault(_pfill(pat, f, sp if sv else {}, n, "").casefold(), []).append(sp)
     label = {}
-    for n, sps in names.items():
+    for sps in names.values():
         for sp in sps:
             f = sp["filament"]
-            x = n
+            x = raw[id(sp)]
             if len(sps) > 1 and c["per"] == "filament":
                 vn = (f.get("vendor") or {}).get("name")
-                x = f"{n} ({vn})" if vn and sum((s["filament"].get("vendor") or {}).get("name") == vn for s in sps) == 1 \
-                    else f"{n} #{f.get('id')}"
-            label[id(sp)] = f"{x} #{sp['id']}" if c["per"] == "spool" else x
+                x = f"{x} ({vn})" if vn and not has("brand") and \
+                    sum((s["filament"].get("vendor") or {}).get("name") == vn for s in sps) == 1 else f"{x} #{f.get('id')}"
+            label[id(sp)] = f"{x} #{sp['id']}" if c["per"] == "spool" and not has("spool") else x
     bases = _snap["bases"] if prs else []
     out = []
     used: set = set()
@@ -2992,11 +3022,15 @@ def build_presets(c: dict, spools: list, only: str = "",
             if key in want and p["id"] not in want[key]:
                 continue
             f = sp["filament"]
-            name = _pname(f"{label[id(sp)]} @ {p['name']}")
+            lb = label[id(sp)]
+            # Without {name} in the pattern, what tells presets apart goes on the end.
+            ex = "" if has("name") else lb[len(raw[id(sp)]):]
+            sfx = ex + (f" @ {p['name']}" if tail else "")
+            name = _pname(_pfill(pat, f, sp if sv else {}, lb, p["name"]) + sfx)
             n = 1
             while name.casefold() in used:
                 n += 1
-                name = _pname(f"{label[id(sp)]} ({n}) @ {p['name']}")
+                name = _pname(_pfill(pat, f, sp if sv else {}, f"{lb} ({n})", p["name"]) + ("" if has("name") else f" ({n})") + sfx)
             base = _base(bases, f, nz, c["bases"].get(str(f.get("material") or "").upper(), "") if c["base"] == "pick" else "")
             if not base:
                 if skipped is not None:
@@ -9349,7 +9383,7 @@ PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</sp
   <div class="hint warn" id="pm-warn" hidden><strong>!</strong> <span id="pm-wt"></span></div>
   <div class="hint warn" id="pm-skip" hidden><strong>!</strong> <span id="pm-skt"></span></div>
   <div id="pm-opts"><div class="pm-lab">Settings</div><div class="pm-acc">
-<div class="pm-sec" data-s="pr"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="12" rx="2"/><path d="M8 21h8M12 15v6"/></svg></span><span class="pm-tx"><span class="pm-tt">Presets and Printers</span><span class="pm-sm" id="pm-s-pr"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="field-label">Create one preset per:</div><div class="seg"><label><input type="radio" name="pm-per" value="filament">Filament</label><label><input type="radio" name="pm-per" value="spool">Spool</label></div><div class="hint">Spool gives each spool its own preset, named with its ID.</div><div class="field-label">Make presets for these printers:</div><div id="pm-prs"></div><div class="hint">Named Filament @ Printer. A spool loaded in a printer only gets that printer's preset. Use With in Edit Spool changes this.</div></div></div>
+<div class="pm-sec" data-s="pr"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="12" rx="2"/><path d="M8 21h8M12 15v6"/></svg></span><span class="pm-tx"><span class="pm-tt">Presets and Printers</span><span class="pm-sm" id="pm-s-pr"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="field-label">Create one preset per:</div><div class="seg"><label><input type="radio" name="pm-per" value="filament">Filament</label><label><input type="radio" name="pm-per" value="spool">Spool</label></div><div class="hint">Spool gives each spool its own preset, with its ID added if the name leaves it out.</div><div class="field-label">Make presets for these printers:</div><div id="pm-prs"></div><div class="hint">A spool loaded in a printer only gets that printer's preset. Use With in Edit Spool changes this.</div><div class="field-label">Name each preset:</div><div class="pm-nm"><input id="pm-name" type="text" maxlength="120" spellcheck="false" autocomplete="off"><button type="button" class="pm-nmr" id="pm-nmr">Reset</button></div><div class="pm-chips" id="pm-chips"><button type="button" data-tok="brand">+ Brand</button><button type="button" data-tok="material">+ Material</button><button type="button" data-tok="name">+ Name</button><button type="button" data-tok="spool">+ Spool ID</button><button type="button" data-tok="printer">+ Printer</button></div><div class="pm-ex" id="pm-ex" hidden>Example: <b></b></div><div class="hint warn" id="pm-nmw" hidden><strong>!</strong> <span></span></div><div class="hint">Click a part to add it, or type your own text between parts. Leave out Printer if you only make presets for one printer. Renaming replaces your Spoolio presets in OrcaSlicer.</div></div></div>
 <div class="pm-sec" data-s="base"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="m3 13 9 5 9-5"/></svg></span><span class="pm-tx"><span class="pm-tt">Base Presets</span><span class="pm-sm" id="pm-s-base"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="seg"><label><input type="radio" name="pm-base" value="auto">Printer's Own Preset</label><label><input type="radio" name="pm-base" value="pick">Choose Per Material</label></div><div id="pm-mats"></div><div class="hint">Anything Spoolio doesn't set comes from this preset, or Generic if there is none.</div></div></div>
 <div class="pm-sec" data-s="sm"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg></span><span class="pm-tx"><span class="pm-tt">Values From Spoolman</span><span class="pm-sm" id="pm-s-sm"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="pm-ck"><label class="check-row"><input type="checkbox" data-take="colour">Colour</label><label class="check-row"><input type="checkbox" data-take="temps">Nozzle and Bed Temperatures</label><label class="check-row"><input type="checkbox" data-take="dens">Density and Diameter</label><label class="check-row"><input type="checkbox" data-take="cost">Cost</label></div><label class="check-row pm-tn"><input id="pm-extra" type="checkbox">Map Matching Spoolman Extra Fields</label><div class="hint">Extra fields named like an OrcaSlicer filament setting override it (spool fields too, with one preset per spool).</div></div></div>
 <div class="pm-sec" data-s="tn"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></span><span class="pm-tx"><span class="pm-tt">Advanced Tuning</span><span class="pm-sm" id="pm-s-tn"></span></span><label class="pm-sw" title="Use Advanced Tuning From Spoolman"><input id="pm-tune" type="checkbox"><i></i></label><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div id="pm-tm" hidden></div><div class="pm-ck" id="pm-tks"><label class="check-row"><input type="checkbox" data-tk="flow">Flow Ratio</label><label class="check-row"><input type="checkbox" data-tk="pa">Pressure Advance</label><label class="check-row"><input type="checkbox" data-tk="mvs">Max Volumetric Speed</label><label class="check-row"><input type="checkbox" data-tk="rlen">Retraction Length</label><label class="check-row"><input type="checkbox" data-tk="rspd">Retraction Speed</label></div><div class="hint" id="pm-tkh">Adds a Tuning step to Edit Spool and offers to update Spoolman when a value changes. Blank values come from the base preset.</div></div></div>
@@ -9408,6 +9442,16 @@ PRESET_CSS = """
   #pm-card .pm-sb > .seg:first-child, #pm-card .pm-sb > .pm-ck:first-child { margin-top: 10px; }
   #pm-card .pm-sb .hint { margin-top: 6px; }
   #pm-card .hint.warn { margin: 0 0 12px; }
+  #pm-card .pm-nm { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+  #pm-card #pm-name { flex: 1; min-width: 0; background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; padding: 6px 8px; font: 12.5px ui-monospace, Consolas, monospace; }
+  #pm-card #pm-name:focus { outline: none; border-color: var(--orca-accent); }
+  #pm-card .pm-nmr { background: transparent; border: 0; color: var(--orca-muted); font: inherit; font-size: 12px; cursor: pointer; padding: 4px 2px; }
+  #pm-card .pm-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  #pm-card .pm-chips button { border: 1px solid var(--orca-border); background: transparent; color: var(--orca-fg); border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 11.5px; cursor: pointer; }
+  #pm-card .pm-chips button.used { border-color: var(--orca-accent); color: var(--orca-accent); }
+  #pm-card .pm-ex { margin-top: 8px; font-size: 12px; color: var(--orca-muted); }
+  #pm-card .pm-ex b { color: var(--orca-fg); font-weight: 600; }
+  #pm-card #pm-nmw { margin: 8px 0 0; }
   #pm-card .pm-pr { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
   #pm-card .pm-pr .check-row { margin: 0; flex: 1; min-width: 0; }
   #pm-card .pm-pr select { width: 55%; }
@@ -9448,7 +9492,7 @@ PRESET_CSS = """
 
 PRESET_JS = r"""
   var $ = function (id) { return document.getElementById(id); };
-  var card = $("pm-card"), I = null, C = null, t = 0;
+  var card = $("pm-card"), I = null, C = null, t = 0, PN = "{name} @ {printer}";
   if (!card) return;
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
   function radio(n) { var x = document.querySelector('input[name="' + n + '"]:checked'); return x ? x.value : ""; }
@@ -9461,7 +9505,7 @@ PRESET_JS = r"""
     var tk = {}, tn = {};
     document.querySelectorAll("#pm-card [data-take]").forEach(function (x) { tk[x.dataset.take] = x.checked; });
     document.querySelectorAll("#pm-card [data-tk]").forEach(function (x) { tn[x.dataset.tk] = x.checked; });
-    return { on: $("pm-on").checked, per: radio("pm-per") || "filament", base: radio("pm-base") || "auto", printers: pr, bases: bs,
+    return { on: $("pm-on").checked, per: radio("pm-per") || "filament", name: $("pm-name").value.trim() || PN, base: radio("pm-base") || "auto", printers: pr, bases: bs,
       take: tk, extra_map: $("pm-extra").checked, tune: { on: $("pm-tune").checked, keys: tn },
       sync: { on: $("pm-fs").checked, auto: radio("pm-fsa") === "auto", scope: radio("pm-fss") || "printer", clash: radio("pm-fsc") || "ask" } };
   }
@@ -9477,7 +9521,19 @@ PRESET_JS = r"""
     $("pm-warn").hidden = !$("pm-wt").textContent;
     $("pm-skt").textContent = !na && $("pm-on").checked && I ? (I.skip_msg || "") : "";
     $("pm-skip").hidden = !$("pm-skt").textContent;
+    nm();
     sums();
+  }
+  function nm() {
+    var p = ($("pm-name").value || PN).toLowerCase(), on = [];
+    document.querySelectorAll("#pm-chips [data-tok]").forEach(function (b) { b.classList.toggle("used", p.indexOf("{" + b.dataset.tok + "}") >= 0); });
+    document.querySelectorAll("#pm-prs [data-p]").forEach(function (r) { if (r.querySelector("input").checked && r.querySelector("select").value) on.push(r.querySelector(".check-row").textContent.trim()); });
+    var w = on.length > 1 && p.indexOf("{printer}") < 0;
+    $("pm-nmw").querySelector("span").textContent = w ? lst(on) + (on.length > 2 ? " all" : " both") + " get presets, so Spoolio adds @ Printer to the end to keep each name different." : "";
+    $("pm-nmw").hidden = !w;
+    var s = I && I.sample;
+    $("pm-ex").hidden = !s;
+    if (s) $("pm-ex").querySelector("b").textContent = s.name;
   }
   var OPEN = [];
   try { OPEN = JSON.parse(localStorage.getItem("spoolio.pmopen") || "[]") || []; } catch (e) { OPEN = []; }
@@ -9542,7 +9598,7 @@ PRESET_JS = r"""
   function draw(d, full) {
     I = d; C = d.cfg;
     if (full) {
-      $("pm-on").checked = C.on; setRadio("pm-per", C.per); setRadio("pm-base", C.base); $("pm-extra").checked = !!C.extra_map; $("pm-tune").checked = C.tune.on;
+      $("pm-on").checked = C.on; setRadio("pm-per", C.per); $("pm-name").value = C.name || PN; setRadio("pm-base", C.base); $("pm-extra").checked = !!C.extra_map; $("pm-tune").checked = C.tune.on;
       document.querySelectorAll("#pm-card [data-take]").forEach(function (x) { x.checked = C.take[x.dataset.take] !== false; });
       document.querySelectorAll("#pm-card [data-tk]").forEach(function (x) { x.checked = !!C.tune.keys[x.dataset.tk]; });
       var sy = C.sync || {};
@@ -9562,6 +9618,21 @@ PRESET_JS = r"""
     status(d); prev(d); look();
   }
   card.addEventListener("change", function () { look(); ask(); });
+  $("pm-name").addEventListener("input", function () { nm(); ask(); });
+  $("pm-name").addEventListener("focus", function () { this.dataset.f = 1; });
+  $("pm-nmr").addEventListener("click", function () { $("pm-name").value = PN; look(); ask(); });
+  $("pm-chips").addEventListener("click", function (e) {
+    var b = e.target.closest("[data-tok]"), x = $("pm-name");
+    if (!b) return;
+    var v = x.value, a = x.selectionStart == null ? v.length : x.selectionStart, z = x.selectionEnd == null ? a : x.selectionEnd, tok = "{" + b.dataset.tok + "}";
+    if (!x.dataset.f) a = z = v.length;
+    var pre = v.slice(0, a), post = v.slice(z), sep = pre && !/[\s\-–_·|,/@:(]$/.test(pre) ? " - " : "";
+    if (b.dataset.tok === "printer" && pre && !/@\s*$/.test(pre)) sep = " @ ";
+    x.value = pre + sep + tok + post;
+    var at = (pre + sep + tok).length;
+    x.focus(); x.setSelectionRange(at, at);
+    look(); ask();
+  });
   var RV = document.createElement("div");
   RV.id = "pm-rv"; RV.hidden = true; document.body.appendChild(RV);
   function rv() {
