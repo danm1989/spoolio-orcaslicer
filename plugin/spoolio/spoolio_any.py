@@ -4044,21 +4044,23 @@ def _settle(entry_id: str, done: dict, by_id: dict, final) -> None:
         hist_note(entry, by_id)
 
 
-def usage_book(entry_id: str, chosen: list | None) -> None:
-    """Book the open rows to their spools; chosen holds manual picks."""
-    wanted = {}
-    for item in chosen if isinstance(chosen, list) else []:
-        if isinstance(item, dict):
-            wanted[_int(item.get("slot"))] = item
+def usage_book(entry_id: str, chosen: list | None, retry: bool = False) -> None:
+    """Book the open rows to their spools; chosen holds manual picks. retry resends only failed rows."""
     url = clean_url(cfg().get("spoolman_url"))
     by_id = {sp.get("id"): sp for sp in (plate_spools(url) if url else None) or []}
     entry = _claim(entry_id, lambda e: True)
     if entry is None:
         return
+    if retry:
+        chosen = [{**r["try"], "slot": r["slot"]} for r in entry["rows"] if r["state"] == "error" and r.get("try")]
+    wanted = {}
+    for item in chosen if isinstance(chosen, list) else []:
+        if isinstance(item, dict):
+            wanted[_int(item.get("slot"))] = item
     done = {}
     try:
         for row in entry["rows"]:
-            if row["state"] == "booked":
+            if row["state"] == "booked" or (retry and row["slot"] not in wanted):
                 continue
             pick = wanted.get(row["slot"], {})
             spool = _int(pick.get("spool")) if pick.get("spool") not in (None, "") else row["spool"]
@@ -4071,14 +4073,31 @@ def usage_book(entry_id: str, chosen: list | None) -> None:
             try:
                 spoolman_use(spool, grams)
             except Exception as exc:
-                done[row["slot"]] = {"state": "error", "error": _spoolman_error(exc)}
+                done[row["slot"]] = {"state": "error", "error": _spoolman_error(exc),
+                                     "try": {"spool": spool, "grams": round(grams, 1)}}
                 continue
             label = _spool_label(by_id[spool]) if spool in by_id else row.get("label") or f"spool {spool}"
-            done[row["slot"]] = {"state": "booked", "error": "", "spool": spool, "grams": round(grams, 1), "label": label}
+            done[row["slot"]] = {"state": "booked", "error": "", "spool": spool, "grams": round(grams, 1), "label": label,
+                                 "try": None}
             log.info("Booked %.1f g to Spoolman spool %s", grams, spool)
     finally:
         _settle(entry_id, done, by_id, lambda e: e.update(
             state="booked" if all(r["state"] == "booked" for r in e["rows"]) else "pending"))
+
+
+def usage_retry() -> dict:
+    """Resends bookings that Spoolman refused or couldn't take."""
+    key = lambda: {(e["id"], r["slot"]) for e in usage_load()["prints"] if e.get("state") == "pending"
+                   for r in e.get("rows") or [] if r.get("state") == "error" and r.get("try")}
+    with _usage_lock:
+        was = key()
+    for i in {k[0] for k in was}:
+        usage_book(i, None, retry=True)
+    with _usage_lock:
+        left = len(was & key())
+    if was:
+        log.info("Resent %d failed booking(s): %d still failed", len(was), left)
+    return {"sent": len(was) - left, "left": left}
 
 
 def usage_undo(entry_id: str) -> None:
@@ -5012,6 +5031,20 @@ MAIN_PAGE = """
   .spool-edit:hover { background: none; color: var(--orca-accent); }
   .spool-edit svg { width: 14px; height: 14px; }
   #add-spool { margin-left: auto; padding: 7px 14px; border-radius: 6px; font-size: 13px; font-weight: 700; }
+  #sync-btn { margin-left: auto; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 112px; padding: 7px 14px; border-radius: 6px; font-size: 13px; font-weight: 700; }
+  #sync-btn ~ #add-spool { margin-left: 0; }
+  #sync-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+  #sync-btn.busy { opacity: .75; cursor: default; border-color: var(--orca-accent); }
+  #sync-btn.busy svg { animation: sy-spin .9s linear infinite; }
+  @keyframes sy-spin { to { transform: rotate(360deg); } }
+  .sync-note { display: flex; gap: 8px; align-items: flex-start; margin: 0 0 10px; padding: 8px 10px 8px 12px; border: 1px solid rgba(63, 185, 80, 0.4); border-radius: 8px; background: rgba(63, 185, 80, 0.1); color: #3fb950; font-size: 12px; line-height: 1.45; animation: pc-fade .2s ease-out; }
+  .sync-note[hidden] { display: none; }
+  .sync-note.warn { border-color: rgba(210, 153, 34, 0.45); background: rgba(210, 153, 34, 0.14); color: #e0a030; }
+  .sync-note.bad { border-color: rgba(217, 83, 79, 0.45); background: rgba(217, 83, 79, 0.12); color: #e5605c; }
+  .sync-note svg { flex: none; width: 16px; height: 16px; margin-top: 1px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+  .sync-note span { flex: 1; min-width: 0; }
+  .sync-note button { flex: none; padding: 0 4px; border: 0; background: none; color: inherit; font-size: 15px; line-height: 1; opacity: .7; }
+  .sync-note button:hover { opacity: 1; background: none; }
   .spool-cart svg { width: 13px; height: 13px; }
   .spool-bar-track {
     height: 5px; border-radius: 3px; margin: 6px 0 5px;
@@ -5351,9 +5384,11 @@ MAIN_PAGE = """
   <div id="page-spools">
   <div class="listbar">
     <div id="status">Loading...</div>
+    <button id="sync-btn" title="Get the latest spools, reload your presets and resend failed bookings"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/></svg><span>Sync</span></button>
     <button id="add-spool" title="Add a Spool to Spoolman" hidden>+ Add Spool</button>
     <button id="filters-toggle" aria-expanded="false">Filters &#9662;</button>
   </div>
+  <div id="sync-note" class="sync-note" hidden><svg viewBox="0 0 24 24"></svg><span></span><button type="button" title="Hide">×</button></div>
   <div id="filters-panel" hidden>
   <div class="filters">
     <input id="search" type="text" placeholder="Filter by name...">
@@ -6945,7 +6980,7 @@ MAIN_PAGE = """
       });
       statusEl.className = "";
       statusEl.textContent = filtered.length + " of " + allSpools.length + " spool" +
-        (allSpools.length === 1 ? "" : "s");
+        (allSpools.length === 1 ? "" : "s") + (syncedAt ? " \u00b7 Synced " + syncedAt : "");
       filtered.sort(function (a, b) {
         return compareSpools(a, b, sortKeyEl.value, sortDir) ||
           (sortKeyEl.value === "plate" ? compareSpools(a, b, "remaining", "asc") : 0);
@@ -7024,10 +7059,52 @@ MAIN_PAGE = """
         if (data.usage) setUsage(data.usage);
         if (key !== liveKey && !picking && !renaming && !linkOpen) { liveKey = key; renderPrinters(); }
         renderProgress();
+      } else if (data && data.type === "sync_done") {
+        syncDone(data);
       } else if (data && data.type === "preset_warn") {
         setPresetWarn(data.msg || "", data.key || "", data.fids, data.sids);
       }
     });
+
+    let syncedAt = "", syncTimer = 0, noteTimer = 0;
+    const syncBtn = document.getElementById("sync-btn"), syncNote = document.getElementById("sync-note");
+    const SY_ICONS = { ok: '<path d="M20 6 9 17l-5-5"/>', warn: '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>', bad: '<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/>' };
+    function syncBusy(on) {
+      syncBtn.classList.toggle("busy", on);
+      syncBtn.disabled = on;
+      syncBtn.querySelector("span").textContent = on ? "Syncing\u2026" : "Sync";
+    }
+    function syncMsg(kind, html) {
+      clearTimeout(noteTimer);
+      syncNote.className = "sync-note" + (kind === "ok" ? "" : " " + kind);
+      syncNote.querySelector("svg").innerHTML = SY_ICONS[kind];
+      syncNote.querySelector("span").innerHTML = html;
+      syncNote.hidden = false;
+      if (kind === "ok") noteTimer = setTimeout(function () { syncNote.hidden = true; }, 6000);
+    }
+    function syncDone(d) {
+      clearTimeout(syncTimer);
+      syncBusy(false);
+      if (!d.ok) { syncMsg("bad", "Couldn&#39;t sync with " + esc(d.src) + ": " + esc(d.err || "unknown error")); return; }
+      syncedAt = d.time;
+      applyFilters();
+      if (d.usage) setUsage(d.usage);
+      const bits = [d.n + " spool" + (d.n === 1 ? "" : "s") + " from " + esc(d.src)];
+      if (d.pn && !d.perr) bits.push(d.pn + " preset" + (d.pn === 1 ? "" : "s") + " reloaded");
+      if (d.sent) bits.push(d.sent + " booking" + (d.sent === 1 ? "" : "s") + " sent");
+      const warn = [];
+      if (d.perr) warn.push("Presets weren&#39;t reloaded: " + esc(d.perr.replace("Sync Now", "Sync")));
+      if (d.left) warn.push(d.left + " booking" + (d.left === 1 ? "" : "s") + " still couldn&#39;t reach Spoolman. " + (d.left === 1 ? "It stays" : "They stay") + " in Recent Bookings on the Printer tab.");
+      syncMsg(warn.length ? "warn" : "ok", "Synced at " + esc(d.time) + " \u00b7 " + bits.join(" \u00b7 ") + (warn.length ? "<br>" + warn.join("<br>") : ""));
+    }
+    syncBtn.addEventListener("click", function () {
+      if (syncBtn.disabled) return;
+      syncBusy(true);
+      syncNote.hidden = true;
+      orca.postMessage({ type: "sync" });
+      syncTimer = setTimeout(function () { syncBusy(false); syncMsg("bad", "Sync didn&#39;t finish. Check the Spoolio log, then try again."); }, 90000);
+    });
+    syncNote.querySelector("button").addEventListener("click", function () { clearTimeout(noteTimer); syncNote.hidden = true; });
 
     let presetWarnKey = "";
     let presetWarnDismissed = "";
@@ -9866,7 +9943,7 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
             data = json.loads(arg0) if isinstance(arg0, str) else arg0
             if not isinstance(data, dict):
                 return
-            if data.get("type") in ("ready", "refresh", "save", "presets_info", "presets_sync"):
+            if data.get("type") in ("ready", "refresh", "sync", "save", "presets_info", "presets_sync"):
                 psnap()
             if data.get("view") == "settings":
                 self._on_settings(data)
@@ -9878,6 +9955,9 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                     send_plate(_plate["payload"])
                 if msg_type == "ready":
                     send_heads()
+            elif msg_type == "sync":
+                self._fs_scan()
+                _bg(self._sync)
             elif msg_type == "settings":
                 self._open_settings()
             elif msg_type == "open_spoolman":
@@ -9996,24 +10076,47 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
             return
         self._refreshing = True
         _local_sync()
-        low_stock_grams = parse_low(cfg().get("low_stock_grams"))
 
         def worker():
             try:
-                result = load_spools()
-            except Exception as exc:
-                log.exception("Spool refresh failed")
-                result = {"ok": False, "error": str(exc)}
+                result = self._spools_post()
             finally:
                 self._refreshing = False
-            self.post_message({"type": "spools", "low_stock_grams": low_stock_grams,
-                               "weight_display": weight_mode(), "show_cart": cart_on(),
-                               "spool_columns": spool_columns(), "can_edit": source() == "spoolman",
-                               **printer_state(), **result})
             if result.get("ok"):
                 presets_sync(result["spools"] if source() == "spoolman" else None)
 
         _bg(worker)
+
+    def _spools_post(self) -> dict:
+        try:
+            result = load_spools()
+        except Exception as exc:
+            log.exception("Spool refresh failed")
+            result = {"ok": False, "error": str(exc)}
+        self.post_message({"type": "spools", "low_stock_grams": parse_low(cfg().get("low_stock_grams")),
+                           "weight_display": weight_mode(), "show_cart": cart_on(),
+                           "spool_columns": spool_columns(), "can_edit": source() == "spoolman",
+                           **printer_state(), **result})
+        return result
+
+    def _sync(self):
+        """The Sync button: pull spools, resend failed bookings, then rewrite and reload the presets."""
+        sm = source() == "spoolman"
+        out = {"type": "sync_done", "src": source_name(), "time": time.strftime("%H:%M")}
+        if sm and not self._spoolman_url():
+            self.post_message({**out, "ok": False, "err": "No Spoolman URL configured yet - click Settings to set one."})
+            return
+        _local_sync()
+        res = self._spools_post()
+        out.update(ok=bool(res.get("ok")), err=res.get("error") or "", n=len(res.get("spools") or []))
+        if out["ok"]:
+            if sm:
+                out.update(usage_retry(), usage=usage_state())
+            if parse_presets(cfg().get("presets"))["on"]:
+                st = presets_sync(res["spools"] if sm else None, force=True)
+                out.update(pn=st.get("n") or 0, perr=st.get("err") or "")
+        log.info("Sync: %s", {k: v for k, v in out.items() if k != "usage"})
+        self.post_message(out)
 
     def _save_settings(self, url, low_stock, plate_check=True,
                        plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
