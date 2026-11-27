@@ -1,3 +1,67 @@
+## [0.14.0] - 2026-11-27
+
+Spoolio presets can now carry every filament setting you change in OrcaSlicer, not just the ones Spoolio sets. Change a Spoolio preset, slice, and Spoolio offers to save your changes to Spoolman. Configure OrcaSlicer Presets has been reorganised into sections that fold open, and the spool editor now mimics how Spoolman ‘edit weight’ works. This update also squashes a considerable number of bugs found in a review of the codebase and its interaction with OrcaSlicer.
+
+### Added
+- Added Sync All Settings under Configure OrcaSlicer Presets. When it's on, change any filament setting on a Spoolio preset in OrcaSlicer, such as fan speeds, nozzle and plate temperature, first layer temperature etc, and it’s all saved back to Spoolman. Changes made in Spoolman come back to OrcaSlicer too.
+
+- After you slice with an edited Spoolio preset, Spoolio asks to Save OrcaSlicer Changes to Spoolman. Each change can apply to This Printer Only or All Printers. Not Now keeps your edits in OrcaSlicer only, and Don't Ask Again for This Preset is well…self-explaining really. You can also have Spoolio save changes Automatically instead of asking after each slice if you prefer.
+
+- If a setting has changed in OrcaSlicer or Spoolman since the last sync, Spoolio asks which value you want to keep. You can set this to Spoolman Priority or OrcaSlicer Priority or Ask Me. Once your changes are saved, OrcaSlicer stops showing the preset as modified.
+
+- The settings are kept in one Spoolman extra field, `orca_settings`, on the filament (or the spool, with one preset per spool). Review Settings lists what's stored, and lets you remove a setting to go back to the base preset's value, or Reset All to Base.
+
+- Edit Spool and Add Spool now mimic how Spoolman manages weights, e.g Measured Weight whereby you enter the weight of the spool and filament as read from a scale, and Spoolio takes off the empty spool weight to work out what's left. It's only available when the spool or filament has a spool weight set. Edit Spool's other option is now Grams Used, which works like Spoolman's Consume Amount: a positive amount consumes filament, a negative amount adds it back.
+
+- You can now choose how Spoolio names its presets. Under Presets and Printers, build your own naming pattern, for example `{brand} - {material} - {name}`, with a live example as you type and a Reset button to go back to the default `{name} @ {printer}`. Note: If you have more than one printer, @ Printer is added automatically so every preset name stays unique. This is only available with Spoolman as your spool source. (#10 (@PatrickGlatz))
+  - Preset names can also use any Spoolman extra field. Type its key in braces, for example `{colour} {material} {brand}` gives "Gray PETG Bambu". Spoolio reads the spool's field first (with one preset per spool), then the filament's. If no spool has a field by that name, a note tells you that part was left out. The hint now also says that Name is the filament's name in Spoolman.
+  - Changing the name pattern now asks before renaming your presets. Spoolio will tell you how many presets will change, with a before and after example, because projects saved with the old names lose their link to the Spoolio preset.
+
+- Added a Sync button to the Spools page, so you can sync whenever you like. It gets the latest spools from Spoolman (or Bambu Cloud), reloads your Spoolio presets in OrcaSlicer, and resends any bookings Spoolman couldn't take earlier. A note shows what was synced, or what still needs your attention, and the spool count shows when you last synced. (#12 (@PatrickGlatz))
+
+### Changed
+- The Configure OrcaSlicer Presets in Settings now has a new look. It’s now split into sections that fold open: Presets and Printers, Base Presets, Values From Spoolman, Advanced Tuning and Sync All Settings. Each one shows a one-line summary when closed.
+
+- The main switch now sits in the card header, with the sync status and Sync Now along the bottom. When Values From Spoolman or Advanced Tuning is open, the preview shows what's Copied From Spoolman.
+
+- Input boxes now only accept valid numbers, e.g nozzle temperature has to be an integer value, pressure advance can be a decimal.
+
+- Values taken from Spoolman are now checked against the kind of value each OrcaSlicer setting takes (whole number, on/off, percentage or decimal), so one bad value can't stop OrcaSlicer loading the presets.
+
+- Spoolman's bed temperature now goes to every plate type, including Cool Plates, Engineering etc not just the Hot and Textured plates.
+
+- Prints that drop off Recent Bookings without being booked now go into Stats, marked Tracking Only, instead of being lost.
+
+### Fixed
+- Fixed an issue where you couldn't type a decimal point in the spool editor's number boxes. (#11 (@PatrickGlatz))
+
+- Fixed an issue where a cleared value, such as Pressure Advance by Printer, came back after saving. Spoolman 0.26 and newer only clears a field when it's told to, so Spoolio now does that, and still works with older versions of Spoolman. This applies to every tuning value and spool extra field. (#11)
+
+- Fixed preset names containing any of `\ / : * ? " < > |`. OrcaSlicer quietly renamed these presets, so tuning prompts never appeared for them, and two names such as "A/B" and "A:B" could overwrite each other.
+
+- Fixed a possible crash where Spoolio read OrcaSlicer's preset list in the background while OrcaSlicer was changing it. Spoolio now takes a copy of what it needs first.
+
+- Fixed tuning prompts never appearing after slicing with two or more filaments.
+
+- Fixed false "value changed" tuning prompts on H2D and H2C printers using a High Flow nozzle.
+
+- Fixed the Pressure Advance prompt coming back after every poll when using one preset per spool. The value is now saved to the spool when that spool has its own value for the printer.
+
+- Fixed presets, settings and the log being saved to the wrong folder with portable OrcaSlicer or a custom data folder. Spoolio now uses OrcaSlicer's own data folder, and copies your existing Spoolio settings across the first time.
+
+- Fixed Sync Now sometimes doing nothing while an automatic sync was running. It now waits for that sync to finish.
+
+- Fixed a Spoolman address ending in `/` making Spoolio download every spool again each time you opened Stats or booked a print.
+
+- Switching the spool source to Bambu Cloud now removes the Spoolman presets from OrcaSlicer straight away.
+
+- Moving Advanced Tuning to the new field names now includes archived spools, so their values aren't lost when the old fields are deleted.
+
+- Fixed a crash when a number value from Spoolman was NaN.
+
+- A problem showing the missing preset warning no longer stops the presets from syncing.
+
+
 ## [0.13.0] - 2026-11-23
 
 Spoolio can now carry any OrcaSlicer filament setting straight from Spoolman. If a filament (or spool) extra field in Spoolman has the same name as an OrcaSlicer filament setting, Spoolio can put its value into the matching preset. Spoolio also now tells you when a filament can't get a preset because OrcaSlicer has no matching material, instead of quietly leaving it out. Thanks to heliodsn for both of these contributions. To go with this, Advanced Tuning now keeps your calibrated values under OrcaSlicer's own setting names, so both features share one field, and Spoolio offers to move your existing values across for you.
