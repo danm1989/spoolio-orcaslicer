@@ -2923,11 +2923,33 @@ def _kg_cost(sp: dict, f: dict):
 
 
 PNAME = "{name} @ {printer}"
+PTOKS = ("brand", "material", "name", "spool", "printer")
 PSEP = re.compile(r"[\s\-–—_·|,/@:+]*")
 
 
+def _xtext(ex: object, key: str) -> str:
+    """A Spoolman extra field as text for a preset name, matching its key in any case."""
+    if not isinstance(ex, dict):
+        return ""
+    v = next((x for k, x in ex.items() if str(k).lower() == key), None)
+    for _ in range(2):
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except ValueError:
+                break
+    if isinstance(v, bool) or v is None or isinstance(v, dict):
+        return ""
+    if isinstance(v, float) and v == int(v):
+        v = int(v)
+    if isinstance(v, list):
+        return ", ".join(str(x).strip() for x in v if isinstance(x, (str, int, float)) and str(x).strip())
+    return " ".join(str(v).split())
+
+
 def _pfill(pat: str, f: dict, sp: dict, name: str, pr: str) -> str:
-    """A preset name from the user's pattern, dropping empty parts with the separator before them."""
+    """A preset name from the user's pattern, dropping empty parts with the separator before them.
+    Any other {key} is a Spoolman extra field, from the spool first, then the filament."""
     v = {"brand": str((f.get("vendor") or {}).get("name") or "").strip(), "material": str(f.get("material") or "").strip(),
          "name": name, "spool": f"#{sp.get('id')}" if sp.get("id") is not None else "", "printer": pr}
     bits = re.split(r"(\{\w+\})", pat)
@@ -2937,7 +2959,7 @@ def _pfill(pat: str, f: dict, sp: dict, name: str, pr: str) -> str:
             out.append(b)
             continue
         k = b[1:-1].lower()
-        x = v.get(k, b)
+        x = v[k] if k in v else _xtext(sp.get("extra"), k) or _xtext(f.get("extra"), k)
         if x:
             out.append(x)
         elif out and PSEP.fullmatch(out[-1]) and len(out) > 1:
@@ -3174,7 +3196,8 @@ def presets_info(want: object = None) -> dict:
     """What the OrcaSlicer Presets card shows, for the saved or the unsaved settings."""
     saved = parse_presets(cfg().get("presets"))
     c = parse_presets({**want, "use": saved["use"]}) if isinstance(want, dict) else saved
-    out = {"type": "presets_info", "cfg": c, "api": False, "printers": [], "groups": [], "materials": [],
+    out = {"type": "presets_info", "cfg": c, "saved_name": saved["name"], "old": "", "miss": [],
+           "api": False, "printers": [], "groups": [], "materials": [],
            "status": dict(_pst), "sample": None, "skipped": [], "skip_msg": "", "fs": fs_list(c["per"])}
     if not _snap["ok"]:
         return out
@@ -3232,6 +3255,13 @@ def presets_info(want: object = None) -> dict:
                 txt = ", ".join(vals)
                 rows.append([k, txt if len(txt) <= 60 else txt[:57] + "..."])
             rows.append(["Based On", j["inherits"]])
+            if c["name"] != saved["name"]:
+                was = build_presets({**c, "name": saved["name"]}, spools, first["id"])
+                out["old"] = next((x["json"]["name"] for x in was if x["spool"] is e["spool"]), "")
+            keys = {k.lower() for k in re.findall(r"\{(\w+)\}", c["name"])} - set(PTOKS)
+            out["miss"] = sorted(k for k in keys if not any(
+                _xtext((x["spool"] if c["per"] == "spool" else {}).get("extra"), k) or _xtext(x["spool"]["filament"].get("extra"), k)
+                for x in es))
             out["sample"] = {"spool": sp, "name": j["name"], "printer": first["name"], "base": j["inherits"],
                              "colour": (j.get("default_filament_colour") or [""])[0], "rows": rows,
                              "list": [{"n": x["json"]["name"], "c": (x["json"].get("default_filament_colour") or [""])[0]}
@@ -9383,7 +9413,7 @@ PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</sp
   <div class="hint warn" id="pm-warn" hidden><strong>!</strong> <span id="pm-wt"></span></div>
   <div class="hint warn" id="pm-skip" hidden><strong>!</strong> <span id="pm-skt"></span></div>
   <div id="pm-opts"><div class="pm-lab">Settings</div><div class="pm-acc">
-<div class="pm-sec" data-s="pr"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="12" rx="2"/><path d="M8 21h8M12 15v6"/></svg></span><span class="pm-tx"><span class="pm-tt">Presets and Printers</span><span class="pm-sm" id="pm-s-pr"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="field-label">Create one preset per:</div><div class="seg"><label><input type="radio" name="pm-per" value="filament">Filament</label><label><input type="radio" name="pm-per" value="spool">Spool</label></div><div class="hint">Spool gives each spool its own preset, with its ID added if the name leaves it out.</div><div class="field-label">Make presets for these printers:</div><div id="pm-prs"></div><div class="hint">A spool loaded in a printer only gets that printer's preset. Use With in Edit Spool changes this.</div><div class="field-label">Name each preset:</div><div class="pm-nm"><input id="pm-name" type="text" maxlength="120" spellcheck="false" autocomplete="off"><button type="button" class="pm-nmr" id="pm-nmr">Reset</button></div><div class="pm-chips" id="pm-chips"><button type="button" data-tok="brand">+ Brand</button><button type="button" data-tok="material">+ Material</button><button type="button" data-tok="name">+ Name</button><button type="button" data-tok="spool">+ Spool ID</button><button type="button" data-tok="printer">+ Printer</button></div><div class="pm-ex" id="pm-ex" hidden>Example: <b></b></div><div class="hint warn" id="pm-nmw" hidden><strong>!</strong> <span></span></div><div class="hint">Click a part to add it, or type your own text between parts. Leave out Printer if you only make presets for one printer. Renaming replaces your Spoolio presets in OrcaSlicer.</div></div></div>
+<div class="pm-sec" data-s="pr"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="12" rx="2"/><path d="M8 21h8M12 15v6"/></svg></span><span class="pm-tx"><span class="pm-tt">Presets and Printers</span><span class="pm-sm" id="pm-s-pr"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="field-label">Create one preset per:</div><div class="seg"><label><input type="radio" name="pm-per" value="filament">Filament</label><label><input type="radio" name="pm-per" value="spool">Spool</label></div><div class="hint">Spool gives each spool its own preset, with its ID added if the name leaves it out.</div><div class="field-label">Make presets for these printers:</div><div id="pm-prs"></div><div class="hint">A spool loaded in a printer only gets that printer's preset. Use With in Edit Spool changes this.</div><div class="field-label">Name each preset:</div><div class="pm-nm"><input id="pm-name" type="text" maxlength="120" spellcheck="false" autocomplete="off"><button type="button" class="pm-nmr" id="pm-nmr">Reset</button></div><div class="pm-chips" id="pm-chips"><button type="button" data-tok="brand">+ Brand</button><button type="button" data-tok="material">+ Material</button><button type="button" data-tok="name">+ Name</button><button type="button" data-tok="spool">+ Spool ID</button><button type="button" data-tok="printer">+ Printer</button></div><div class="pm-ex" id="pm-ex" hidden>Example: <b></b></div><div class="hint warn" id="pm-nmw" hidden><strong>!</strong> <span></span></div><div class="hint warn" id="pm-nmx" hidden><strong>!</strong> <span></span></div><div class="hint">Click a part to add it, or type your own text between parts. Name is the filament's name in Spoolman. Type any Spoolman extra field in braces to use it too, e.g. {colour}. Leave out Printer if you only make presets for one printer.</div></div></div>
 <div class="pm-sec" data-s="base"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="m3 13 9 5 9-5"/></svg></span><span class="pm-tx"><span class="pm-tt">Base Presets</span><span class="pm-sm" id="pm-s-base"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="seg"><label><input type="radio" name="pm-base" value="auto">Printer's Own Preset</label><label><input type="radio" name="pm-base" value="pick">Choose Per Material</label></div><div id="pm-mats"></div><div class="hint">Anything Spoolio doesn't set comes from this preset, or Generic if there is none.</div></div></div>
 <div class="pm-sec" data-s="sm"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg></span><span class="pm-tx"><span class="pm-tt">Values From Spoolman</span><span class="pm-sm" id="pm-s-sm"></span></span><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div class="pm-ck"><label class="check-row"><input type="checkbox" data-take="colour">Colour</label><label class="check-row"><input type="checkbox" data-take="temps">Nozzle and Bed Temperatures</label><label class="check-row"><input type="checkbox" data-take="dens">Density and Diameter</label><label class="check-row"><input type="checkbox" data-take="cost">Cost</label></div><label class="check-row pm-tn"><input id="pm-extra" type="checkbox">Map Matching Spoolman Extra Fields</label><div class="hint">Extra fields named like an OrcaSlicer filament setting override it (spool fields too, with one preset per spool).</div></div></div>
 <div class="pm-sec" data-s="tn"><div class="pm-sh" role="button" tabindex="0" aria-expanded="false"><span class="pm-ic"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></span><span class="pm-tx"><span class="pm-tt">Advanced Tuning</span><span class="pm-sm" id="pm-s-tn"></span></span><label class="pm-sw" title="Use Advanced Tuning From Spoolman"><input id="pm-tune" type="checkbox"><i></i></label><span class="pm-chev">&#9656;</span></div><div class="pm-sb"><div id="pm-tm" hidden></div><div class="pm-ck" id="pm-tks"><label class="check-row"><input type="checkbox" data-tk="flow">Flow Ratio</label><label class="check-row"><input type="checkbox" data-tk="pa">Pressure Advance</label><label class="check-row"><input type="checkbox" data-tk="mvs">Max Volumetric Speed</label><label class="check-row"><input type="checkbox" data-tk="rlen">Retraction Length</label><label class="check-row"><input type="checkbox" data-tk="rspd">Retraction Speed</label></div><div class="hint" id="pm-tkh">Adds a Tuning step to Edit Spool and offers to update Spoolman when a value changes. Blank values come from the base preset.</div></div></div>
@@ -9451,7 +9481,11 @@ PRESET_CSS = """
   #pm-card .pm-chips button.used { border-color: var(--orca-accent); color: var(--orca-accent); }
   #pm-card .pm-ex { margin-top: 8px; font-size: 12px; color: var(--orca-muted); }
   #pm-card .pm-ex b { color: var(--orca-fg); font-weight: 600; }
-  #pm-card #pm-nmw { margin: 8px 0 0; }
+  #pm-card #pm-nmw, #pm-card #pm-nmx { margin: 8px 0 0; }
+  #pm-rv .rn { margin-top: 12px; display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; font-size: 12px; }
+  #pm-rv .rn span { color: var(--orca-muted); }
+  #pm-rv .bar { gap: 8px; }
+  #pm-rv .bar button.ghost { background: transparent; color: var(--orca-muted); border-color: transparent; font-weight: 400; }
   #pm-card .pm-pr { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
   #pm-card .pm-pr .check-row { margin: 0; flex: 1; min-width: 0; }
   #pm-card .pm-pr select { width: 55%; }
@@ -9531,6 +9565,9 @@ PRESET_JS = r"""
     var w = on.length > 1 && p.indexOf("{printer}") < 0;
     $("pm-nmw").querySelector("span").textContent = w ? lst(on) + (on.length > 2 ? " all" : " both") + " get presets, so Spoolio adds @ Printer to the end to keep each name different." : "";
     $("pm-nmw").hidden = !w;
+    var mx = (I && I.miss) || [];
+    $("pm-nmx").querySelector("span").textContent = mx.length ? "None of your spools has a Spoolman extra field called " + lst(mx.map(function (k) { return "{" + k + "}"; })) + ", so " + (mx.length > 1 ? "those parts are" : "that part is") + " left out." : "";
+    $("pm-nmx").hidden = !mx.length;
     var s = I && I.sample;
     $("pm-ex").hidden = !s;
     if (s) $("pm-ex").querySelector("b").textContent = s.name;
@@ -9604,7 +9641,7 @@ PRESET_JS = r"""
       var sy = C.sync || {};
       $("pm-fs").checked = !!sy.on; setRadio("pm-fsa", sy.auto ? "auto" : "ask"); setRadio("pm-fss", sy.scope || "printer"); setRadio("pm-fsc", sy.clash || "ask");
     }
-    if (!$("pm-rv").hidden) rv();
+    if (!RV.hidden && RV.dataset.m !== "rn") rv();
     var opts = function (g) { return '<option value="">Choose a Printer Preset</option>' + d.groups.map(function (x) { return '<option' + (x === g ? " selected" : "") + '>' + esc(x) + '</option>'; }).join(""); };
     $("pm-prs").innerHTML = d.printers.length ? d.printers.map(function (p) {
       return '<div class="pm-pr" data-p="' + esc(p.id) + '"><label class="check-row"><input type="checkbox"' + (p.on ? " checked" : "") + '>' + esc(p.name) + '</label><select>' + opts(p.group) + '</select></div>' +
@@ -9619,6 +9656,18 @@ PRESET_JS = r"""
   }
   card.addEventListener("change", function () { look(); ask(); });
   $("pm-name").addEventListener("input", function () { nm(); ask(); });
+  var ok = false;
+  document.addEventListener("click", function (e) {
+    if (!e.target.closest || !e.target.closest("#save")) return;
+    var c = cur(), n = I && I.status && I.status.n;
+    if (ok || !I || !I.api || !c.on || !n || c.name === (I.saved_name || PN)) { ok = false; return; }
+    e.stopImmediatePropagation(); e.preventDefault();
+    RV.dataset.m = "rn";
+    RV.innerHTML = '<div class="pop" role="dialog" aria-modal="true"><b>Rename Your Presets?</b><div class="note">Spoolio will rename its ' + n + ' preset' + (n === 1 ? "" : "s") + ' in OrcaSlicer on the next sync. Projects saved with the old names keep their own copy of the filament settings, but lose their link to the Spoolio preset.</div>' +
+      (I.old && I.sample ? '<div class="rn"><span>Before</span><b>' + esc(I.old) + '</b><span>After</span><b>' + esc(I.sample.name) + '</b></div>' : "") +
+      '<div class="bar"><button type="button" class="ghost" data-rn="no">Cancel</button><button type="button" data-rn="yes">Rename and Save</button></div></div>';
+    RV.hidden = false;
+  }, true);
   $("pm-name").addEventListener("focus", function () { this.dataset.f = 1; });
   $("pm-nmr").addEventListener("click", function () { $("pm-name").value = PN; look(); ask(); });
   $("pm-chips").addEventListener("click", function (e) {
@@ -9637,6 +9686,7 @@ PRESET_JS = r"""
   RV.id = "pm-rv"; RV.hidden = true; document.body.appendChild(RV);
   function rv() {
     var fl = (I && I.fs) || [];
+    RV.dataset.m = "rv";
     if (!fl.length) { RV.hidden = true; return; }
     RV.innerHTML = '<div class="pop" role="dialog" aria-modal="true"><b>OrcaSlicer Settings in Spoolman</b><div class="note">Settings saved from OrcaSlicer. Anything not listed comes from the base preset. Remove a setting to go back to the base value. Printer values take priority over All Printers values.</div>' +
       fl.map(function (f, i) {
@@ -9652,6 +9702,8 @@ PRESET_JS = r"""
     RV.hidden = false;
   }
   RV.addEventListener("click", function (e) {
+    var rn = e.target.closest("[data-rn]");
+    if (rn) { RV.hidden = true; if (rn.dataset.rn === "yes") { ok = true; $("save").click(); } return; }
     if (e.target === RV || e.target.closest('[data-rv="close"]')) { RV.hidden = true; return; }
     var x = e.target.closest("[data-rm]"); if (!x) return;
     var f = I.fs[+x.dataset.rm];
